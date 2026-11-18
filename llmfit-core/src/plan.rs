@@ -1,4 +1,6 @@
-use crate::fit::{FitLevel, RunMode};
+use crate::fit::{
+    CalcConfig, FIT_GOOD_MAX_RATIO, FIT_PERFECT_MAX_RATIO, FitLevel, RunMode, score_fit,
+};
 use crate::hardware::{GpuBackend, SystemSpecs};
 use crate::models::{KvQuant, LlmModel, quant_speed_multiplier};
 
@@ -13,6 +15,7 @@ const SUPPORTED_QUANTS: &[&str] = &[
     "Q4_0",
     "Q3_K_M",
     "Q2_K",
+    "MXFP4",
     "mlx-8bit",
     "mlx-4bit",
     "AWQ-4bit",
@@ -73,6 +76,10 @@ pub struct PathEstimate {
     pub minimum: Option<HardwareEstimate>,
     pub recommended: Option<HardwareEstimate>,
     pub estimated_tps: Option<f64>,
+    /// How this path's memory requirement grades against the current machine's
+    /// pool for that path — VRAM for GPU, system RAM for the CPU paths. Note
+    /// `minimum`/`recommended` describe hardware you may not own, whereas this
+    /// answers "would this path fit here?".
     pub fit_level: Option<FitLevel>,
     pub notes: Vec<String>,
 }
@@ -116,6 +123,9 @@ pub struct PlanEstimate {
     pub provider: String,
     pub context: u32,
     pub quantization: String,
+    /// Estimated weight storage in decimal GB at `quantization`.
+    /// Excludes KV cache, runtime buffers, and download scratch space.
+    pub disk_size_gb: f64,
     pub kv_quant: KvQuant,
     pub target_tps: Option<f64>,
     pub minimum: HardwareEstimate,
@@ -178,44 +188,76 @@ fn estimate_tps(
     backend: GpuBackend,
     path: PlanRunPath,
     cpu_cores: usize,
+    config: &CalcConfig,
 ) -> f64 {
-    estimate_tps_with_gpu(model, quant, backend, path, cpu_cores, None)
+    estimate_tps_with_gpu(model, quant, backend, path, cpu_cores, None, config)
 }
 
-/// Bandwidth-aware tok/s estimation (mirrors fit.rs logic).
-/// When `gpu_name` is provided and recognized, uses memory-bandwidth-based
-/// estimation instead of fixed constants.
+/// Run mode to estimate speed under.
+///
+/// A MoE model on the CPU-offload path keeps its inactive experts in system RAM,
+/// so per-token cost is bounded by DDR bandwidth. That is [`RunMode::MoeOffload`],
+/// which `fit.rs` already calibrates — not the dense `CpuOffload` factor, which
+/// would otherwise rank CPU offload *above* full-GPU execution.
+fn speed_run_mode(path: PlanRunPath, model: &LlmModel) -> RunMode {
+    match path {
+        PlanRunPath::CpuOffload if model.is_moe => RunMode::MoeOffload,
+        other => other.run_mode(),
+    }
+}
+
+/// Bandwidth-aware tok/s estimation.
+///
+/// When the effective GPU bandwidth is known, this delegates to
+/// [`crate::fit::estimate_tps`] so `plan` and `fit` cannot report different
+/// speeds for the same model. This includes an explicit configuration override
+/// from a hardware profile. Otherwise it falls back to fixed per-backend
+/// constants, which is all we can do for an unrecognized GPU.
 fn estimate_tps_with_gpu(
     model: &LlmModel,
     quant: &str,
     backend: GpuBackend,
     path: PlanRunPath,
     cpu_cores: usize,
-    gpu_name: Option<&str>,
+    system: Option<&SystemSpecs>,
+    config: &CalcConfig,
 ) -> f64 {
-    use crate::hardware::gpu_memory_bandwidth_gbps;
-    use crate::models::quant_bytes_per_param;
+    use crate::fit::InferenceRuntime;
 
-    let params = model.params_b().max(0.1);
+    let params = model
+        .active_parameters
+        .filter(|_| model.is_moe)
+        .map(|p| (p as f64) / 1_000_000_000.0)
+        .unwrap_or_else(|| model.params_b())
+        .max(0.1);
 
-    // Bandwidth-based estimation when GPU is recognized
+    // Delegate to the shared estimator when we can resolve effective GPU
+    // bandwidth. `resolve_gpu_bandwidth` first respects an explicit config
+    // override, then falls back to the GPU-name table. Checking only the name
+    // table here would silently discard a profile's bandwidth when its GPU name
+    // is synthetic or intentionally omitted.
+    //
+    // This module used to reimplement the bandwidth formula as
+    // `(bw / total_params_gb) * 0.55`, which ignored MoE sparsity entirely: only
+    // the active experts are read per token, so a 30B-A3B model was estimated at
+    // ~34 tok/s against fit.rs's ~160. Delegating keeps the MoE decomposition,
+    // the VRAM cache-pressure penalty, and the run-mode factors in one place.
+    //
+    // `runtime` only selects fixed-constant K values inside `estimate_tps`; on
+    // the bandwidth path it is unused, so LlamaCpp is a safe stand-in for a
+    // subcommand that has no runtime concept of its own.
     if path != PlanRunPath::CpuOnly
-        && let Some(name) = gpu_name
-        && let Some(bw) = gpu_memory_bandwidth_gbps(name)
+        && let Some(specs) = system
+        && crate::fit::resolve_gpu_bandwidth(specs, config).is_some()
     {
-        let model_gb = params * quant_bytes_per_param(quant);
-        let efficiency = 0.55;
-        let raw_tps = (bw / model_gb) * efficiency;
-
-        // CpuOnly is unreachable here (guarded above). The default fallback handles
-        // any future PlanRunPath variants gracefully.
-        let mode_factor = match path {
-            PlanRunPath::Gpu => 1.0,
-            PlanRunPath::CpuOffload => 0.5,
-            _ => 1.0,
-        };
-
-        return (raw_tps * mode_factor).max(0.1);
+        return crate::fit::estimate_tps(
+            model,
+            quant,
+            specs,
+            speed_run_mode(path, model),
+            InferenceRuntime::LlamaCpp,
+            config,
+        );
     }
 
     // Fallback: fixed-constant approach
@@ -236,53 +278,38 @@ fn estimate_tps_with_gpu(
         base *= 1.1;
     }
 
-    match path {
-        PlanRunPath::Gpu => {}
-        PlanRunPath::CpuOffload => base *= 0.5,
-        PlanRunPath::CpuOnly => {
-            let cpu_k = if cfg!(target_arch = "aarch64") {
-                90.0
-            } else {
-                70.0
-            };
-            base = (cpu_k / params) * quant_speed_multiplier(quant);
-            if cpu_cores >= 8 {
-                base *= 1.1;
-            }
+    // CPU-only should use CPU K regardless of detected GPU, matching fit.rs.
+    if path == PlanRunPath::CpuOnly {
+        let cpu_k = if cfg!(target_arch = "aarch64") {
+            90.0
+        } else {
+            70.0
+        };
+        base = (cpu_k / params) * quant_speed_multiplier(quant);
+        if cpu_cores >= 8 {
+            base *= 1.1;
         }
     }
+
+    // Run mode penalties — tunable via CalcConfig, mirroring fit.rs's fallback.
+    // Previously hardcoded (0.5 for CpuOffload, nothing for CpuOnly), which both
+    // ignored tuning and left CpuOnly 1/cpu_only-times faster than fit reported.
+    base *= config.run_mode_factors.for_run_mode(path.run_mode());
 
     base.max(0.1)
 }
 
-fn fit_level_for(
-    path: PlanRunPath,
-    required_gb: f64,
-    available_gb: f64,
-    recommended_gb: f64,
-) -> FitLevel {
-    if required_gb > available_gb {
-        return FitLevel::TooTight;
-    }
-
-    match path {
-        PlanRunPath::Gpu => {
-            if recommended_gb <= available_gb {
-                FitLevel::Perfect
-            } else if available_gb >= required_gb * 1.2 {
-                FitLevel::Good
-            } else {
-                FitLevel::Marginal
-            }
-        }
-        PlanRunPath::CpuOffload => {
-            if available_gb >= required_gb * 1.2 {
-                FitLevel::Good
-            } else {
-                FitLevel::Marginal
-            }
-        }
-        PlanRunPath::CpuOnly => FitLevel::Marginal,
+/// Grade a path's memory requirement against what the current machine actually has,
+/// with the same thresholds `fit` uses.
+///
+/// `required_gb` and `available_gb` must describe the *same* memory pool: VRAM on
+/// the GPU path, system RAM on the CPU paths. Passing `required_gb` as
+/// `available_gb` makes `TooTight` and `Good` unreachable.
+fn fit_level_for(path: PlanRunPath, required_gb: f64, available_gb: f64) -> FitLevel {
+    match score_fit(required_gb, available_gb, path.run_mode()) {
+        FitLevel::TooTight => FitLevel::TooTight,
+        _ if path == PlanRunPath::CpuOnly => FitLevel::Marginal,
+        level => level,
     }
 }
 
@@ -292,13 +319,14 @@ fn minimum_cores_for_target(
     backend: GpuBackend,
     path: PlanRunPath,
     target_tps: Option<f64>,
+    config: &CalcConfig,
 ) -> Option<usize> {
     let Some(target) = target_tps else {
         return Some(4);
     };
 
     for cores in 1..=64 {
-        let tps = estimate_tps(model, quant, backend, path, cores);
+        let tps = estimate_tps(model, quant, backend, path, cores, config);
         if tps >= target {
             return Some(cores);
         }
@@ -322,49 +350,41 @@ fn evaluate_current(
     kv_quant: KvQuant,
     target_tps: Option<f64>,
     system: &SystemSpecs,
+    config: &CalcConfig,
 ) -> PlanCurrentStatus {
     let model_mem = model.estimate_memory_gb_with_kv(quant, context, kv_quant);
-    let gpu_vram = system
-        .total_gpu_vram_gb
-        .or(system.gpu_vram_gb)
-        .unwrap_or(0.0);
+    // Free VRAM when the backend reports it, so a card another process has
+    // filled is not graded as if it were empty (#835).
+    let gpu_vram = system.gpu_fit_pool_gb();
 
     let mut candidates: Vec<(FitLevel, PlanRunPath, f64)> = Vec::new();
 
     if system.has_gpu && gpu_vram > 0.0 {
-        let gpu_fit = fit_level_for(
-            PlanRunPath::Gpu,
-            model_mem,
-            gpu_vram,
-            model.recommended_ram_gb,
-        );
-        let gpu_name = system.gpu_name.as_deref();
+        let gpu_fit = fit_level_for(PlanRunPath::Gpu, model_mem, gpu_vram);
         let gpu_tps = estimate_tps_with_gpu(
             model,
             quant,
             system.backend,
             PlanRunPath::Gpu,
             system.total_cpu_cores,
-            gpu_name,
+            Some(system),
+            config,
         );
         if target_tps.is_none_or(|t| gpu_tps >= t) {
             candidates.push((gpu_fit, PlanRunPath::Gpu, gpu_tps));
         }
 
         if !system.unified_memory {
-            let offload_fit = fit_level_for(
-                PlanRunPath::CpuOffload,
-                model_mem,
-                system.available_ram_gb,
-                model.recommended_ram_gb,
-            );
+            let offload_fit =
+                fit_level_for(PlanRunPath::CpuOffload, model_mem, system.available_ram_gb);
             let offload_tps = estimate_tps_with_gpu(
                 model,
                 quant,
                 system.backend,
                 PlanRunPath::CpuOffload,
                 system.total_cpu_cores,
-                gpu_name,
+                Some(system),
+                config,
             );
             if target_tps.is_none_or(|t| offload_tps >= t) {
                 candidates.push((offload_fit, PlanRunPath::CpuOffload, offload_tps));
@@ -372,18 +392,14 @@ fn evaluate_current(
         }
     }
 
-    let cpu_fit = fit_level_for(
-        PlanRunPath::CpuOnly,
-        model_mem,
-        system.available_ram_gb,
-        model.recommended_ram_gb,
-    );
+    let cpu_fit = fit_level_for(PlanRunPath::CpuOnly, model_mem, system.available_ram_gb);
     let cpu_tps = estimate_tps(
         model,
         quant,
         system.backend,
         PlanRunPath::CpuOnly,
         system.total_cpu_cores,
+        config,
     );
     if target_tps.is_none_or(|t| cpu_tps >= t) {
         candidates.push((cpu_fit, PlanRunPath::CpuOnly, cpu_tps));
@@ -421,6 +437,9 @@ fn evaluate_current(
     }
 }
 
+// One arg over clippy's limit: threading `config` is the point of this change,
+// and the alternative (a params struct) would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 fn build_path_estimate(
     model: &LlmModel,
     quant: &str,
@@ -429,12 +448,14 @@ fn build_path_estimate(
     target_tps: Option<f64>,
     path: PlanRunPath,
     system: &SystemSpecs,
+    config: &CalcConfig,
 ) -> PathEstimate {
     let model_mem = model.estimate_memory_gb_with_kv(quant, context, kv_quant);
     let backend = default_gpu_backend(system);
     let mut notes = vec![];
 
-    let min_cores = match minimum_cores_for_target(model, quant, backend, path, target_tps) {
+    let min_cores = match minimum_cores_for_target(model, quant, backend, path, target_tps, config)
+    {
         Some(c) => c,
         None => {
             return PathEstimate {
@@ -453,17 +474,29 @@ fn build_path_estimate(
 
     let recommended_cores = min_cores.max(8);
 
-    let gpu_name = system.gpu_name.as_deref();
-
     match path {
         PlanRunPath::Gpu => {
             let min_vram = model_mem;
             let rec_vram = model.recommended_ram_gb.max(model_mem * 1.2);
             let min_ram = (model_mem * 0.2).max(8.0);
             let rec_ram = (min_ram * 1.25).max(12.0);
-            let tps = estimate_tps_with_gpu(model, quant, backend, path, min_cores, gpu_name);
+            let tps =
+                estimate_tps_with_gpu(model, quant, backend, path, min_cores, Some(system), config);
 
-            let fit = fit_level_for(path, min_vram, min_vram, model.recommended_ram_gb);
+            let available_vram = system.gpu_fit_pool_gb();
+            let fit = fit_level_for(path, min_vram, available_vram);
+            if let Some(free) = system.gpu_available_gb
+                && !system.unified_memory
+                && free
+                    < system
+                        .total_gpu_vram_gb
+                        .or(system.gpu_vram_gb)
+                        .unwrap_or(0.0)
+            {
+                notes.push(format!(
+                    "Graded against {free:.1} GB of VRAM currently free, not total capacity"
+                ));
+            }
             notes.push(
                 "Estimated from quant/context memory and fit headroom thresholds".to_string(),
             );
@@ -503,8 +536,9 @@ fn build_path_estimate(
             let rec_vram = 4.0;
             let min_ram = model_mem;
             let rec_ram = model_mem * 1.2;
-            let fit = fit_level_for(path, min_ram, min_ram, model.recommended_ram_gb);
-            let tps = estimate_tps_with_gpu(model, quant, backend, path, min_cores, gpu_name);
+            let fit = fit_level_for(path, min_ram, system.available_ram_gb);
+            let tps =
+                estimate_tps_with_gpu(model, quant, backend, path, min_cores, Some(system), config);
             notes.push("RAM is the primary memory pool for CPU offload".to_string());
 
             PathEstimate {
@@ -528,8 +562,8 @@ fn build_path_estimate(
         PlanRunPath::CpuOnly => {
             let min_ram = model_mem;
             let rec_ram = model_mem * 1.2;
-            let fit = fit_level_for(path, min_ram, min_ram, model.recommended_ram_gb);
-            let tps = estimate_tps(model, quant, GpuBackend::CpuX86, path, min_cores);
+            let fit = fit_level_for(path, min_ram, system.available_ram_gb);
+            let tps = estimate_tps(model, quant, GpuBackend::CpuX86, path, min_cores, config);
             notes.push(
                 "CPU-only fit is always capped at Marginal in current heuristics".to_string(),
             );
@@ -555,10 +589,28 @@ fn build_path_estimate(
     }
 }
 
+/// Build a plan using the default calculation config.
+///
+/// Kept for API compatibility. Callers holding a user-tuned [`CalcConfig`] —
+/// notably the TUI, whose Advanced Configuration panel can change `efficiency`
+/// and `ddr_bandwidth_gbps` — should call [`estimate_model_plan_with_config`],
+/// otherwise `plan` and `fit` report different speeds despite sharing the same
+/// estimator.
 pub fn estimate_model_plan(
     model: &LlmModel,
     request: &PlanRequest,
     system: &SystemSpecs,
+) -> Result<PlanEstimate, String> {
+    estimate_model_plan_with_config(model, request, system, &CalcConfig::default())
+}
+
+/// Build a plan under an explicit [`CalcConfig`], so speed estimates honour the
+/// same tuning `fit` uses.
+pub fn estimate_model_plan_with_config(
+    model: &LlmModel,
+    request: &PlanRequest,
+    system: &SystemSpecs,
+    config: &CalcConfig,
 ) -> Result<PlanEstimate, String> {
     if request.context == 0 {
         return Err("--context must be greater than 0".to_string());
@@ -571,9 +623,21 @@ pub fn estimate_model_plan(
 
     let quant = if let Some(ref q) = request.quant {
         normalize_quant(q).ok_or_else(|| format!("Unsupported quantization '{}'.", q))?
+    } else if model.is_mxfp4_native() {
+        // The catalog default is a K-quant label, but these weights ship as
+        // MXFP4 and every GGUF of them stays that size.
+        "MXFP4".to_string()
     } else {
         model.quantization.clone()
     };
+    let non_native_quant_note = (model.is_mxfp4_native() && quant != "MXFP4").then(|| {
+        format!(
+            "{} ships MXFP4-native weights and GGUF builds keep the experts in MXFP4, \
+             so a {quant} build is close to the MXFP4 size and speed; this estimate prices \
+             it as a full {quant} model and is pessimistic. Use --quant MXFP4.",
+            model.name
+        )
+    });
 
     let kv_quant = request.kv_quant.unwrap_or_default();
 
@@ -591,7 +655,7 @@ pub fn estimate_model_plan(
     }
 
     let context = request.context;
-    let run_paths = vec![
+    let mut run_paths = vec![
         build_path_estimate(
             model,
             &quant,
@@ -600,6 +664,7 @@ pub fn estimate_model_plan(
             request.target_tps,
             PlanRunPath::Gpu,
             system,
+            config,
         ),
         build_path_estimate(
             model,
@@ -609,6 +674,7 @@ pub fn estimate_model_plan(
             request.target_tps,
             PlanRunPath::CpuOffload,
             system,
+            config,
         ),
         build_path_estimate(
             model,
@@ -618,10 +684,24 @@ pub fn estimate_model_plan(
             request.target_tps,
             PlanRunPath::CpuOnly,
             system,
+            config,
         ),
     ];
+    if let Some(note) = non_native_quant_note {
+        for path in &mut run_paths {
+            path.notes.push(note.clone());
+        }
+    }
 
-    let current = evaluate_current(model, &quant, context, kv_quant, request.target_tps, system);
+    let current = evaluate_current(
+        model,
+        &quant,
+        context,
+        kv_quant,
+        request.target_tps,
+        system,
+        config,
+    );
     let kv_alternatives = compute_kv_alternatives(model, &quant, context, system);
 
     let preferred = run_paths
@@ -650,6 +730,8 @@ pub fn estimate_model_plan(
 
     let mut upgrade_deltas = Vec::new();
 
+    // Upgrade sizing is a capacity question, so it stays on total VRAM: what
+    // another process holds right now is not something to buy around.
     let current_vram = system
         .total_gpu_vram_gb
         .or(system.gpu_vram_gb)
@@ -657,7 +739,9 @@ pub fn estimate_model_plan(
     if let Some(gpu_path) = run_paths.iter().find(|p| p.path == PlanRunPath::Gpu)
         && let Some(min_hw) = &gpu_path.minimum
     {
-        let add_good = (min_hw.vram_gb.unwrap_or(0.0) - current_vram).max(0.0);
+        // VRAM at which the requirement drops to each verdict's ratio ceiling.
+        let need = min_hw.vram_gb.unwrap_or(0.0);
+        let add_good = (need / FIT_GOOD_MAX_RATIO - current_vram).max(0.0);
         upgrade_deltas.push(UpgradeDelta {
             resource: "vram_gb".to_string(),
             add_gb: Some(add_good),
@@ -666,11 +750,7 @@ pub fn estimate_model_plan(
             path: PlanRunPath::Gpu,
             description: format!("+{add_good:.1} GB VRAM -> Good"),
         });
-    }
-    if let Some(gpu_path) = run_paths.iter().find(|p| p.path == PlanRunPath::Gpu)
-        && let Some(rec_hw) = &gpu_path.recommended
-    {
-        let add_perfect = (rec_hw.vram_gb.unwrap_or(0.0) - current_vram).max(0.0);
+        let add_perfect = (need / FIT_PERFECT_MAX_RATIO - current_vram).max(0.0);
         upgrade_deltas.push(UpgradeDelta {
             resource: "vram_gb".to_string(),
             add_gb: Some(add_perfect),
@@ -712,6 +792,7 @@ pub fn estimate_model_plan(
         model_name: model.name.clone(),
         provider: model.provider.clone(),
         context,
+        disk_size_gb: model.estimate_disk_gb(&quant),
         quantization: quant,
         kv_quant,
         target_tps: request.target_tps,
@@ -760,9 +841,8 @@ fn compute_kv_alternatives(
                     );
                     if let Some(l) = layout {
                         parts.push(format!(
-                            "compresses {} of {} attention layers",
-                            l.full,
-                            l.total()
+                            "applies to {} full-attention layers; {} recurrent layers use fixed state covered by runtime overhead",
+                            l.full, l.linear
                         ));
                     }
                     if !supported {
@@ -836,6 +916,10 @@ pub fn resolve_model_selector<'a>(
 mod tests {
     use super::*;
 
+    fn cfg() -> CalcConfig {
+        CalcConfig::default()
+    }
+
     fn test_model() -> LlmModel {
         LlmModel {
             name: "Qwen-Test-7B".to_string(),
@@ -855,6 +939,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: crate::models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -879,6 +964,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(12.0),
             total_gpu_vram_gb: Some(12.0),
+            gpu_available_gb: None,
             gpu_name: Some("Test GPU".to_string()),
             gpu_count: 1,
             unified_memory: false,
@@ -935,6 +1021,59 @@ mod tests {
         assert_eq!(plan.quantization, "Q4_K_M");
         assert!(!plan.run_paths.is_empty());
         assert!(plan.minimum.ram_gb > 0.0);
+    }
+
+    #[test]
+    fn plan_disk_size_uses_resolved_quant_and_total_moe_weights() {
+        let mut model = test_model();
+        model.parameters_raw = Some(8_000_000_000);
+        model.is_moe = true;
+        model.active_parameters = Some(1_000_000_000);
+        for (quant, expected_quant, expected_gb) in [
+            (None, "Q4_K_M", 4.64),
+            (Some(" q8_0 "), "Q8_0", 8.4),
+            (Some("mlx-4bit"), "mlx-4bit", 4.4),
+            (Some("autoround-4bit"), "AutoRound-4bit", 4.0),
+            (Some(" AUTOROUND-8BIT "), "AutoRound-8bit", 8.0),
+        ] {
+            let request = PlanRequest {
+                context: 8192,
+                quant: quant.map(str::to_string),
+                target_tps: None,
+                kv_quant: None,
+            };
+            let plan = estimate_model_plan(&model, &request, &test_specs()).expect("plan");
+            let json = serde_json::to_value(plan).expect("serialize plan");
+            assert_eq!(json["quantization"], expected_quant);
+            let disk = json["disk_size_gb"].as_f64().expect("numeric disk size");
+            assert!((disk - expected_gb).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn plan_disk_size_is_independent_of_context_and_kv_cache() {
+        let request = PlanRequest {
+            context: 1024,
+            quant: None,
+            target_tps: None,
+            kv_quant: None,
+        };
+        let small = estimate_model_plan(&test_model(), &request, &test_specs()).expect("plan");
+        let large = estimate_model_plan(
+            &test_model(),
+            &PlanRequest {
+                context: 32768,
+                kv_quant: Some(KvQuant::Q4_0),
+                ..request
+            },
+            &test_specs(),
+        )
+        .expect("plan");
+        assert!(large.minimum.vram_gb > small.minimum.vram_gb);
+        let small = serde_json::to_value(small).expect("serialize plan");
+        let large = serde_json::to_value(large).expect("serialize plan");
+        assert!(small["disk_size_gb"].is_number());
+        assert_eq!(small["disk_size_gb"], large["disk_size_gb"]);
     }
 
     #[test]
@@ -1031,39 +1170,39 @@ mod tests {
 
     #[test]
     fn test_fit_level_for_gpu_perfect() {
-        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 24.0, 12.0);
+        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 24.0);
         assert_eq!(fit, FitLevel::Perfect);
     }
 
     #[test]
     fn test_fit_level_for_gpu_good() {
-        // required*1.2 = 9.6, available = 10.0 > 9.6, but recommended = 12.0 > 10.0
-        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 10.0, 12.0);
+        // 8 / 10 = 80% of VRAM: past the Perfect ratio, within Good
+        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 10.0);
         assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
     fn test_fit_level_for_gpu_marginal() {
-        // available barely exceeds required, but less than required*1.2
-        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 8.5, 12.0);
+        // 8 / 8.5 = 94% of VRAM: past Good, within the Marginal ceiling
+        let fit = fit_level_for(PlanRunPath::Gpu, 8.0, 8.5);
         assert_eq!(fit, FitLevel::Marginal);
     }
 
     #[test]
     fn test_fit_level_for_too_tight() {
-        let fit = fit_level_for(PlanRunPath::Gpu, 24.0, 8.0, 32.0);
+        let fit = fit_level_for(PlanRunPath::Gpu, 24.0, 8.0);
         assert_eq!(fit, FitLevel::TooTight);
     }
 
     #[test]
     fn test_fit_level_for_cpu_offload_caps_at_good() {
-        let fit = fit_level_for(PlanRunPath::CpuOffload, 8.0, 24.0, 12.0);
+        let fit = fit_level_for(PlanRunPath::CpuOffload, 8.0, 24.0);
         assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
     fn test_fit_level_for_cpu_only_always_marginal() {
-        let fit = fit_level_for(PlanRunPath::CpuOnly, 4.0, 64.0, 8.0);
+        let fit = fit_level_for(PlanRunPath::CpuOnly, 4.0, 64.0);
         assert_eq!(fit, FitLevel::Marginal);
     }
 
@@ -1088,13 +1227,21 @@ mod tests {
     #[test]
     fn test_estimate_tps_gpu_faster_than_cpu() {
         let model = test_model();
-        let gpu_tps = estimate_tps(&model, "Q4_K_M", GpuBackend::Cuda, PlanRunPath::Gpu, 8);
+        let gpu_tps = estimate_tps(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            &cfg(),
+        );
         let cpu_tps = estimate_tps(
             &model,
             "Q4_K_M",
             GpuBackend::CpuX86,
             PlanRunPath::CpuOnly,
             8,
+            &cfg(),
         );
         assert!(gpu_tps > cpu_tps);
     }
@@ -1102,13 +1249,21 @@ mod tests {
     #[test]
     fn test_estimate_tps_cpu_offload_slower_than_gpu() {
         let model = test_model();
-        let gpu_tps = estimate_tps(&model, "Q4_K_M", GpuBackend::Cuda, PlanRunPath::Gpu, 8);
+        let gpu_tps = estimate_tps(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            &cfg(),
+        );
         let offload_tps = estimate_tps(
             &model,
             "Q4_K_M",
             GpuBackend::Cuda,
             PlanRunPath::CpuOffload,
             8,
+            &cfg(),
         );
         assert!(gpu_tps > offload_tps);
     }
@@ -1116,21 +1271,62 @@ mod tests {
     #[test]
     fn test_estimate_tps_more_cores_helps() {
         let model = test_model();
-        let tps_4 = estimate_tps(&model, "Q4_K_M", GpuBackend::Cuda, PlanRunPath::Gpu, 4);
-        let tps_16 = estimate_tps(&model, "Q4_K_M", GpuBackend::Cuda, PlanRunPath::Gpu, 16);
+        let tps_4 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            4,
+            &cfg(),
+        );
+        let tps_16 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            16,
+            &cfg(),
+        );
         assert!(tps_16 >= tps_4);
+    }
+
+    /// Specs whose GPU name resolves to a known memory bandwidth, so the
+    /// bandwidth path (not the fixed-constant fallback) is exercised.
+    fn test_specs_known_gpu() -> SystemSpecs {
+        SystemSpecs {
+            gpu_name: Some("NVIDIA GeForce RTX 4090".to_string()),
+            gpu_vram_gb: Some(24.0),
+            total_gpu_vram_gb: Some(24.0),
+            ..test_specs()
+        }
+    }
+
+    /// A sparse MoE model in the shape of Qwen3-30B-A3B: 30B total, 3.3B active.
+    fn test_moe_model() -> LlmModel {
+        LlmModel {
+            name: "Qwen-Test-30B-A3B".to_string(),
+            parameter_count: "30B".to_string(),
+            parameters_raw: Some(30_000_000_000),
+            is_moe: true,
+            num_experts: Some(128),
+            active_experts: Some(8),
+            active_parameters: Some(3_300_000_000),
+            ..test_model()
+        }
     }
 
     #[test]
     fn test_estimate_tps_with_known_gpu_uses_bandwidth() {
         let model = test_model();
+        let specs = test_specs_known_gpu();
         let bw_tps = estimate_tps_with_gpu(
             &model,
             "Q4_K_M",
             GpuBackend::Cuda,
             PlanRunPath::Gpu,
             8,
-            Some("NVIDIA RTX 4090"),
+            Some(&specs),
+            &cfg(),
         );
         let fallback_tps = estimate_tps_with_gpu(
             &model,
@@ -1139,9 +1335,302 @@ mod tests {
             PlanRunPath::Gpu,
             8,
             None,
+            &cfg(),
         );
         // Known GPU should give a different (bandwidth-based) estimate
         assert!((bw_tps - fallback_tps).abs() > 0.01);
+    }
+
+    /// A tuned `CalcConfig` must reach the estimator. Previously `plan` always
+    /// used `CalcConfig::default()`, so a user who raised `efficiency` in the TUI
+    /// Advanced Config panel saw `fit` and `plan` disagree despite sharing the
+    /// same formula.
+    #[test]
+    fn test_plan_honours_calc_config_efficiency() {
+        let model = test_model();
+        let specs = test_specs_known_gpu();
+        let tuned = CalcConfig {
+            efficiency: 0.80,
+            ..CalcConfig::default()
+        };
+
+        let default_tps = estimate_tps_with_gpu(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            Some(&specs),
+            &cfg(),
+        );
+        let tuned_tps = estimate_tps_with_gpu(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            Some(&specs),
+            &tuned,
+        );
+
+        assert!(
+            tuned_tps > default_tps,
+            "raising efficiency 0.55 -> 0.80 should raise the estimate: \
+             default={default_tps} tuned={tuned_tps}"
+        );
+
+        // and it must still agree with `fit` under that same config
+        let fit_tps = crate::fit::estimate_tps(
+            &model,
+            "Q4_K_M",
+            &specs,
+            RunMode::Gpu,
+            crate::fit::InferenceRuntime::LlamaCpp,
+            &tuned,
+        );
+        assert!(
+            (tuned_tps - fit_tps).abs() < 1e-9,
+            "plan={tuned_tps} fit={fit_tps} under a tuned config"
+        );
+    }
+
+    /// The public wrapper must keep its default-config behaviour.
+    #[test]
+    fn test_estimate_model_plan_defaults_match_explicit_default_config() {
+        let req = PlanRequest {
+            context: 4096,
+            quant: Some("Q4_K_M".to_string()),
+            target_tps: None,
+            kv_quant: None,
+        };
+        let specs = test_specs_known_gpu();
+
+        let implicit = estimate_model_plan(&test_model(), &req, &specs).unwrap();
+        let explicit =
+            estimate_model_plan_with_config(&test_model(), &req, &specs, &CalcConfig::default())
+                .unwrap();
+
+        assert_eq!(
+            implicit.current.estimated_tps, explicit.current.estimated_tps,
+            "estimate_model_plan must equal the _with_config form under defaults"
+        );
+    }
+
+    /// The CPU-only path always takes the fixed-constant fallback in both modules
+    /// (each gates its bandwidth path on `!= CpuOnly`), so the two must agree
+    /// there too. The fallback previously applied no run-mode factor at all,
+    /// leaving `plan` faster than `fit` by `1 / cpu_only` even at defaults, and
+    /// ignoring the tuned value entirely.
+    #[test]
+    fn test_plan_cpu_only_speed_matches_fit_and_honours_config() {
+        let model = test_model();
+        let specs = test_specs_known_gpu();
+
+        for cfg_used in [
+            crate::fit::CalcConfig::default(),
+            crate::fit::CalcConfig {
+                run_mode_factors: crate::fit::RunModeFactors {
+                    cpu_only: 0.15,
+                    ..Default::default()
+                },
+                ..crate::fit::CalcConfig::default()
+            },
+        ] {
+            let plan_tps = estimate_tps_with_gpu(
+                &model,
+                "Q4_K_M",
+                specs.backend,
+                PlanRunPath::CpuOnly,
+                specs.total_cpu_cores,
+                Some(&specs),
+                &cfg_used,
+            );
+            let fit_tps = crate::fit::estimate_tps(
+                &model,
+                "Q4_K_M",
+                &specs,
+                RunMode::CpuOnly,
+                crate::fit::InferenceRuntime::LlamaCpp,
+                &cfg_used,
+            );
+            assert!(
+                (plan_tps - fit_tps).abs() < 1e-9,
+                "cpu_only factor {}: plan={plan_tps} fit={fit_tps}",
+                cfg_used.run_mode_factors.cpu_only
+            );
+        }
+    }
+
+    /// Regression test for the duplicate estimator: `plan` must not report a
+    /// different speed than `fit` for the same model on the same hardware.
+    /// A local reimplementation here previously diverged by ~4x on MoE models
+    /// because it divided bandwidth by *total* rather than *active* params.
+    #[test]
+    fn test_plan_speed_matches_fit_speed() {
+        let specs = test_specs_known_gpu();
+        let config = crate::fit::CalcConfig::default();
+
+        for model in [test_model(), test_moe_model()] {
+            let plan_tps = estimate_tps_with_gpu(
+                &model,
+                "Q4_K_M",
+                GpuBackend::Cuda,
+                PlanRunPath::Gpu,
+                8,
+                Some(&specs),
+                &cfg(),
+            );
+            let fit_tps = crate::fit::estimate_tps(
+                &model,
+                "Q4_K_M",
+                &specs,
+                RunMode::Gpu,
+                crate::fit::InferenceRuntime::LlamaCpp,
+                &config,
+            );
+            assert!(
+                (plan_tps - fit_tps).abs() < 1e-9,
+                "{} : plan={plan_tps} fit={fit_tps}",
+                model.name
+            );
+        }
+    }
+
+    /// F32 reads twice the bytes of F16 per token, so on both the bandwidth
+    /// path and the fixed-constant path it must come out at half F16's speed.
+    #[test]
+    fn test_plan_f32_runs_at_half_f16_speed() {
+        let model = test_model();
+        let specs = test_specs_known_gpu();
+        for path in [PlanRunPath::Gpu, PlanRunPath::CpuOnly] {
+            let tps = |quant| {
+                estimate_tps_with_gpu(
+                    &model,
+                    quant,
+                    GpuBackend::Cuda,
+                    path,
+                    8,
+                    Some(&specs),
+                    &cfg(),
+                )
+            };
+            let ratio = tps("F32") / tps("F16");
+            assert!((ratio - 0.5).abs() < 1e-9, "{path:?}: F32/F16 = {ratio}");
+        }
+    }
+
+    /// Offloading inactive experts to system RAM can never be faster than keeping
+    /// the whole model in VRAM. Estimating the offload path with the dense
+    /// `CpuOffload` factor instead of `MoeOffload` used to invert this.
+    ///
+    /// DDR bandwidth is pinned to the 50 GB/s default: left on auto it is
+    /// measured on the host, and a fast unified-memory machine (Apple Silicon)
+    /// would no longer model a discrete RTX 4090 box.
+    #[test]
+    fn test_moe_offload_is_not_faster_than_gpu() {
+        let model = test_moe_model();
+        let specs = test_specs_known_gpu();
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(50.0),
+            ..cfg()
+        };
+        let gpu = estimate_tps_with_gpu(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            Some(&specs),
+            &config,
+        );
+        let offload = estimate_tps_with_gpu(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::CpuOffload,
+            8,
+            Some(&specs),
+            &config,
+        );
+        assert!(
+            offload < gpu,
+            "MoE offload {offload} should be slower than full GPU {gpu}"
+        );
+    }
+
+    #[test]
+    fn test_speed_run_mode_maps_moe_offload() {
+        assert_eq!(
+            speed_run_mode(PlanRunPath::CpuOffload, &test_moe_model()),
+            RunMode::MoeOffload
+        );
+        assert_eq!(
+            speed_run_mode(PlanRunPath::CpuOffload, &test_model()),
+            RunMode::CpuOffload
+        );
+        assert_eq!(
+            speed_run_mode(PlanRunPath::Gpu, &test_moe_model()),
+            RunMode::Gpu
+        );
+    }
+
+    /// A sparse MoE model reads only its active experts per token, so it must be
+    /// estimated well above the dense-equivalent figure that total-param
+    /// accounting would produce.
+    #[test]
+    fn test_moe_gpu_speed_uses_active_params() {
+        let specs = test_specs_known_gpu();
+        let moe_tps = estimate_tps_with_gpu(
+            &test_moe_model(),
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            Some(&specs),
+            &cfg(),
+        );
+
+        // What the old total-params formula produced: (bw / 30B*bpp) * 0.55.
+        let bw = crate::hardware::gpu_memory_bandwidth_gbps("NVIDIA GeForce RTX 4090")
+            .expect("RTX 4090 bandwidth is known");
+        let dense_equivalent =
+            (bw / (30.0 * crate::models::quant_bytes_per_param("Q4_K_M"))) * 0.55;
+
+        assert!(
+            moe_tps > dense_equivalent * 2.0,
+            "MoE estimate {moe_tps} should far exceed dense-equivalent {dense_equivalent}"
+        );
+    }
+
+    /// The fixed-constant fallback must preserve the same sparse-MoE parameter
+    /// accounting as the known-bandwidth path.
+    #[test]
+    fn test_moe_fallback_speed_uses_active_params() {
+        let moe = test_moe_model();
+        let specs = test_specs();
+
+        let plan_tps = estimate_tps_with_gpu(
+            &moe,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            8,
+            None,
+            &cfg(),
+        );
+        let fit_tps = crate::fit::estimate_tps(
+            &moe,
+            "Q4_K_M",
+            &specs,
+            RunMode::Gpu,
+            crate::fit::InferenceRuntime::LlamaCpp,
+            &cfg(),
+        );
+
+        assert!(
+            (plan_tps - fit_tps).abs() < 1e-9,
+            "fallback MoE estimates diverged: plan={plan_tps} fit={fit_tps}"
+        );
     }
 
     // ── minimum_cores_for_target ─────────────────────────────────────
@@ -1149,8 +1638,14 @@ mod tests {
     #[test]
     fn test_minimum_cores_no_target_returns_default() {
         let model = test_model();
-        let cores =
-            minimum_cores_for_target(&model, "Q4_K_M", GpuBackend::Cuda, PlanRunPath::Gpu, None);
+        let cores = minimum_cores_for_target(
+            &model,
+            "Q4_K_M",
+            GpuBackend::Cuda,
+            PlanRunPath::Gpu,
+            None,
+            &cfg(),
+        );
         assert_eq!(cores, Some(4));
     }
 
@@ -1163,6 +1658,7 @@ mod tests {
             GpuBackend::Cuda,
             PlanRunPath::Gpu,
             Some(5.0),
+            &cfg(),
         );
         assert!(cores.is_some());
         assert!(cores.unwrap() >= 1);
@@ -1177,6 +1673,7 @@ mod tests {
             GpuBackend::CpuX86,
             PlanRunPath::CpuOnly,
             Some(999999.0),
+            &cfg(),
         );
         assert!(cores.is_none());
     }
@@ -1202,7 +1699,7 @@ mod tests {
     fn test_evaluate_current_with_gpu() {
         let model = test_model();
         let specs = test_specs();
-        let status = evaluate_current(&model, "Q4_K_M", 4096, KvQuant::Fp16, None, &specs);
+        let status = evaluate_current(&model, "Q4_K_M", 4096, KvQuant::Fp16, None, &specs, &cfg());
         assert!(status.estimated_tps > 0.0);
         // With 12GB VRAM and 7B model, GPU should be preferred
         assert_eq!(status.run_mode, RunMode::Gpu);
@@ -1215,7 +1712,7 @@ mod tests {
         specs.has_gpu = false;
         specs.gpu_vram_gb = None;
         specs.total_gpu_vram_gb = None;
-        let status = evaluate_current(&model, "Q4_K_M", 4096, KvQuant::Fp16, None, &specs);
+        let status = evaluate_current(&model, "Q4_K_M", 4096, KvQuant::Fp16, None, &specs, &cfg());
         assert_eq!(status.run_mode, RunMode::CpuOnly);
         assert!(status.estimated_tps > 0.0);
     }
@@ -1235,6 +1732,7 @@ mod tests {
             KvQuant::Fp16,
             Some(999999.0),
             &specs,
+            &cfg(),
         );
         assert_eq!(status.fit_level, FitLevel::TooTight);
     }
@@ -1253,6 +1751,7 @@ mod tests {
             None,
             PlanRunPath::Gpu,
             &specs,
+            &cfg(),
         );
         assert!(estimate.feasible);
         let min = estimate.minimum.unwrap();
@@ -1273,9 +1772,155 @@ mod tests {
             None,
             PlanRunPath::CpuOffload,
             &specs,
+            &cfg(),
         );
         assert!(!estimate.feasible);
         assert!(estimate.notes.iter().any(|n| n.contains("unified-memory")));
+    }
+
+    /// A model far larger than the box's VRAM. Before real pools were passed,
+    /// `required_gb == available_gb` made this arm unreachable.
+    #[test]
+    fn test_gpu_fit_level_reaches_too_tight_when_vram_short() {
+        let big = LlmModel {
+            name: "Huge-70B".to_string(),
+            parameter_count: "70B".to_string(),
+            parameters_raw: Some(70_000_000_000),
+            ..test_model()
+        };
+        let specs = test_specs(); // 12 GB VRAM
+        let estimate = build_path_estimate(
+            &big,
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::Gpu,
+            &specs,
+            &cfg(),
+        );
+        assert_eq!(
+            estimate.fit_level,
+            Some(FitLevel::TooTight),
+            "70B on 12 GB VRAM must grade TooTight, got {:?}",
+            estimate.fit_level
+        );
+    }
+
+    #[test]
+    fn test_gpu_fit_level_perfect_with_ample_vram() {
+        let mut specs = test_specs();
+        specs.gpu_vram_gb = Some(80.0);
+        specs.total_gpu_vram_gb = Some(80.0);
+        let estimate = build_path_estimate(
+            &test_model(),
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::Gpu,
+            &specs,
+            &cfg(),
+        );
+        assert_eq!(estimate.fit_level, Some(FitLevel::Perfect));
+    }
+
+    /// The GPU arm must be graded on VRAM alone. It previously compared the VRAM
+    /// requirement against `recommended_ram_gb`, a system-RAM field, which made
+    /// larger models grade *better*.
+    #[test]
+    fn test_gpu_fit_level_is_independent_of_system_ram() {
+        let model = test_model();
+        let mut lean_ram = test_specs();
+        lean_ram.total_ram_gb = 16.0;
+        lean_ram.available_ram_gb = 8.0;
+        let mut fat_ram = test_specs();
+        fat_ram.total_ram_gb = 512.0;
+        fat_ram.available_ram_gb = 480.0;
+
+        let a = build_path_estimate(
+            &model,
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::Gpu,
+            &lean_ram,
+            &cfg(),
+        );
+        let b = build_path_estimate(
+            &model,
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::Gpu,
+            &fat_ram,
+            &cfg(),
+        );
+        assert_eq!(
+            a.fit_level, b.fit_level,
+            "GPU fit must not move with system RAM: {:?} vs {:?}",
+            a.fit_level, b.fit_level
+        );
+    }
+
+    /// The offload path is graded on system RAM too, since that is where the
+    /// weights live. `unified_memory` is left false so this exercises the fit
+    /// grading rather than the early infeasible return.
+    #[test]
+    fn test_cpu_offload_fit_level_uses_available_ram() {
+        let big = LlmModel {
+            name: "Huge-70B".to_string(),
+            parameter_count: "70B".to_string(),
+            parameters_raw: Some(70_000_000_000),
+            ..test_model()
+        };
+        let specs = test_specs(); // 24 GB available RAM, unified_memory: false
+        let estimate = build_path_estimate(
+            &big,
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::CpuOffload,
+            &specs,
+            &cfg(),
+        );
+        assert!(
+            estimate.feasible,
+            "offload is still a viable path on sufficient hardware"
+        );
+        assert_eq!(
+            estimate.fit_level,
+            Some(FitLevel::TooTight),
+            "70B needs more than 24 GB of RAM, got {:?}",
+            estimate.fit_level
+        );
+    }
+
+    /// The CPU paths are graded on system RAM, so a model larger than available
+    /// RAM must reach `TooTight` rather than the blanket `Marginal`.
+    #[test]
+    fn test_cpu_only_fit_level_uses_available_ram() {
+        let big = LlmModel {
+            name: "Huge-70B".to_string(),
+            parameter_count: "70B".to_string(),
+            parameters_raw: Some(70_000_000_000),
+            ..test_model()
+        };
+        let specs = test_specs(); // 24 GB available RAM
+        let estimate = build_path_estimate(
+            &big,
+            "Q4_K_M",
+            4096,
+            KvQuant::Fp16,
+            None,
+            PlanRunPath::CpuOnly,
+            &specs,
+            &cfg(),
+        );
+        assert_eq!(estimate.fit_level, Some(FitLevel::TooTight));
     }
 
     #[test]
@@ -1290,6 +1935,7 @@ mod tests {
             None,
             PlanRunPath::CpuOnly,
             &specs,
+            &cfg(),
         );
         assert!(estimate.feasible);
         assert!(estimate.minimum.as_ref().unwrap().vram_gb.is_none());
@@ -1355,6 +2001,206 @@ mod tests {
         };
         let plan = estimate_model_plan(&model, &req, &specs).unwrap();
         assert!(!plan.upgrade_deltas.is_empty());
+    }
+
+    #[test]
+    fn test_upgrade_deltas_reach_the_fit_they_name() {
+        let model = test_model();
+        let mut specs = test_specs();
+        specs.gpu_vram_gb = Some(4.0);
+        specs.total_gpu_vram_gb = Some(4.0);
+        let plan = estimate_model_plan(&model, &plan_request(), &specs).unwrap();
+
+        for delta in plan
+            .upgrade_deltas
+            .iter()
+            .filter(|d| d.resource == "vram_gb")
+        {
+            let vram = 4.0 + delta.add_gb.unwrap() + 0.01;
+            let mut upgraded = specs.clone();
+            upgraded.gpu_vram_gb = Some(vram);
+            upgraded.total_gpu_vram_gb = Some(vram);
+            let after = estimate_model_plan(&model, &plan_request(), &upgraded).unwrap();
+            assert_eq!(
+                Some(gpu_path_fit(&after)),
+                delta.target_fit,
+                "{}",
+                delta.description
+            );
+        }
+    }
+
+    // `current` and the GPU path grade with fit's thresholds, so a model that
+    // fills 96% of the card is Marginal even when recommended_ram_gb fits.
+    #[test]
+    fn test_plan_grades_near_full_vram_like_fit() {
+        let mut model = test_model();
+        let mut specs = test_specs();
+        let need = model.estimate_memory_gb_with_kv("Q4_K_M", 4096, KvQuant::Fp16);
+        let vram = need / 0.96;
+        model.recommended_ram_gb = vram - 1.0;
+        specs.gpu_vram_gb = Some(vram);
+        specs.total_gpu_vram_gb = Some(vram);
+        specs.available_ram_gb = need;
+
+        let plan = estimate_model_plan(&model, &plan_request(), &specs).unwrap();
+        assert_eq!(gpu_path_fit(&plan), FitLevel::Marginal);
+        assert_eq!(plan.current.run_mode, RunMode::Gpu);
+        assert_eq!(plan.current.fit_level, FitLevel::Marginal);
+    }
+
+    // ── Native MXFP4 (#973) ──────────────────────────────────────────
+
+    fn gpt_oss_120b() -> LlmModel {
+        crate::models::ModelDatabase::embedded()
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "openai/gpt-oss-120b")
+            .expect("catalog is missing openai/gpt-oss-120b")
+            .clone()
+    }
+
+    #[test]
+    fn test_plan_defaults_mxfp4_native_models_to_mxfp4() {
+        let req = PlanRequest {
+            context: 8192,
+            quant: None,
+            target_tps: None,
+            kv_quant: None,
+        };
+        let plan = estimate_model_plan(&gpt_oss_120b(), &req, &test_specs()).unwrap();
+        assert_eq!(plan.quantization, "MXFP4");
+        assert!(
+            plan.run_paths
+                .iter()
+                .all(|p| !p.notes.iter().any(|n| n.contains("pessimistic"))),
+            "the native quant needs no warning"
+        );
+        assert_eq!(normalize_quant("mxfp4"), Some("MXFP4".to_string()));
+    }
+
+    #[test]
+    fn test_plan_flags_a_non_native_quant_on_an_mxfp4_model() {
+        let req = |quant: &str| PlanRequest {
+            context: 8192,
+            quant: Some(quant.to_string()),
+            target_tps: None,
+            kv_quant: None,
+        };
+        let q8 = estimate_model_plan(&gpt_oss_120b(), &req("Q8_0"), &test_specs()).unwrap();
+        assert_eq!(q8.quantization, "Q8_0", "an explicit request is honoured");
+        assert!(q8.run_paths.iter().all(|p| {
+            p.notes
+                .iter()
+                .any(|n| n.contains("MXFP4-native") && n.contains("--quant MXFP4"))
+        }));
+
+        // Any other model asking for Q8_0 gets no such note.
+        let other = estimate_model_plan(&test_model(), &req("Q8_0"), &test_specs()).unwrap();
+        assert!(
+            other
+                .run_paths
+                .iter()
+                .all(|p| !p.notes.iter().any(|n| n.contains("MXFP4")))
+        );
+    }
+
+    // ── Available VRAM (#835) ────────────────────────────────────────
+
+    fn gpu_path_fit(plan: &PlanEstimate) -> FitLevel {
+        plan.run_paths
+            .iter()
+            .find(|p| p.path == PlanRunPath::Gpu)
+            .expect("gpu path")
+            .fit_level
+            .expect("gpu path fit level")
+    }
+
+    fn plan_request() -> PlanRequest {
+        PlanRequest {
+            context: 4096,
+            quant: Some("Q4_K_M".to_string()),
+            target_tps: None,
+            kv_quant: None,
+        }
+    }
+
+    // A 24 GB card with ~1 GB free (a resident vLLM engine) must not grade
+    // the GPU path as a fit, nor pick it as the current run mode.
+    #[test]
+    fn test_plan_grades_gpu_path_against_free_vram() {
+        let model = test_model();
+        let mut idle = test_specs_known_gpu();
+        idle.gpu_available_gb = Some(23.5);
+        let mut occupied = test_specs_known_gpu();
+        occupied.gpu_available_gb = Some(1.09);
+
+        let idle_plan = estimate_model_plan(&model, &plan_request(), &idle).unwrap();
+        let occupied_plan = estimate_model_plan(&model, &plan_request(), &occupied).unwrap();
+
+        assert_ne!(gpu_path_fit(&idle_plan), FitLevel::TooTight);
+        assert_eq!(gpu_path_fit(&occupied_plan), FitLevel::TooTight);
+        assert_ne!(occupied_plan.current.run_mode, RunMode::Gpu);
+        let gpu = occupied_plan
+            .run_paths
+            .iter()
+            .find(|p| p.path == PlanRunPath::Gpu)
+            .unwrap();
+        assert!(
+            gpu.notes.iter().any(|n| n.contains("currently free")),
+            "{:?}",
+            gpu.notes
+        );
+    }
+
+    // No free-VRAM reading (older driver, Intel, Windows, or a --gpu-vram
+    // override) grades against total capacity exactly as before.
+    #[test]
+    fn test_plan_falls_back_to_total_vram_without_a_free_reading() {
+        let model = test_model();
+        let unknown = test_specs_known_gpu();
+        assert_eq!(unknown.gpu_available_gb, None);
+        let mut idle = test_specs_known_gpu();
+        idle.gpu_available_gb = Some(24.0);
+
+        let a = estimate_model_plan(&model, &plan_request(), &unknown).unwrap();
+        let b = estimate_model_plan(&model, &plan_request(), &idle).unwrap();
+        assert_eq!(gpu_path_fit(&a), gpu_path_fit(&b));
+        assert_eq!(a.current.fit_level, b.current.fit_level);
+        assert_eq!(a.current.run_mode, b.current.run_mode);
+    }
+
+    // On unified memory gpu_available_gb is Metal's wiring cap, not a
+    // free-memory reading, so it must not change the pool; and a reading
+    // above capacity is clamped to it.
+    #[test]
+    fn test_gpu_fit_pool_ignores_metal_cap_and_clamps_to_total() {
+        let mut unified = test_specs_known_gpu();
+        unified.unified_memory = true;
+        unified.gpu_available_gb = Some(10.0);
+        assert_eq!(unified.gpu_fit_pool_gb(), 24.0);
+
+        let mut bogus = test_specs_known_gpu();
+        bogus.gpu_available_gb = Some(99.0);
+        assert_eq!(bogus.gpu_fit_pool_gb(), 24.0);
+    }
+
+    // What to buy is a capacity question: a busy card must not inflate it.
+    #[test]
+    fn test_upgrade_deltas_ignore_transient_vram_use() {
+        let model = test_model();
+        let mut idle = test_specs();
+        idle.gpu_vram_gb = Some(4.0);
+        idle.total_gpu_vram_gb = Some(4.0);
+        let mut occupied = idle.clone();
+        occupied.gpu_available_gb = Some(0.5);
+
+        let a = estimate_model_plan(&model, &plan_request(), &idle).unwrap();
+        let b = estimate_model_plan(&model, &plan_request(), &occupied).unwrap();
+        let vram = |p: &PlanEstimate| -> Vec<Option<f64>> {
+            p.upgrade_deltas.iter().map(|d| d.add_gb).collect()
+        };
+        assert_eq!(vram(&a), vram(&b));
     }
 
     #[test]

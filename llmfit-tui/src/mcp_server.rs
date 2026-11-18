@@ -1,13 +1,12 @@
 use llmfit_core::fit::{
-    FitLevel, InferenceRuntime, ModelFit, SortColumn, backend_compatible,
-    rank_models_by_fit_opts_col,
+    CalcConfig, FitLevel, InferenceRuntime, ModelFit, SortColumn, rank_models_by_fit_opts_col,
 };
 use llmfit_core::hardware::{GpuBackend, SystemSpecs};
 use llmfit_core::models::{LlmModel, ModelDatabase, UseCase};
-use llmfit_core::plan::{PlanRequest, estimate_model_plan};
+use llmfit_core::plan::{PlanRequest, estimate_model_plan_with_config};
 use llmfit_core::providers::{
     DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider, ModelProvider,
-    OllamaProvider, VllmProvider,
+    OllamaProvider, RamaLamaProvider, VllmProvider,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -26,7 +25,7 @@ pub struct RecommendModelsParams {
     pub use_case: Option<String>,
     /// Minimum fit level: perfect, good, marginal
     pub min_fit: Option<String>,
-    /// Filter by runtime: mlx, llamacpp, vllm
+    /// Filter by runtime: mlx, llamacpp, vllm, bitnetcpp
     pub runtime: Option<String>,
     /// Filter by license string
     pub license: Option<String>,
@@ -75,6 +74,9 @@ pub struct LlmfitMcpServer {
     specs: SystemSpecs,
     models: Vec<LlmModel>,
     context_limit: Option<u32>,
+    /// Calculation parameters implied by `--profile`, or `None` when the
+    /// server describes the machine it runs on (issue #969).
+    calc_config: Option<CalcConfig>,
     node_name: String,
     tool_router: ToolRouter<Self>,
 }
@@ -88,12 +90,14 @@ impl LlmfitMcpServer {
         specs: SystemSpecs,
         models: Vec<LlmModel>,
         context_limit: Option<u32>,
+        calc_config: Option<CalcConfig>,
         node_name: String,
     ) -> Self {
         Self {
             specs,
             models,
             context_limit,
+            calc_config,
             node_name,
             tool_router: Self::tool_router(),
         }
@@ -166,17 +170,22 @@ impl LlmfitMcpServer {
         let params = params.0;
         let limit = params.limit.unwrap_or(10);
         let search_lower = params.query.to_lowercase();
+        let terms: Vec<&str> = search_lower.split_whitespace().collect();
 
         let mut fits = self.analyze_all();
         fits.retain(|f| {
-            f.model.name.to_lowercase().contains(&search_lower)
-                || f.model.provider.to_lowercase().contains(&search_lower)
-                || f.model
-                    .parameter_count
-                    .to_lowercase()
-                    .contains(&search_lower)
-                || f.model.use_case.to_lowercase().contains(&search_lower)
-                || f.use_case.label().to_lowercase().contains(&search_lower)
+            let name = f.model.name.to_lowercase();
+            let provider = f.model.provider.to_lowercase();
+            let size = f.model.parameter_count.to_lowercase();
+            let use_case = f.model.use_case.to_lowercase();
+            let label = f.use_case.label().to_lowercase();
+            terms.iter().all(|t| {
+                name.contains(t)
+                    || provider.contains(t)
+                    || size.contains(t)
+                    || use_case.contains(t)
+                    || label.contains(t)
+            })
         });
         fits.retain(|f| f.fit_level != FitLevel::TooTight);
 
@@ -198,18 +207,23 @@ impl LlmfitMcpServer {
         name = "plan_hardware",
         description = "Plan hardware requirements for running a specific model at a given context window size"
     )]
-    async fn plan_hardware(&self, params: Parameters<PlanHardwareParams>) -> String {
+    async fn plan_hardware(
+        &self,
+        params: Parameters<PlanHardwareParams>,
+    ) -> Result<String, String> {
         let params = params.0;
         let model = self
             .models
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(&params.model));
 
+        // An Err is sent as a tool error (isError: true), so the client does
+        // not take the error object for a plan.
         let Some(model) = model else {
-            return serde_json::json!({
+            return Err(serde_json::json!({
                 "error": format!("model '{}' not found", params.model),
             })
-            .to_string();
+            .to_string());
         };
 
         let request = PlanRequest {
@@ -219,11 +233,12 @@ impl LlmfitMcpServer {
             kv_quant: None,
         };
 
-        match estimate_model_plan(model, &request, &self.specs) {
+        let config = self.calc_config.clone().unwrap_or_default();
+        match estimate_model_plan_with_config(model, &request, &self.specs, &config) {
             Ok(estimate) => {
-                serde_json::to_string_pretty(&serde_json::json!(estimate)).unwrap_or_default()
+                Ok(serde_json::to_string_pretty(&serde_json::json!(estimate)).unwrap_or_default())
             }
-            Err(e) => serde_json::json!({ "error": e }).to_string(),
+            Err(e) => Err(serde_json::json!({ "error": e }).to_string()),
         }
     }
 
@@ -257,6 +272,10 @@ impl LlmfitMcpServer {
         set.spawn_blocking(|| RuntimeInfo {
             name: "vllm",
             installed: VllmProvider::new().is_available(),
+        });
+        set.spawn_blocking(|| RuntimeInfo {
+            name: "ramalama",
+            installed: RamaLamaProvider::new().detect_with_installed().0,
         });
 
         let mut runtimes = Vec::new();
@@ -305,21 +324,22 @@ impl LlmfitMcpServer {
             let p = VllmProvider::new();
             ("vllm", p.is_available(), p.installed_models())
         });
+        set.spawn_blocking(|| {
+            let p = RamaLamaProvider::new();
+            let (available, installed, _) = p.detect_with_installed();
+            ("ramalama", available, installed)
+        });
 
-        let mut models = Vec::new();
+        let mut detected = Vec::new();
         while let Some(result) = set.join_next().await {
-            if let Ok((name, available, installed)) = result {
-                if available {
-                    for model_name in installed {
-                        models.push(InstalledModel {
-                            name: model_name,
-                            runtime: name.to_string(),
-                        });
-                    }
-                }
+            if let Ok((name, available, installed)) = result
+                && available
+            {
+                detected.push((name, installed));
             }
         }
 
+        let models = installed_models_from_results(detected);
         let result = serde_json::json!({ "models": models });
         serde_json::to_string_pretty(&result).unwrap_or_default()
     }
@@ -328,14 +348,18 @@ impl LlmfitMcpServer {
 impl LlmfitMcpServer {
     fn analyze_all(&self) -> Vec<ModelFit> {
         let is_apple_silicon = self.specs.backend == GpuBackend::Metal && self.specs.unified_memory;
-        let mut fits: Vec<ModelFit> = self
-            .models
-            .iter()
-            .filter(|m| backend_compatible(m, &self.specs))
-            .map(|m| {
-                ModelFit::analyze_with_forced_runtime(m, &self.specs, self.context_limit, None)
-            })
-            .collect();
+        let mut fits: Vec<ModelFit> =
+            llmfit_core::analysis::rankable_models(&self.models, &self.specs)
+                .map(|m| {
+                    llmfit_core::analysis::analyze_with_optional_config(
+                        m,
+                        &self.specs,
+                        self.context_limit,
+                        self.calc_config.as_ref(),
+                    )
+                })
+                .collect();
+        llmfit_core::analysis::annotate_measured(&mut fits, &self.specs);
 
         if !is_apple_silicon {
             fits.retain(|f| !f.model.is_mlx_only());
@@ -345,13 +369,27 @@ impl LlmfitMcpServer {
     }
 }
 
+fn installed_models_from_results(
+    results: Vec<(&'static str, std::collections::HashSet<String>)>,
+) -> Vec<InstalledModel> {
+    results
+        .into_iter()
+        .flat_map(|(runtime, models)| {
+            models.into_iter().map(move |name| InstalledModel {
+                name,
+                runtime: runtime.to_string(),
+            })
+        })
+        .collect()
+}
+
 // --- Entry point ---
 
 pub fn run_mcp_server(
     overrides: &super::HardwareOverrides,
     context_limit: Option<u32>,
 ) -> Result<(), String> {
-    let specs = super::detect_specs(overrides);
+    let (specs, calc_config) = super::detect_specs_and_config(overrides);
     let db = ModelDatabase::new();
     let models = db.get_all_models().clone();
     let node_name = std::env::var("HOSTNAME")
@@ -359,7 +397,7 @@ pub fn run_mcp_server(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "unknown-node".to_string());
 
-    let server = LlmfitMcpServer::new(specs, models, context_limit, node_name);
+    let server = LlmfitMcpServer::new(specs, models, context_limit, calc_config, node_name);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -408,6 +446,7 @@ fn parse_runtime(raw: Option<&str>) -> Option<InferenceRuntime> {
         "mlx" => Some(InferenceRuntime::Mlx),
         "llamacpp" | "llama.cpp" | "llama_cpp" => Some(InferenceRuntime::LlamaCpp),
         "vllm" => Some(InferenceRuntime::Vllm),
+        "bitnetcpp" | "bitnet.cpp" | "bitnet" => Some(InferenceRuntime::BitNet),
         _ => None,
     })
 }
@@ -432,4 +471,230 @@ fn fit_at_least(actual: FitLevel, minimum: FitLevel) -> bool {
         FitLevel::TooTight => 0,
     };
     rank(actual) >= rank(minimum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::tool::IntoCallToolResult;
+    use rmcp::model::CallToolResponse;
+    use serde_json::Value;
+
+    fn test_server() -> LlmfitMcpServer {
+        server_with(SystemSpecs::detect(), None)
+    }
+
+    #[test]
+    fn plan_json_reports_disk_size_at_the_requested_quant() {
+        let server = server_with(unified_specs(), None);
+        let expected = server
+            .models
+            .iter()
+            .find(|m| m.name == "openai/gpt-oss-120b")
+            .expect("fixture model")
+            .estimate_disk_gb("Q8_0");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let output = runtime.block_on(server.plan_hardware(Parameters(PlanHardwareParams {
+            model: "openai/gpt-oss-120b".to_string(),
+            context: Some(8192),
+            quant: Some("q8_0".to_string()),
+            target_tps: None,
+        })));
+        let json: Value = serde_json::from_str(&output.expect("plan")).expect("plan JSON");
+        assert_eq!(json["quantization"], "Q8_0");
+        // serde_json parses floats fast, not exactly: without its
+        // `float_roundtrip` feature a value can come back one ULP off
+        // (126.43295434560001 parses as 126.4329543456), so compare with a
+        // tolerance rather than bit-for-bit.
+        let disk = json["disk_size_gb"].as_f64().expect("numeric disk size");
+        assert!(
+            (disk - expected).abs() <= 1e-9 * expected.abs(),
+            "disk_size_gb {disk} != {expected}"
+        );
+    }
+
+    #[test]
+    fn plan_errors_are_tool_errors() {
+        let server = server_with(unified_specs(), None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let plan = |model: &str, context: Option<u32>, quant: Option<&str>| {
+            runtime.block_on(server.plan_hardware(Parameters(PlanHardwareParams {
+                model: model.to_string(),
+                context,
+                quant: quant.map(str::to_string),
+                target_tps: None,
+            })))
+        };
+        for result in [
+            plan("no/such-model", None, None),
+            plan("openai/gpt-oss-120b", None, Some("bogus")),
+            plan("openai/gpt-oss-120b", Some(0), None),
+        ] {
+            let err = result.clone().expect_err("plan should fail");
+            let json: Value = serde_json::from_str(&err).expect("error JSON");
+            assert!(json["error"].is_string(), "{json}");
+            let call = result.into_call_tool_result().expect("tool result");
+            assert!(matches!(call, CallToolResponse::Complete(r) if r.is_error == Some(true)));
+        }
+    }
+
+    fn server_with(specs: SystemSpecs, calc_config: Option<CalcConfig>) -> LlmfitMcpServer {
+        LlmfitMcpServer::new(
+            specs,
+            ModelDatabase::new().get_all_models().clone(),
+            None,
+            calc_config,
+            "test-node".to_string(),
+        )
+    }
+
+    /// A fixed 128 GB unified-memory box, so estimator assertions don't depend
+    /// on whatever hardware the test happens to run on.
+    fn unified_specs() -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: 128.0,
+            available_ram_gb: 120.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(128.0),
+            total_gpu_vram_gb: Some(128.0),
+            gpu_available_gb: None,
+            gpu_name: Some("Test Unified GPU".to_string()),
+            gpu_count: 1,
+            unified_memory: true,
+            backend: GpuBackend::Rocm,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    /// MCP clients rank from `analyze_all`, so the sanitization gate has to
+    /// hold here too — an agent must not be handed a speculative-decoding
+    /// draft head that the CLI hides (issue #969, problem 3).
+    #[test]
+    fn analyze_all_excludes_sanitization_demoted_entries() {
+        let db = ModelDatabase::new();
+        let demoted: std::collections::HashSet<&str> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| m.is_sanitization_demoted())
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(
+            !demoted.is_empty(),
+            "catalog has no demoted entries to hide"
+        );
+
+        let fits = server_with(unified_specs(), None).analyze_all();
+
+        assert!(!fits.is_empty(), "expected some ranked fits");
+        let leaked: Vec<&str> = fits
+            .iter()
+            .map(|f| f.model.name.as_str())
+            .filter(|name| demoted.contains(name))
+            .collect();
+        assert!(leaked.is_empty(), "demoted models reached MCP: {leaked:?}");
+    }
+
+    /// A profile's bandwidth has to reach the estimator, not just the reported
+    /// capacity, or MCP publishes this host's speeds under the profile's name.
+    #[test]
+    fn analyze_all_estimates_from_the_profile_config() {
+        let config = CalcConfig {
+            gpu_bandwidth_gbps_override: Some(777.0),
+            ..CalcConfig::default()
+        };
+
+        let bandwidths: Vec<f64> = server_with(unified_specs(), Some(config))
+            .analyze_all()
+            .iter()
+            .filter_map(|f| f.estimate_basis.gpu_bandwidth_gbps)
+            .collect();
+
+        assert!(
+            !bandwidths.is_empty() && bandwidths.iter().all(|bw| *bw == 777.0),
+            "every GPU-path estimate should use the profile bandwidth, got {bandwidths:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_discovery_includes_ramalama() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let output = runtime.block_on(test_server().get_runtimes());
+        let value: Value = serde_json::from_str(&output).expect("runtime output should be JSON");
+        let runtimes = value
+            .get("runtimes")
+            .and_then(Value::as_array)
+            .expect("runtime output should contain an array");
+
+        assert!(
+            runtimes
+                .iter()
+                .any(|runtime| { runtime.get("name").and_then(Value::as_str) == Some("ramalama") })
+        );
+    }
+
+    #[test]
+    fn installed_model_discovery_returns_json_when_providers_are_unavailable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let output = runtime.block_on(test_server().get_installed_models());
+        let value: Value =
+            serde_json::from_str(&output).expect("installed model output should be JSON");
+        let models = value
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("installed model output should contain an array");
+
+        assert!(models.iter().all(|model| {
+            model.get("name").and_then(Value::as_str).is_some()
+                && model.get("runtime").and_then(Value::as_str).is_some()
+        }));
+    }
+
+    #[test]
+    fn installed_model_discovery_preserves_ramalama_model_identity() {
+        let models = installed_models_from_results(vec![(
+            "ramalama",
+            std::collections::HashSet::from(["model-x".to_string()]),
+        )]);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].runtime, "ramalama");
+        assert_eq!(models[0].name, "model-x");
+    }
+
+    #[test]
+    fn search_models_matches_every_word() {
+        let server = server_with(unified_specs(), None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let output = runtime.block_on(server.search_models(Parameters(SearchModelsParams {
+            query: "qwen 7b".to_string(),
+            limit: Some(50),
+        })));
+        let json: Value = serde_json::from_str(&output).expect("search JSON");
+        let models = json["models"].as_array().expect("models");
+        assert!(!models.is_empty(), "no models for \"qwen 7b\": {json}");
+        for m in models {
+            let fields =
+                format!("{} {} {}", m["name"], m["provider"], m["parameter_count"]).to_lowercase();
+            assert!(fields.contains("qwen") && fields.contains("7b"), "{fields}");
+        }
+    }
 }

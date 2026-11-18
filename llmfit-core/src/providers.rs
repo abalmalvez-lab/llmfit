@@ -2,8 +2,10 @@
 //!
 //! Each provider can list locally installed models and pull new ones.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Provider trait
@@ -73,6 +75,38 @@ fn normalize_ollama_host(raw: &str) -> Option<String> {
     Some(format!("http://{host}"))
 }
 
+/// The Ollama base URL for one-shot clients (bench): `OLLAMA_HOST` read the
+/// way [`OllamaProvider`] reads it, else `http://localhost:11434`.
+pub fn ollama_bench_url() -> String {
+    ollama_url_from(std::env::var("OLLAMA_HOST").ok().as_deref())
+}
+
+fn ollama_url_from(raw: Option<&str>) -> String {
+    explicit_ollama_host(raw).unwrap_or_else(|| "http://localhost:11434".to_string())
+}
+
+/// `OLLAMA_HOST` as a client base URL: the scheme added when missing. `None`
+/// (with a warning) when it cannot be used: an unsupported scheme, or a
+/// wildcard bind address such as `0.0.0.0`.
+fn explicit_ollama_host(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let Some(normalized) = normalize_ollama_host(raw) else {
+        eprintln!(
+            "Warning: could not parse OLLAMA_HOST='{}'. Expected host:port or http(s)://host:port",
+            raw
+        );
+        return None;
+    };
+    if is_wildcard_bind_address(&normalized) {
+        eprintln!(
+            "Warning: OLLAMA_HOST='{}' is a wildcard bind address; falling back to localhost.",
+            raw
+        );
+        return None;
+    }
+    Some(normalized)
+}
+
 /// Returns true if the URL's host is a wildcard bind address — `0.0.0.0`
 /// (IPv4) or `[::]` (IPv6). Servers listen on these to accept traffic on
 /// every interface, but they are never valid as a connect target. When
@@ -102,23 +136,7 @@ fn is_wildcard_bind_address(url: &str) -> bool {
 
 impl Default for OllamaProvider {
     fn default() -> Self {
-        let explicit = std::env::var("OLLAMA_HOST").ok().and_then(|raw| {
-            let Some(normalized) = normalize_ollama_host(&raw) else {
-                eprintln!(
-                    "Warning: could not parse OLLAMA_HOST='{}'. Expected host:port or http(s)://host:port",
-                    raw
-                );
-                return None;
-            };
-            if is_wildcard_bind_address(&normalized) {
-                eprintln!(
-                    "Warning: OLLAMA_HOST='{}' is a wildcard bind address; falling back to localhost.",
-                    raw
-                );
-                return None;
-            }
-            Some(normalized)
-        });
+        let explicit = explicit_ollama_host(std::env::var("OLLAMA_HOST").ok().as_deref());
 
         if let Some(base_url) = explicit {
             // User supplied an explicit host — use it as-is, no fallback.
@@ -181,7 +199,7 @@ impl OllamaProvider {
     /// is configured, the fallback is tried and—if successful—adopted as the
     /// provider's base URL for all subsequent requests (pull, show, …).
     pub fn detect_with_installed(&mut self) -> (bool, HashSet<String>, usize) {
-        let mut set = HashSet::new();
+        let set = HashSet::new();
 
         let primary_ok = ureq::get(&self.api_url("tags"))
             .config()
@@ -215,14 +233,7 @@ impl OllamaProvider {
         let Ok(tags): Result<TagsResponse, _> = resp.into_body().read_json() else {
             return (true, set, 0);
         };
-        let count = tags.models.len();
-        for m in tags.models {
-            let lower = m.name.to_lowercase();
-            set.insert(lower.clone());
-            if let Some(family) = lower.split(':').next() {
-                set.insert(family.to_string());
-            }
-        }
+        let (set, count) = build_installed_set(tags.models);
         (true, set, count)
     }
 
@@ -230,27 +241,18 @@ impl OllamaProvider {
     /// The HashSet may have fewer entries than 2*count due to family-name deduplication,
     /// so `len() / 2` is unreliable for counting models.
     pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
-        let mut set = HashSet::new();
         let Ok(resp) = ureq::get(&self.api_url("tags"))
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(5)))
             .build()
             .call()
         else {
-            return (set, 0);
+            return (HashSet::new(), 0);
         };
         let Ok(tags): Result<TagsResponse, _> = resp.into_body().read_json() else {
-            return (set, 0);
+            return (HashSet::new(), 0);
         };
-        let count = tags.models.len();
-        for m in tags.models {
-            let lower = m.name.to_lowercase();
-            set.insert(lower.clone());
-            if let Some(family) = lower.split(':').next() {
-                set.insert(family.to_string());
-            }
-        }
-        (set, count)
+        build_installed_set(tags.models)
     }
 
     /// Best-effort check that a tag exists in Ollama's remote registry.
@@ -273,10 +275,100 @@ struct TagsResponse {
     models: Vec<OllamaModel>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct OllamaModel {
     /// e.g. "llama3.1:8b-instruct-q4_K_M"
     name: String,
+    /// On-disk size in bytes. Cloud-hosted models are served remotely and
+    /// report `0` because nothing is stored locally.
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    details: OllamaModelDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct OllamaModelDetails {
+    /// Parameter count of the resolved weights as Ollama reports it, e.g.
+    /// "8.2B" for `qwen3:latest`. Empty when the daemon omits it.
+    #[serde(default)]
+    parameter_size: String,
+}
+
+impl OllamaModel {
+    /// Whether this entry is a cloud-hosted model rather than a local install.
+    /// Ollama surfaces cloud models with a `-cloud` tag suffix (e.g.
+    /// `qwen3-coder:480b-cloud`) and a zero on-disk size.
+    fn is_cloud(&self) -> bool {
+        let tag = self.name.rsplit(':').next().unwrap_or("");
+        tag.ends_with("-cloud") || self.size == 0
+    }
+}
+
+/// The tag Ollama resolves when a model is pulled without one.
+const OLLAMA_DEFAULT_TAG: &str = "latest";
+
+/// Ollama-style size tokens implied by the parameter count Ollama reports,
+/// e.g. "8.2B" → `["8b", "8.2b"]`.
+///
+/// Most tags carry the marketing size rather than the true count (`qwen2.5:14b`
+/// reports "14.8B"), hence the truncated form. Families tagged with a decimal
+/// (`qwen3:1.7b`, `solar:10.7b`) need the verbatim form as well. Counts below
+/// 1B are reported in "M" — `qwen3:0.6b` reports "596.05M" — and have no
+/// reliable tag form, so they yield nothing rather than a bogus `0b`.
+fn size_tokens_from_parameter_size(parameter_size: &str) -> Vec<String> {
+    let raw = parameter_size.trim().to_lowercase();
+    let Some(value) = raw
+        .strip_suffix('b')
+        .and_then(|digits| digits.parse::<f64>().ok())
+        .filter(|v| *v >= 1.0)
+    else {
+        return Vec::new();
+    };
+
+    let mut tokens = vec![format!("{}b", value.trunc() as u64)];
+    if tokens[0] != raw {
+        tokens.push(raw);
+    }
+    tokens
+}
+
+/// Build the set of installed model name stems from Ollama's tag list, plus the
+/// count of locally-installed models. Cloud-hosted models are skipped entirely:
+/// they are not installed locally, and inserting their family stem (e.g.
+/// `qwen3-coder` from `qwen3-coder:480b-cloud`) would falsely mark unrelated
+/// models as installed (#619).
+///
+/// A **sized** install (`qwen3:8b`) contributes its tag and nothing else: the
+/// tag already says exactly which weights are on disk, and adding the bare
+/// family stem made every catalog entry in that family look installed — one
+/// `qwen3:8b` marked 238 of 9,250 models, `Qwen3-235B-A22B` among them (#861).
+/// Only an untagged / `:latest` install, where the size genuinely is unknown,
+/// contributes a family stem — plus the sized alias its parameter count implies,
+/// so `qwen3:latest` still matches `Qwen/Qwen3-8B` specifically.
+fn build_installed_set(models: Vec<OllamaModel>) -> (HashSet<String>, usize) {
+    let mut set = HashSet::new();
+    let mut count = 0;
+    for m in models {
+        if m.is_cloud() {
+            continue;
+        }
+        count += 1;
+        let lower = m.name.to_lowercase();
+        set.insert(lower.clone());
+
+        let (family, tag) = lower
+            .split_once(':')
+            .unwrap_or((lower.as_str(), OLLAMA_DEFAULT_TAG));
+        if tag != OLLAMA_DEFAULT_TAG {
+            continue;
+        }
+        set.insert(family.to_string());
+        for size in size_tokens_from_parameter_size(&m.details.parameter_size) {
+            set.insert(format!("{family}:{size}"));
+        }
+    }
+    (set, count)
 }
 
 #[derive(serde::Deserialize)]
@@ -376,36 +468,321 @@ impl ModelProvider for OllamaProvider {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-compatible provider helpers
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub(crate) struct OpenAiModelList {
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiModel {
+    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct".
+    id: String,
+    /// OpenAI-compatible providers may include an owner string. oMLX uses
+    /// `owned_by: "omlx"`, which lets us disambiguate it from vLLM.
+    owned_by: Option<String>,
+}
+
+fn openai_models_url(base_url: &str) -> String {
+    format!("{}/v1/models", base_url.trim_end_matches('/'))
+}
+
+/// Identity of an OpenAI-compatible endpoint, read from the `/v1/models`
+/// response itself so a server is recognized before any of its model ids
+/// are imported (#791, #790).
+///
+/// Measured against live servers (2026-08-23): llama-server stamps
+/// `Server: llama.cpp` on every response and lists models with
+/// `owned_by: "llamacpp"`; llama-swap lists models with
+/// `owned_by: "llama-swap"`; mlx_lm.server (0.31.3) sends a Python
+/// `BaseHTTP` Server header and no `owned_by` field at all. vLLM and Docker
+/// Model Runner were measured 2026-09-01 (see the variants below); Ferrum was
+/// captured 2026-09-02 in #992. LM Studio is identified out-of-band via its
+/// native /api/v0 API (`lmstudio_native_models`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenAiEndpointIdentity {
+    /// llama.cpp serving directly.
+    LlamaCpp,
+    /// A llama-swap proxy fronting llama.cpp instances.
+    LlamaSwap,
+    /// vLLM's OpenAI server (measured 2026-09-01: owned_by "vllm").
+    Vllm,
+    /// Ferrum's OpenAI-compatible server (owned_by "ferrum").
+    Ferrum,
+    /// Docker Model Runner (measured 2026-09-01: owned_by "docker").
+    DockerModelRunner,
+    /// No foreign marker recognized.
+    Unrecognized,
+}
+
+fn classify_openai_endpoint(
+    server_header: Option<&str>,
+    list: &OpenAiModelList,
+) -> OpenAiEndpointIdentity {
+    let owned_by = |name: &str| {
+        list.data.iter().any(|model| {
+            model
+                .owned_by
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(name))
+        })
+    };
+    // vLLM stamps owned_by "vllm". Its Server: uvicorn header is shared by any
+    // FastAPI app, so the owner string is the discriminator. Measured 2026-09-01.
+    if owned_by("vllm") {
+        return OpenAiEndpointIdentity::Vllm;
+    }
+    if owned_by("ferrum") {
+        return OpenAiEndpointIdentity::Ferrum;
+    }
+    // Docker Model Runner stamps owned_by "docker" (plus a per-model `dmr`
+    // object) and sends no Server header. Measured 2026-09-01.
+    if owned_by("docker") {
+        return OpenAiEndpointIdentity::DockerModelRunner;
+    }
+    if owned_by("llama-swap") {
+        return OpenAiEndpointIdentity::LlamaSwap;
+    }
+    if owned_by("llamacpp") || server_header.is_some_and(|s| s.eq_ignore_ascii_case("llama.cpp")) {
+        return OpenAiEndpointIdentity::LlamaCpp;
+    }
+    OpenAiEndpointIdentity::Unrecognized
+}
+
+pub(crate) fn fetch_openai_model_list(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Option<(OpenAiModelList, OpenAiEndpointIdentity)> {
+    let resp = ureq::get(&openai_models_url(base_url))
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .ok()?;
+    let server_header = resp
+        .headers()
+        .get("server")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let list = resp.into_body().read_json::<OpenAiModelList>().ok()?;
+    let identity = classify_openai_endpoint(server_header.as_deref(), &list);
+    Some((list, identity))
+}
+
+fn openai_model_list_is_omlx(list: &OpenAiModelList) -> bool {
+    list.data.iter().any(|model| {
+        model
+            .owned_by
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case("omlx"))
+    })
+}
+
+pub(crate) fn openai_model_ids(list: &OpenAiModelList) -> impl Iterator<Item = &str> {
+    list.data.iter().map(|model| model.id.as_str())
+}
+
+fn is_omlx_status_payload(json: &serde_json::Value) -> bool {
+    json.get("status").and_then(|v| v.as_str()) == Some("ok")
+        && json.get("version").and_then(|v| v.as_str()).is_some()
+        && (json.get("models_discovered").is_some()
+            || json.get("model_memory_max").is_some()
+            || json.get("cache_efficiency").is_some())
+}
+
+fn endpoint_has_omlx_status(base_url: &str, timeout: std::time::Duration) -> bool {
+    let url = format!("{}/api/status", base_url.trim_end_matches('/'));
+    let Ok(resp) = ureq::get(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+    else {
+        return false;
+    };
+    let Ok(json) = resp.into_body().read_json::<serde_json::Value>() else {
+        return false;
+    };
+    is_omlx_status_payload(&json)
+}
+
+/// One entry of LM Studio's native `/api/v0/models` response. `compatibility_type`
+/// and `state` are LM Studio-specific fields, absent from the OpenAI `/v1/models`
+/// schema, which lets us positively identify the runtime.
+#[derive(serde::Deserialize)]
+pub(crate) struct LmStudioNativeModel {
+    id: String,
+    #[serde(default, rename = "type")]
+    model_type: Option<String>,
+    #[serde(default)]
+    compatibility_type: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct LmStudioNativeList {
+    data: Vec<LmStudioNativeModel>,
+}
+
+/// Models listed when the endpoint answers LM Studio's native `/api/v0/models` route
+/// with LM Studio's native schema. A generic OpenAI-compatible server (even
+/// one behind Express) does not serve this LM Studio-specific route, so this
+/// is the evidence that identifies LM Studio rather than the framework-wide
+/// `X-Powered-By` header (#790). Measured 2026-09-01 against LM Studio 0.4.23:
+/// the route lists every model on disk (loaded or not) with the native
+/// `compatibility_type`/`state` fields, an unauthenticated `Authorization`
+/// header is tolerated when the API key requirement is off, and unknown paths
+/// answer a JSON `error` object rather than a model list.
+pub(crate) fn lmstudio_native_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: std::time::Duration,
+) -> Option<Vec<LmStudioNativeModel>> {
+    let url = format!("{}/api/v0/models", base_url.trim_end_matches('/'));
+    let mut req = ureq::get(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build();
+    // Honor a configured key, like the /v1/models fetch: with LM Studio's
+    // "Require API Key" enabled the native route needs it too, and sending it
+    // when the requirement is off is accepted (measured).
+    if let Some(key) = api_key {
+        req = req.header("Authorization", &format!("Bearer {}", key));
+    }
+    let list = req
+        .call()
+        .ok()?
+        .into_body()
+        .read_json::<LmStudioNativeList>()
+        .ok()?;
+    // Identify only on an entry carrying LM Studio-native fields. An empty
+    // `data` array carries no evidence, so it stays unidentified: since the
+    // native route lists on-disk models, a server with no downloaded models
+    // has nothing to import anyway.
+    list.data
+        .iter()
+        .any(|m| m.compatibility_type.is_some() || m.state.is_some())
+        .then_some(list.data)
+}
+
+/// Ids of the chat models LM Studio currently holds in memory. Benchmarking a
+/// model that is only on disk would trigger a load.
+pub(crate) fn lmstudio_loaded_models(models: Vec<LmStudioNativeModel>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|m| m.state.as_deref() == Some("loaded"))
+        .filter(|m| m.model_type.as_deref() != Some("embeddings"))
+        .map(|m| m.id)
+        .collect()
+}
+
+/// True when the endpoint's root answers with Docker Model Runner's banner.
+/// A runner with no models yet returns an empty `/v1/models` list that carries
+/// no `owned_by` marker, so identity falls back to this probe. Measured
+/// 2026-09-01: `GET /` answers `Docker Model Runner is running` as plain text.
+fn endpoint_is_docker_model_runner_root(base_url: &str, timeout: std::time::Duration) -> bool {
+    let url = format!("{}/", base_url.trim_end_matches('/'));
+    let Ok(resp) = ureq::get(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+    else {
+        return false;
+    };
+    let Ok(body) = resp.into_body().read_to_string() else {
+        return false;
+    };
+    body.trim() == "Docker Model Runner is running"
+}
+
+// ---------------------------------------------------------------------------
 // MLX provider (Apple MLX framework via HuggingFace cache)
 // ---------------------------------------------------------------------------
 
+const MLX_DEFAULT_SERVER_URL: &str = "http://localhost:8080";
+const OMLX_DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8000";
+
+struct MlxServerCandidate<'a> {
+    base_url: &'a str,
+    require_omlx_identity: bool,
+}
+
 pub struct MlxProvider {
     server_url: String,
+    server_url_explicit: bool,
 }
 
 impl Default for MlxProvider {
     fn default() -> Self {
-        let server_url = std::env::var("MLX_LM_HOST")
-            .ok()
-            .and_then(|url| {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    Some(url)
-                } else {
-                    eprintln!(
-                        "Warning: MLX_LM_HOST must start with http:// or https://, ignoring: {}",
-                        url
-                    );
-                    None
-                }
-            })
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        Self { server_url }
+        let explicit = std::env::var("MLX_LM_HOST").ok().and_then(|url| {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                Some(url)
+            } else {
+                eprintln!(
+                    "Warning: MLX_LM_HOST must start with http:// or https://, ignoring: {}",
+                    url
+                );
+                None
+            }
+        });
+        let server_url_explicit = explicit.is_some();
+        let server_url = explicit.unwrap_or_else(|| MLX_DEFAULT_SERVER_URL.to_string());
+        Self {
+            server_url,
+            server_url_explicit,
+        }
     }
 }
 
 impl MlxProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_server_url(url: &str) -> Self {
+        Self {
+            server_url: url.to_string(),
+            server_url_explicit: true,
+        }
+    }
+
+    fn server_candidates(&self) -> Vec<MlxServerCandidate<'_>> {
+        let mut candidates = vec![MlxServerCandidate {
+            base_url: self.server_url.as_str(),
+            require_omlx_identity: false,
+        }];
+        if !self.server_url_explicit && self.server_url != OMLX_DEFAULT_SERVER_URL {
+            candidates.push(MlxServerCandidate {
+                base_url: OMLX_DEFAULT_SERVER_URL,
+                require_omlx_identity: true,
+            });
+        }
+        candidates
+    }
+
+    fn fetch_candidate_models(
+        candidate: &MlxServerCandidate<'_>,
+        timeout: std::time::Duration,
+    ) -> Option<OpenAiModelList> {
+        let has_omlx_status = candidate.require_omlx_identity
+            && endpoint_has_omlx_status(candidate.base_url, timeout);
+        let (list, identity) = fetch_openai_model_list(candidate.base_url, timeout)?;
+        // Shared identity gate (#791): a llama.cpp server or a llama-swap
+        // proxy answering on this port is not an MLX runtime, so its model
+        // list must not be imported as MLX models.
+        if identity != OpenAiEndpointIdentity::Unrecognized {
+            return None;
+        }
+        if candidate.require_omlx_identity && !has_omlx_status && !openai_model_list_is_omlx(&list)
+        {
+            return None;
+        }
+        Some(list)
     }
 
     /// Single-pass startup probe for MLX.
@@ -416,23 +793,15 @@ impl MlxProvider {
             return (false, set);
         }
 
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if let Ok(resp) = ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_millis(800)))
-            .build()
-            .call()
-        {
-            if let Ok(json) = resp.into_body().read_json::<serde_json::Value>()
-                && let Some(data) = json.get("data").and_then(|d| d.as_array())
+        for candidate in self.server_candidates() {
+            if let Some(list) =
+                Self::fetch_candidate_models(&candidate, std::time::Duration::from_millis(800))
             {
-                for model in data {
-                    if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
-                        set.insert(id.to_lowercase());
-                    }
+                for id in openai_model_ids(&list) {
+                    set.insert(id.to_lowercase());
                 }
+                return (true, set);
             }
-            return (true, set);
         }
 
         (check_mlx_python(), set)
@@ -472,11 +841,27 @@ fn is_likely_gguf_repo(repo_lower: &str) -> bool {
     repo_lower.contains("-gguf") || repo_lower.ends_with("gguf")
 }
 
+/// Detect repos whose name marks a pre-quantized non-MLX format (AWQ, GPTQ,
+/// AutoRound). These are vLLM/CUDA formats: guessing an `mlx-community`
+/// equivalent for them almost always fabricates a repo that does not exist
+/// (issue #294). A name that also carries an MLX marker (e.g. an
+/// mlx-community conversion that keeps "AWQ" in its name) is not excluded —
+/// callers check MLX markers first.
+pub fn is_likely_prequantized_repo(repo_lower: &str) -> bool {
+    ["awq", "gptq", "autoround", "auto-round"]
+        .iter()
+        .any(|marker| repo_lower.contains(marker))
+}
+
 /// Scan HuggingFace cache directories for MLX model directories.
 fn scan_hf_cache_for_mlx() -> HashSet<String> {
+    scan_hf_cache_for_mlx_in(&dirs_hf_cache_all())
+}
+
+fn scan_hf_cache_for_mlx_in(cache_dirs: &[PathBuf]) -> HashSet<String> {
     let mut set = HashSet::new();
-    for cache_dir in dirs_hf_cache_all() {
-        let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+    for cache_dir in cache_dirs {
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -493,7 +878,7 @@ fn scan_hf_cache_for_mlx() -> HashSet<String> {
                 continue;
             };
 
-            if !is_likely_mlx_repo(owner, repo) {
+            if !is_likely_mlx_repo(owner, repo) || !hf_repo_has_mlx_weights(&entry.path()) {
                 continue;
             }
 
@@ -504,6 +889,26 @@ fn scan_hf_cache_for_mlx() -> HashSet<String> {
         }
     }
     set
+}
+
+fn hf_repo_has_mlx_weights(repo_dir: &Path) -> bool {
+    let Ok(snapshots) = std::fs::read_dir(repo_dir.join("snapshots")) else {
+        return false;
+    };
+    snapshots.flatten().any(|snapshot| {
+        let Ok(files) = std::fs::read_dir(snapshot.path()) else {
+            return false;
+        };
+        files.flatten().any(|file| {
+            let path = file.path();
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("safetensors" | "npz")
+            ) && path
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        })
+    })
 }
 
 /// Scan HuggingFace cache directories for GGUF model directories.
@@ -544,24 +949,55 @@ fn scan_hf_cache_for_gguf() -> (HashSet<String>, usize) {
 
 /// Return all candidate HuggingFace cache directories.
 ///
-/// The HF CLI always uses `~/.cache/huggingface/hub` (XDG-style) regardless
-/// of platform, but `dirs::cache_dir()` returns `~/Library/Caches` on macOS.
-/// We check both to handle either location.
+/// Follows the order in which `huggingface_hub`, and so `hf download`,
+/// resolves its cache: `HF_HUB_CACHE`, the legacy `HUGGINGFACE_HUB_CACHE`,
+/// `$HF_HOME/hub`, then `$XDG_CACHE_HOME/huggingface/hub`. Without those the
+/// HF CLI uses `~/.cache/huggingface/hub` (XDG-style) regardless of platform,
+/// but `dirs::cache_dir()` returns `~/Library/Caches` on macOS. We check both
+/// to handle either location.
 fn dirs_hf_cache_all() -> Vec<std::path::PathBuf> {
+    hf_cache_dirs_for(
+        |name| std::env::var(name).ok(),
+        dirs::cache_dir(),
+        dirs::home_dir(),
+    )
+}
+
+/// Candidate HuggingFace cache directories. Pure so tests can cover every
+/// variable without touching the process environment.
+fn hf_cache_dirs_for(
+    env: impl Fn(&str) -> Option<String>,
+    platform_cache_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    if let Ok(cache) = std::env::var("HF_HOME") {
-        dirs.push(std::path::PathBuf::from(cache).join("hub"));
+    // An explicit hub cache is the only place the HF CLI stores models.
+    if let Some(cache) = env("HF_HUB_CACHE").or_else(|| env("HUGGINGFACE_HUB_CACHE")) {
+        dirs.push(PathBuf::from(cache));
         return dirs;
     }
 
+    if let Some(cache) = env("HF_HOME") {
+        dirs.push(PathBuf::from(cache).join("hub"));
+        return dirs;
+    }
+
+    // $XDG_CACHE_HOME replaces ~/.cache for the HF CLI on every platform.
+    if let Some(cache) = env("XDG_CACHE_HOME") {
+        dirs.push(PathBuf::from(cache).join("huggingface").join("hub"));
+    }
+
     // Platform-native cache dir (e.g. ~/Library/Caches on macOS)
-    if let Some(cache) = dirs::cache_dir() {
-        dirs.push(cache.join("huggingface").join("hub"));
+    if let Some(cache) = platform_cache_dir {
+        let native = cache.join("huggingface").join("hub");
+        if !dirs.iter().any(|d| d == &native) {
+            dirs.push(native);
+        }
     }
 
     // XDG-style ~/.cache (what the HF CLI actually uses on all platforms)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
         let xdg = home.join(".cache").join("huggingface").join("hub");
         if !dirs.iter().any(|d| d == &xdg) {
             dirs.push(xdg);
@@ -569,7 +1005,7 @@ fn dirs_hf_cache_all() -> Vec<std::path::PathBuf> {
     }
 
     if dirs.is_empty() {
-        dirs.push(std::path::PathBuf::from("/tmp/.cache/huggingface/hub"));
+        dirs.push(PathBuf::from("/tmp/.cache/huggingface/hub"));
     }
     dirs
 }
@@ -583,16 +1019,12 @@ impl ModelProvider for MlxProvider {
         if !cfg!(target_os = "macos") {
             return false;
         }
-        // Try the MLX server first
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            .is_ok()
-        {
-            return true;
+        // Try MLX-compatible servers first.
+        for candidate in self.server_candidates() {
+            if Self::fetch_candidate_models(&candidate, std::time::Duration::from_secs(2)).is_some()
+            {
+                return true;
+            }
         }
         // Fall back to checking if mlx_lm is installed
         check_mlx_python()
@@ -603,31 +1035,22 @@ impl ModelProvider for MlxProvider {
         if !cfg!(target_os = "macos") {
             return set;
         }
-        // Also try querying the MLX server if running
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if let Ok(resp) = ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            && let Ok(json) = resp.into_body().read_json::<serde_json::Value>()
-            && let Some(data) = json.get("data").and_then(|d| d.as_array())
-        {
-            for model in data {
-                if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
+        // Also try querying MLX-compatible servers if running.
+        for candidate in self.server_candidates() {
+            if let Some(list) =
+                Self::fetch_candidate_models(&candidate, std::time::Duration::from_secs(2))
+            {
+                for id in openai_model_ids(&list) {
                     set.insert(id.to_lowercase());
                 }
+                break;
             }
         }
         set
     }
 
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
-        let repo_id = if model_tag.contains('/') {
-            model_tag.to_string()
-        } else {
-            format!("mlx-community/{}", model_tag)
-        };
+        let repo_id = resolve_mlx_fallback_repo(model_tag, &hf_repo_exists)?;
         let repo_for_thread = repo_id.clone();
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -683,18 +1106,144 @@ impl ModelProvider for MlxProvider {
 // llama.cpp provider (direct GGUF download from HuggingFace)
 // ---------------------------------------------------------------------------
 
+/// How a detected llama.cpp installation is invoked.
+///
+/// Classic builds install two binaries (`llama-cli`, `llama-server`). Newer
+/// builds ship a single `llama` binary that exposes the same tools as
+/// subcommands (`llama cli`, `llama serve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaCppBinaryStyle {
+    /// Classic separate `llama-cli` / `llama-server` binaries.
+    Separate,
+    /// Single `llama` binary; CLI and server modes are `llama cli` /
+    /// `llama serve`.
+    Omnibus,
+}
+
+impl LlamaCppBinaryStyle {
+    /// argv tokens selecting CLI mode for the detected binary.
+    pub fn cli_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Separate => &[],
+            Self::Omnibus => &["cli"],
+        }
+    }
+
+    /// argv tokens selecting server mode for the detected binary.
+    pub fn server_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Separate => &[],
+            Self::Omnibus => &["serve"],
+        }
+    }
+
+    /// Command name for CLI mode as a user would type it: `llama-cli` or
+    /// `llama cli`.
+    pub fn cli_command(self) -> &'static str {
+        match self {
+            Self::Separate => "llama-cli",
+            Self::Omnibus => "llama cli",
+        }
+    }
+
+    /// Short stable label used in JSON output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::Omnibus => "omnibus",
+        }
+    }
+}
+
+/// Pick the llama.cpp binaries to use and how to invoke them.
+///
+/// Classic names (`llama-cli` / `llama-server`) win when present so existing
+/// installs keep working unchanged; the single `llama` binary only fills in
+/// when no classic binary was found, and is then used for both modes.
+fn resolve_llamacpp_binaries(
+    legacy_cli: Option<String>,
+    legacy_server: Option<String>,
+    omnibus: Option<String>,
+) -> (Option<String>, Option<String>, LlamaCppBinaryStyle) {
+    if legacy_cli.is_some() || legacy_server.is_some() {
+        (legacy_cli, legacy_server, LlamaCppBinaryStyle::Separate)
+    } else {
+        match omnibus {
+            Some(bin) => (Some(bin.clone()), Some(bin), LlamaCppBinaryStyle::Omnibus),
+            None => (None, None, LlamaCppBinaryStyle::Separate),
+        }
+    }
+}
+
+/// Detect the llama.cpp binaries and their invocation style without probing
+/// for a running server.
+///
+/// The single `llama` binary is only looked up when no classic binary exists,
+/// and is only accepted if `llama cli --help` succeeds: other tools install a
+/// `llama` command too (e.g. Meta's llama-stack), and they reject `cli`.
+pub fn detect_llamacpp_binaries() -> (Option<String>, Option<String>, LlamaCppBinaryStyle) {
+    let legacy_cli = find_binary("llama-cli");
+    let legacy_server = find_binary("llama-server");
+    let omnibus = if legacy_cli.is_none() && legacy_server.is_none() {
+        find_binary("llama").filter(|bin| is_llamacpp_omnibus(bin))
+    } else {
+        None
+    };
+    resolve_llamacpp_binaries(legacy_cli, legacy_server, omnibus)
+}
+
+/// Whether `bin` is a llama.cpp omnibus build, i.e. accepts the `cli`
+/// subcommand.
+fn is_llamacpp_omnibus(bin: &str) -> bool {
+    is_llamacpp_omnibus_within(bin, std::time::Duration::from_secs(5))
+}
+
+/// [`is_llamacpp_omnibus`] with an explicit time limit. A `llama` command
+/// that has not exited by then is killed and treated as not llama.cpp, so a
+/// stuck or unrelated binary cannot stall startup.
+fn is_llamacpp_omnibus_within(bin: &str, timeout: std::time::Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(bin)
+        .args(["cli", "--help"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// A provider that downloads GGUF model files directly from HuggingFace
-/// and uses llama.cpp binaries (`llama-cli`, `llama-server`) to run them.
+/// and uses llama.cpp binaries to run them — either the classic
+/// `llama-cli` / `llama-server` pair or a single `llama` binary with
+/// `cli` / `serve` subcommands.
 ///
 /// Unlike Ollama, this doesn't require a running daemon — it downloads
 /// GGUF files to a local cache directory and invokes llama.cpp directly.
 pub struct LlamaCppProvider {
     /// Directory where GGUF models are stored.
     models_dir: PathBuf,
-    /// Path to llama-cli binary, if found.
+    /// Path to the binary used for CLI mode, if found.
     llama_cli: Option<String>,
-    /// Path to llama-server binary, if found.
+    /// Path to the binary used for server mode, if found.
     llama_server: Option<String>,
+    /// How the detected binaries must be invoked.
+    style: LlamaCppBinaryStyle,
     /// Whether a running llama-server was detected via health probe.
     server_running: bool,
 }
@@ -702,8 +1251,7 @@ pub struct LlamaCppProvider {
 impl Default for LlamaCppProvider {
     fn default() -> Self {
         let models_dir = llamacpp_models_dir();
-        let llama_cli = find_binary("llama-cli");
-        let llama_server = find_binary("llama-server");
+        let (llama_cli, llama_server, style) = detect_llamacpp_binaries();
 
         // If no binaries found, check if a server is already running
         let server_running = if llama_cli.is_none() && llama_server.is_none() {
@@ -717,9 +1265,24 @@ impl Default for LlamaCppProvider {
             models_dir,
             llama_cli,
             llama_server,
+            style,
             server_running,
         }
     }
+}
+
+/// Build the HuggingFace Hub query used to search GGUF repositories.
+///
+/// The `sort` key must be a field name the Hub actually exposes:
+/// `sort=trending` is rejected with HTTP 400 (`Invalid sort parameter:
+/// trending`), which `search_hf_gguf` would silently turn into "no results".
+/// The trending rank lives in `trendingScore`, which is what
+/// `update::hf_get_list_for_pipeline` already sorts on.
+fn hf_gguf_search_url(query: &str) -> String {
+    format!(
+        "https://huggingface.co/api/models?library=gguf&search={}&sort=trendingScore&limit=20",
+        urlencoding::encode(query)
+    )
 }
 
 impl LlamaCppProvider {
@@ -774,14 +1337,25 @@ impl LlamaCppProvider {
         Err(format!("Model file not found for '{}'", model_tag))
     }
 
-    /// Path to `llama-cli` if detected.
+    /// Path to the binary used for CLI mode (`llama-cli`, or `llama` for
+    /// omnibus installs). Invoke it with [`Self::binary_style`]'s `cli_args`
+    /// prepended.
     pub fn llama_cli_path(&self) -> Option<&str> {
         self.llama_cli.as_deref()
     }
 
-    /// Path to `llama-server` if detected.
+    /// Path to the binary used for server mode (`llama-server`, or `llama`
+    /// for omnibus installs). Invoke it with [`Self::binary_style`]'s
+    /// `server_args` prepended.
     pub fn llama_server_path(&self) -> Option<&str> {
         self.llama_server.as_deref()
+    }
+
+    /// How the detected binaries must be invoked: classic separate
+    /// `llama-cli` / `llama-server`, or a single `llama` binary with
+    /// `cli` / `serve` subcommands.
+    pub fn binary_style(&self) -> LlamaCppBinaryStyle {
+        self.style
     }
 
     /// Whether a running llama-server was detected via health probe.
@@ -800,27 +1374,16 @@ impl LlamaCppProvider {
         }
     }
 
-    /// List all `.gguf` files in the cache directory.
+    /// List all `.gguf` files in the cache directory, descending into
+    /// subdirectories up to [`GGUF_SCAN_MAX_DEPTH`].
     pub fn list_gguf_files(&self) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    files.push(path);
-                }
-            }
-        }
-        files
+        collect_gguf_files(&self.models_dir, GGUF_SCAN_MAX_DEPTH)
     }
 
     /// Search HuggingFace for GGUF repositories matching a query.
     /// Returns a list of (repo_id, description) tuples.
     pub fn search_hf_gguf(query: &str) -> Vec<(String, String)> {
-        let url = format!(
-            "https://huggingface.co/api/models?library=gguf&search={}&sort=trending&limit=20",
-            urlencoding::encode(query)
-        );
+        let url = hf_gguf_search_url(query);
         let Ok(resp) = ureq::get(&url)
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(15)))
@@ -879,8 +1442,8 @@ impl LlamaCppProvider {
         // Quant preference order (best quality first)
         let quant_order = [
             "Q8_0", "q8_0", "Q6_K", "q6_k", "Q6_K_L", "q6_k_l", "Q5_K_M", "q5_k_m", "Q5_K_S",
-            "q5_k_s", "Q4_K_M", "q4_k_m", "Q4_K_S", "q4_k_s", "Q4_0", "q4_0", "Q3_K_M", "q3_k_m",
-            "Q3_K_S", "q3_k_s", "Q2_K", "q2_k", "IQ4_XS", "iq4_xs", "IQ3_M", "iq3_m", "IQ2_M",
+            "q5_k_s", "Q4_K_M", "q4_k_m", "Q4_K_S", "q4_k_s", "Q4_0", "q4_0", "IQ4_XS", "iq4_xs",
+            "Q3_K_M", "q3_k_m", "IQ3_M", "iq3_m", "Q3_K_S", "q3_k_s", "Q2_K", "q2_k", "IQ2_M",
             "iq2_m", "IQ1_M", "iq1_m",
         ];
         let budget_bytes = (budget_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -902,6 +1465,78 @@ impl LlamaCppProvider {
             .collect();
         fitting.sort_by_key(|(_, s)| *s);
         fitting.last().map(|(f, s)| (f.clone(), *s))
+    }
+
+    /// Native-ternary GGUF quant tags (i2_s / TQ1_0 / TQ2_0), in bitnet.cpp
+    /// preference order.
+    const TERNARY_GGUF_QUANTS: [&'static str; 3] = ["i2_s", "tq1_0", "tq2_0"];
+
+    /// True if a GGUF filename names a native-ternary artifact the bitnet.cpp
+    /// runtime can load (i2_s / TQ), as opposed to an ordinary k-quant.
+    fn is_ternary_gguf_filename(filename: &str) -> bool {
+        let f = filename.to_lowercase();
+        Self::TERNARY_GGUF_QUANTS.iter().any(|q| f.contains(q))
+    }
+
+    /// Select a native-ternary GGUF artifact (`i2_s` / `TQ1_0` / `TQ2_0`) for
+    /// bitnet.cpp. Returns `None` when the repo has no ternary artifact, so the
+    /// caller fails clearly instead of silently pulling an incompatible k-quant.
+    pub fn select_best_ternary_gguf(files: &[(String, u64)]) -> Option<(String, u64)> {
+        // Preference: i2_s (packed 2-bit ternary) first, then the TQ variants.
+        let candidates = build_gguf_candidates(files);
+        for quant in &Self::TERNARY_GGUF_QUANTS {
+            for (filename, size) in &candidates {
+                if *size > 0 && filename.to_lowercase().contains(quant) {
+                    return Some((filename.clone(), *size));
+                }
+            }
+        }
+        None
+    }
+
+    /// Pull a native-ternary GGUF (`i2_s` / `TQ`) for bitnet.cpp. Unlike
+    /// `start_pull`, this selects only ternary artifacts and errors clearly when
+    /// a repository has none, so a repo that also ships ordinary k-quants never
+    /// silently resolves to a file the bitnet.cpp runtime cannot load.
+    pub fn start_pull_ternary(&self, model_tag: &str) -> Result<PullHandle, String> {
+        // Explicit repo/file — honour the caller's choice, but only if the named
+        // artifact is actually ternary (never let a k-quant through by name).
+        if model_tag.matches('/').count() >= 2 && model_tag.ends_with(".gguf") {
+            let parts: Vec<&str> = model_tag.splitn(3, '/').collect();
+            if parts.len() == 3 {
+                let repo = format!("{}/{}", parts[0], parts[1]);
+                let filename = parts[2];
+                if !Self::is_ternary_gguf_filename(filename) {
+                    return Err(format!(
+                        "'{}' is not a native-ternary (i2_s/TQ) GGUF; bitnet.cpp requires a ternary artifact",
+                        filename
+                    ));
+                }
+                return self.download_gguf(&repo, filename);
+            }
+        }
+
+        let repo_id: String = if model_tag.contains('/') {
+            model_tag.to_string()
+        } else {
+            let results = Self::search_hf_gguf(model_tag);
+            results
+                .first()
+                .map(|(r, _)| r.clone())
+                .ok_or_else(|| format!("No GGUF models found on HuggingFace for '{}'", model_tag))?
+        };
+
+        let files = Self::list_repo_gguf_files(&repo_id);
+        if files.is_empty() {
+            return Err(format!("No GGUF files found in repository '{}'", repo_id));
+        }
+        match Self::select_best_ternary_gguf(&files) {
+            Some((filename, _)) => self.download_gguf(&repo_id, &filename),
+            None => Err(format!(
+                "No native-ternary (i2_s/TQ) GGUF found in '{}'; bitnet.cpp requires a ternary artifact",
+                repo_id
+            )),
+        }
     }
 
     /// Download a GGUF file from a HuggingFace repository.
@@ -1333,6 +1968,110 @@ fn parse_repo_gguf_entries(entries: Vec<serde_json::Value>) -> Vec<(String, u64)
 }
 
 /// Default directory for llama.cpp GGUF model cache.
+/// How far below a models root to look for `.gguf` files.
+///
+/// A flat scan is not enough: LM Studio stores `publisher/repo/model.gguf`,
+/// and anyone pointing `LLMFIT_MODELS_DIR` at a tree with that shape hits the
+/// same wall. Three levels covers those layouts while keeping the walk
+/// bounded, so a large library does not turn into a full crawl.
+pub const GGUF_SCAN_MAX_DEPTH: usize = 3;
+
+/// Collect `.gguf` files under `root`, descending at most `max_depth`
+/// directory levels (the root itself is level one).
+///
+/// The name is tested for the extension before anything asks the filesystem
+/// about the entry, so only directories cost a `file_type` call. Unreadable
+/// directories are skipped rather than aborting the walk.
+fn collect_gguf_files(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if max_depth == 0 {
+        return files;
+    }
+    let mut pending = vec![(root.to_path_buf(), 1usize)];
+
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let looks_like_model = name.to_string_lossy().to_lowercase().ends_with(".gguf");
+            let path = entry.path();
+
+            // Only names that already look like models are resolved, so the
+            // extension test is still what does the filtering. `metadata`
+            // rather than `DirEntry::file_type` because the latter describes
+            // the symlink instead of its target, and a symlinked model in
+            // `LLMFIT_MODELS_DIR` is still a model.
+            let resolved = looks_like_model
+                .then(|| path.metadata())
+                .and_then(Result::ok);
+            if let Some(meta) = &resolved
+                && meta.is_file()
+            {
+                files.push(path);
+                continue;
+            }
+
+            if depth >= max_depth {
+                continue;
+            }
+            // Descend into real directories only, which includes one named
+            // `foo.gguf`: that is not a model, but what is inside it may be.
+            //
+            // Directory symlinks are deliberately not followed. Doing so lets
+            // the walk leave the models root entirely, or alias a subtree back
+            // into itself and count the same model twice, and callers act on
+            // the paths returned here. Symlinked model *files* are still
+            // resolved above, which is the case that actually came up.
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    dedupe_by_target(files)
+}
+
+/// Collapse paths that resolve to the same file.
+///
+/// A symlink and the model it points at both look like models, so a tree
+/// holding both would report the same weights twice and inflate the count the
+/// TUI shows. Resolution is per collected model rather than per directory
+/// entry, so this stays proportional to the number of models found.
+///
+/// Where a target and an alias both appear, the target wins, so the path
+/// handed to callers is the stable one.
+fn dedupe_by_target(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut chosen: Vec<(PathBuf, bool)> = Vec::with_capacity(files.len());
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+
+    for path in files {
+        let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Ask whether this entry is a link, rather than comparing it to its
+        // canonical form. Those differ whenever any parent directory is a
+        // symlink, in which case neither the model nor its alias matches the
+        // target and the survivor would come down to directory order. Callers
+        // look the model up by stem, so the wrong survivor means a model that
+        // cannot be found by its real name.
+        let is_alias = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+
+        match seen.get(&target) {
+            Some(&index) => {
+                if chosen[index].1 && !is_alias {
+                    chosen[index] = (path, false);
+                }
+            }
+            None => {
+                seen.insert(target, chosen.len());
+                chosen.push((path, is_alias));
+            }
+        }
+    }
+    chosen.into_iter().map(|(path, _)| path).collect()
+}
+
 pub fn llamacpp_models_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LLMFIT_MODELS_DIR") {
         PathBuf::from(dir)
@@ -1343,10 +2082,40 @@ pub fn llamacpp_models_dir() -> PathBuf {
     }
 }
 
-/// Find a binary by checking `LLAMA_CPP_PATH` env var, common install
-/// locations, and finally the system PATH via `which`.
+/// Check whether a binary is available on the system PATH.
+/// Cross-platform: uses the `which` crate rather than shelling out to a
+/// Unix-only `which` command, so it works on Windows too.
+pub fn command_exists(name: &str) -> bool {
+    which::which(name).is_ok()
+}
+
+/// Directory holding the llama.cpp binaries, when the caller supplied one
+/// explicitly (the `--llama-cpp-path` CLI flag). Set once, before any provider
+/// detection runs, so lookups stay consistent for the life of the process.
+static LLAMA_CPP_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point llama.cpp binary discovery at `dir` for the rest of this process.
+///
+/// Takes precedence over `LLAMA_CPP_PATH`. Only the first call has an effect,
+/// which keeps discovery from changing shape midway through a run. This exists
+/// so a caller can override the location without mutating the process
+/// environment, which is `unsafe` and racy once other threads are running.
+pub fn set_llama_cpp_path_override(dir: PathBuf) -> bool {
+    LLAMA_CPP_PATH_OVERRIDE.set(dir).is_ok()
+}
+
+/// Find a binary by checking the explicit override, the `LLAMA_CPP_PATH` env
+/// var, common install locations, and finally the system PATH via `which`.
 fn find_binary(name: &str) -> Option<String> {
-    // 1. Check LLAMA_CPP_PATH env var first
+    // 1. An explicit override from the caller wins over the environment.
+    if let Some(dir) = LLAMA_CPP_PATH_OVERRIDE.get() {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    // 2. Check LLAMA_CPP_PATH env var next
     if let Ok(dir) = std::env::var("LLAMA_CPP_PATH") {
         let candidate = PathBuf::from(&dir).join(name);
         if candidate.is_file() {
@@ -1354,7 +2123,7 @@ fn find_binary(name: &str) -> Option<String> {
         }
     }
 
-    // 2. Check common install locations
+    // 3. Check common install locations
     let mut common_dirs: Vec<PathBuf> = vec![
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/opt/llama.cpp/build/bin"),
@@ -1369,7 +2138,7 @@ fn find_binary(name: &str) -> Option<String> {
         }
     }
 
-    // 3. Fall back to PATH lookup
+    // 4. Fall back to PATH lookup
     which::which(name)
         .ok()
         .map(|p| p.to_string_lossy().to_string())
@@ -1508,6 +2277,49 @@ fn is_docker_desktop_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether the Docker Desktop application is installed, regardless of
+/// whether it is currently running (#731). The Model Runner API probe only
+/// succeeds while Docker Desktop is up, so this is what lets the UI say
+/// "installed (not running)" instead of "not detected".
+pub fn docker_desktop_installed() -> bool {
+    docker_desktop_install_candidates(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Filesystem locations that identify a Docker Desktop (or docker-model
+/// plugin) install. Pure so tests can cover the per-OS layouts; `exists()`
+/// checks happen in [`docker_desktop_installed`].
+fn docker_desktop_install_candidates(
+    program_files: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(pf) = program_files {
+        let docker = Path::new(pf).join("Docker").join("Docker");
+        // Classic layout, and the frontend/ layout used by newer releases
+        // (e.g. C:\Program Files\Docker\Docker\frontend\Docker Desktop.exe).
+        candidates.push(docker.join("Docker Desktop.exe"));
+        candidates.push(docker.join("frontend").join("Docker Desktop.exe"));
+        candidates.push(Path::new(pf).join("Docker").join("cli-plugins"));
+    }
+    candidates.push(PathBuf::from("/Applications/Docker.app"));
+    candidates.push(PathBuf::from("/opt/docker-desktop"));
+    if let Some(home) = home {
+        candidates.push(home.join("Applications").join("Docker.app"));
+        candidates.push(home.join(".docker").join("desktop"));
+        // Standalone Model Runner plugin (docker-model), installable
+        // without Docker Desktop on Docker CE.
+        let plugins = home.join(".docker").join("cli-plugins");
+        candidates.push(plugins.join("docker-model"));
+        candidates.push(plugins.join("docker-model.exe"));
+    }
+    candidates
+}
+
 fn normalize_docker_mr_host(raw: &str) -> Option<String> {
     let host = raw.trim();
     if host.is_empty() {
@@ -1550,6 +2362,13 @@ impl DockerModelRunnerProvider {
         Self::default()
     }
 
+    #[cfg(all(test, not(target_os = "linux")))]
+    fn with_base_url(url: &str) -> Self {
+        Self {
+            base_url: url.to_string(),
+        }
+    }
+
     fn models_url(&self) -> String {
         format!("{}/v1/models", self.base_url.trim_end_matches('/'))
     }
@@ -1574,9 +2393,32 @@ impl DockerModelRunnerProvider {
             return (false, set, 0);
         };
 
-        let Ok(list) = resp.into_body().read_json::<DockerModelList>() else {
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
             return (true, set, 0);
         };
+        // Identity gate (#791, #790): import only when the endpoint positively
+        // identifies as Docker Model Runner, so a foreign OpenAI server on the
+        // port is not imported. Measured 2026-09-01: a live docker/model-runner
+        // lists models with owned_by "docker" (plus a per-model `dmr` object)
+        // and sends no Server header. A runner with no models yet returns an
+        // empty list with no marker, so that case falls back to the root
+        // banner probe.
+        let identity = classify_openai_endpoint(server_header.as_deref(), &list);
+        let identified = identity == OpenAiEndpointIdentity::DockerModelRunner
+            || (list.data.is_empty()
+                && identity == OpenAiEndpointIdentity::Unrecognized
+                && endpoint_is_docker_model_runner_root(
+                    &self.base_url,
+                    std::time::Duration::from_millis(800),
+                ));
+        if !identified {
+            return (false, HashSet::new(), 0);
+        }
         let engines = list.data;
         let count = engines.len();
         for e in engines {
@@ -1602,29 +2444,39 @@ impl DockerModelRunnerProvider {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct DockerModelList {
-    data: Vec<DockerEngine>,
-}
-
-#[derive(serde::Deserialize)]
-struct DockerEngine {
-    /// Model ID, e.g. "ai/llama3.1:8B-Q4_K_M"
-    id: String,
-}
-
 impl ModelProvider for DockerModelRunnerProvider {
     fn name(&self) -> &str {
         "Docker Model Runner"
     }
 
     fn is_available(&self) -> bool {
-        ureq::get(&self.models_url())
+        let Ok(resp) = ureq::get(&self.models_url())
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok()
+        else {
+            return false;
+        };
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
+            return false;
+        };
+        // Report available only when the endpoint identifies as Docker Model
+        // Runner, matching the identity gate used for model import. An empty
+        // model list carries no marker, so it falls back to the root banner.
+        let identity = classify_openai_endpoint(server_header.as_deref(), &list);
+        identity == OpenAiEndpointIdentity::DockerModelRunner
+            || (list.data.is_empty()
+                && identity == OpenAiEndpointIdentity::Unrecognized
+                && endpoint_is_docker_model_runner_root(
+                    &self.base_url,
+                    std::time::Duration::from_secs(2),
+                ))
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -1688,6 +2540,165 @@ pub struct LmStudioProvider {
     api_key: Option<String>,
 }
 
+/// Check whether the LM Studio application is installed, regardless of
+/// whether its local server is running (#731). LM Studio's REST API is off
+/// until the user starts the server (or `lms server start`), so the HTTP
+/// probe alone reports installed-but-idle copies as missing.
+pub fn lmstudio_app_installed() -> bool {
+    if command_exists("lms") {
+        return true;
+    }
+    lmstudio_install_candidates(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Filesystem locations that identify an LM Studio install. Pure so tests
+/// can cover the per-OS layouts; `exists()` checks happen in
+/// [`lmstudio_app_installed`].
+fn lmstudio_install_candidates(
+    program_files: Option<&str>,
+    local_app_data: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    // Windows per-machine install (e.g. C:\Program Files\LM Studio\LM Studio.exe).
+    if let Some(pf) = program_files {
+        candidates.push(Path::new(pf).join("LM Studio").join("LM Studio.exe"));
+    }
+    // Windows per-user install (the installer default).
+    if let Some(lad) = local_app_data {
+        candidates.push(
+            Path::new(lad)
+                .join("Programs")
+                .join("LM Studio")
+                .join("LM Studio.exe"),
+        );
+    }
+    candidates.push(PathBuf::from("/Applications/LM Studio.app"));
+    if let Some(home) = home {
+        candidates.push(home.join("Applications").join("LM Studio.app"));
+        // ~/.lmstudio is created on first run on every OS (models, lms CLI).
+        candidates.push(home.join(".lmstudio"));
+    }
+    candidates
+}
+
+/// Where LM Studio keeps downloaded models. Pure so tests can cover it
+/// without a home directory, mirroring [`lmstudio_install_candidates`].
+fn lmstudio_models_dir_for(home: Option<&Path>) -> Option<PathBuf> {
+    Some(home?.join(".lmstudio").join("models"))
+}
+
+fn lmstudio_models_dir() -> Option<PathBuf> {
+    lmstudio_models_dir_for(dirs::home_dir().as_deref())
+}
+
+/// Identifiers for every model in LM Studio's models directory.
+///
+/// The HTTP API only advertises models that are currently *loaded*, so a
+/// library of thirteen with one loaded is reported as one. The download is
+/// what makes a model installed, not whether it happens to be resident, so
+/// the directory is the only complete picture.
+///
+/// Layout is `<models>/<publisher>/<repo>/<file>.gguf`. These names are
+/// matched by equality (see [`is_model_installed_lmstudio_disk`]) rather than
+/// the substring rule used for API ids, so only canonical forms go in:
+/// feeding loose stems to a substring matcher makes `llama` match
+/// `meta-llama-3.1-8b-instruct`.
+///
+/// Returns `(names, model_count)`. `mmproj-*` files are vision projectors
+/// shipped beside a model rather than models of their own, so they are not
+/// counted.
+pub fn scan_lmstudio_models_dir() -> (HashSet<String>, usize) {
+    scan_lmstudio_models_dir_at(lmstudio_models_dir().as_deref())
+}
+
+fn scan_lmstudio_models_dir_at(root: Option<&Path>) -> (HashSet<String>, usize) {
+    let mut set = HashSet::new();
+    let mut repos = HashSet::new();
+    let Some(root) = root else {
+        return (set, 0);
+    };
+
+    for path in collect_gguf_files(root, GGUF_SCAN_MAX_DEPTH) {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let stem = stem.to_lowercase();
+        if stem.starts_with("mmproj-") {
+            continue;
+        }
+
+        set.insert(stem.clone());
+        if let Some(base) = strip_gguf_quant_suffix(&stem) {
+            set.insert(base);
+        }
+
+        let repo = path
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().to_lowercase());
+        let publisher = path
+            .parent()
+            .and_then(|d| d.parent())
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().to_lowercase());
+
+        if let Some(repo) = repo {
+            repos.insert(repo.clone());
+            // LM Studio appends `-GGUF` to the repo it downloaded from; the
+            // catalog id does not carry it.
+            let trimmed = repo.trim_end_matches("-gguf").to_string();
+            if let Some(publisher) = publisher {
+                set.insert(format!("{publisher}/{repo}"));
+                set.insert(format!("{publisher}/{trimmed}"));
+            }
+            set.insert(trimmed);
+            set.insert(repo);
+        }
+    }
+
+    let count = repos.len();
+    (set, count)
+}
+
+/// Candidate ids for the equality-matched disk path.
+///
+/// Deliberately not [`hf_name_to_lmstudio_candidates`], which also offers a
+/// form with `-instruct`, `-chat`, `-hf` and `-it` removed. Widening the net
+/// that way is reasonable for a substring search, but under equality it
+/// collides: it reduces the distinct `gemma-4-12b-it` entry to `gemma-4-12b`,
+/// so an installed base model would mark the IT variant installed too.
+fn hf_name_to_lmstudio_disk_candidates(hf_name: &str) -> Vec<String> {
+    let full = hf_name.to_lowercase();
+    let repo = hf_name
+        .split('/')
+        .next_back()
+        .unwrap_or(hf_name)
+        .to_lowercase();
+    if repo == full {
+        vec![full]
+    } else {
+        vec![full, repo]
+    }
+}
+
+/// Is this catalog model present in LM Studio's models directory?
+///
+/// Deliberately equality rather than the substring test used for API ids:
+/// these names come from directory and file names, which are numerous enough
+/// that a substring rule starts matching unrelated catalog entries.
+pub fn is_model_installed_lmstudio_disk(hf_name: &str, on_disk: &HashSet<String>) -> bool {
+    hf_name_to_lmstudio_disk_candidates(hf_name)
+        .iter()
+        .any(|candidate| on_disk.contains(candidate))
+}
+
 fn normalize_lmstudio_host(raw: &str) -> Option<String> {
     let host = raw.trim();
     if host.is_empty() {
@@ -1705,32 +2716,50 @@ fn normalize_lmstudio_host(raw: &str) -> Option<String> {
     Some(format!("http://{host}"))
 }
 
+/// Base URL of the LM Studio server: `LMSTUDIO_HOST` or the default port.
+pub fn lmstudio_url() -> String {
+    std::env::var("LMSTUDIO_HOST")
+        .ok()
+        .and_then(|raw| {
+            let normalized = normalize_lmstudio_host(&raw);
+            if normalized.is_none() {
+                eprintln!(
+                    "Warning: could not parse LMSTUDIO_HOST='{}'. \
+                     Expected host:port or http(s)://host:port",
+                    raw
+                );
+            }
+            normalized
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:1234".to_string())
+}
+
+pub fn lmstudio_api_key() -> Option<String> {
+    std::env::var("LMSTUDIO_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+}
+
 impl Default for LmStudioProvider {
     fn default() -> Self {
-        let base_url = std::env::var("LMSTUDIO_HOST")
-            .ok()
-            .and_then(|raw| {
-                let normalized = normalize_lmstudio_host(&raw);
-                if normalized.is_none() {
-                    eprintln!(
-                        "Warning: could not parse LMSTUDIO_HOST='{}'. \
-                         Expected host:port or http(s)://host:port",
-                        raw
-                    );
-                }
-                normalized
-            })
-            .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
-        let api_key = std::env::var("LMSTUDIO_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
-        Self { base_url, api_key }
+        Self {
+            base_url: lmstudio_url(),
+            api_key: lmstudio_api_key(),
+        }
     }
 }
 
 impl LmStudioProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_base_url(url: &str) -> Self {
+        Self {
+            base_url: url.to_string(),
+            api_key: None,
+        }
     }
 
     fn models_url(&self) -> String {
@@ -1761,9 +2790,23 @@ impl LmStudioProvider {
             return (false, set, 0);
         };
 
-        let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
             return (true, set, 0);
         };
+        // Identity gate (#791, #790): LM Studio is identified by its native
+        // /api/v0 API, not by the OpenAI-compatible /v1 shape (a generic Express
+        // server would share the framework header). Import only when the
+        // endpoint answers /api/v0/models with LM Studio's native schema.
+        // Measured 2026-09-01 against LM Studio 0.4.23.
+        if lmstudio_native_models(
+            &self.base_url,
+            self.api_key.as_deref(),
+            std::time::Duration::from_millis(800),
+        )
+        .is_none()
+        {
+            return (false, set, 0);
+        }
         let models = list.data;
         let count = models.len();
         for m in models {
@@ -1796,16 +2839,26 @@ struct LmStudioModel {
     id: String,
 }
 
+fn lmstudio_download_status_url(base_url: &str, job_id: &str) -> String {
+    format!(
+        "{}/api/v1/models/download/status/{job_id}",
+        base_url.trim_end_matches('/')
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct LmStudioDownloadResponse {
     #[serde(default)]
-    #[allow(dead_code)]
     job_id: Option<String>,
     #[serde(default)]
     status: String,
     #[serde(default)]
     #[allow(dead_code)]
     total_size_bytes: Option<u64>,
+}
+
+fn lmstudio_response_job_id(resp: &LmStudioDownloadResponse) -> Option<&str> {
+    resp.job_id.as_deref().filter(|job_id| !job_id.is_empty())
 }
 
 #[derive(serde::Deserialize)]
@@ -1820,20 +2873,181 @@ struct LmStudioDownloadStatus {
     total_size_bytes: Option<u64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LmStudioDownloadTerminalStatus {
+    Done,
+    Failed,
+}
+
+fn lmstudio_download_status_percent(st: &LmStudioDownloadStatus) -> Option<f64> {
+    st.progress
+        .map(|p| p * 100.0)
+        .or_else(|| match (st.downloaded_bytes, st.total_size_bytes) {
+            (Some(dl), Some(total)) if total > 0 => Some(dl as f64 / total as f64 * 100.0),
+            _ => None,
+        })
+}
+
+fn lmstudio_download_terminal_status(status: &str) -> Option<LmStudioDownloadTerminalStatus> {
+    match status {
+        "completed" | "already_downloaded" => Some(LmStudioDownloadTerminalStatus::Done),
+        "failed" => Some(LmStudioDownloadTerminalStatus::Failed),
+        _ => None,
+    }
+}
+
+fn lmstudio_empty_status_limit_reached(status: &str, empty_statuses: &mut usize) -> bool {
+    if status.is_empty() {
+        *empty_statuses += 1;
+    } else {
+        *empty_statuses = 0;
+    }
+    *empty_statuses >= 3
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LmStudioStatusPollResult {
+    Finished,
+    Fallback,
+}
+
+fn poll_lmstudio_download_status(
+    status_url: &str,
+    api_key: Option<&str>,
+    tx: &std::sync::mpsc::Sender<PullEvent>,
+    poll_interval: std::time::Duration,
+    poll_budget: &mut usize,
+) -> LmStudioStatusPollResult {
+    let _ = tx.send(PullEvent::Progress {
+        status: "Downloading via LM Studio (tracking status)...".to_string(),
+        percent: None,
+    });
+
+    let mut empty_statuses = 0;
+    while *poll_budget > 0 {
+        *poll_budget -= 1;
+        std::thread::sleep(poll_interval);
+
+        let mut req = ureq::get(status_url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build();
+        if let Some(key) = api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        let Ok(resp) = req.call() else {
+            return LmStudioStatusPollResult::Fallback;
+        };
+
+        let Ok(st) = resp.into_body().read_json::<LmStudioDownloadStatus>() else {
+            return LmStudioStatusPollResult::Fallback;
+        };
+
+        if lmstudio_empty_status_limit_reached(&st.status, &mut empty_statuses) {
+            return LmStudioStatusPollResult::Fallback;
+        }
+
+        match lmstudio_download_terminal_status(&st.status) {
+            Some(LmStudioDownloadTerminalStatus::Done) => {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Download complete".to_string(),
+                    percent: Some(100.0),
+                });
+                let _ = tx.send(PullEvent::Done);
+                return LmStudioStatusPollResult::Finished;
+            }
+            Some(LmStudioDownloadTerminalStatus::Failed) => {
+                let _ = tx.send(PullEvent::Error("LM Studio download failed".to_string()));
+                return LmStudioStatusPollResult::Finished;
+            }
+            None => {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Downloading via LM Studio...".to_string(),
+                    percent: lmstudio_download_status_percent(&st),
+                });
+            }
+        }
+    }
+
+    let _ = tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
+    LmStudioStatusPollResult::Finished
+}
+
+fn poll_lmstudio_installed_models(
+    models_url: &str,
+    api_key: Option<&str>,
+    model_tag: &str,
+    tx: &std::sync::mpsc::Sender<PullEvent>,
+    poll_interval: std::time::Duration,
+    max_polls: usize,
+) {
+    let candidates = hf_name_to_lmstudio_candidates(model_tag);
+
+    let _ = tx.send(PullEvent::Progress {
+        status: "Downloading via LM Studio (tracking)...".to_string(),
+        percent: None,
+    });
+
+    for poll_num in 0..max_polls {
+        std::thread::sleep(poll_interval);
+
+        let mut req = ureq::get(models_url)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build();
+        if let Some(key) = api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        let Ok(resp) = req.call() else {
+            continue;
+        };
+
+        let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
+            continue;
+        };
+
+        let installed: HashSet<String> =
+            list.data.into_iter().map(|m| m.id.to_lowercase()).collect();
+
+        for candidate in &candidates {
+            if installed.contains(candidate.as_str()) {
+                let _ = tx.send(PullEvent::Progress {
+                    status: "Download complete".to_string(),
+                    percent: Some(100.0),
+                });
+                let _ = tx.send(PullEvent::Done);
+                return;
+            }
+        }
+
+        // Send periodic progress so the UI knows we're still tracking the
+        // background download.
+        if poll_num % 10 == 9 {
+            let elapsed_secs = (poll_num + 1) as u64 * poll_interval.as_secs();
+            let _ = tx.send(PullEvent::Progress {
+                status: format!("Downloading via LM Studio ({}s elapsed)...", elapsed_secs),
+                percent: None,
+            });
+        }
+    }
+
+    let _ = tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
+}
+
 impl ModelProvider for LmStudioProvider {
     fn name(&self) -> &str {
         "LM Studio"
     }
 
     fn is_available(&self) -> bool {
-        let mut req = ureq::get(&self.models_url())
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build();
-        if let Some(ref key) = self.api_key {
-            req = req.header("Authorization", &format!("Bearer {}", key));
-        }
-        req.call().is_ok()
+        // Report available only when the native /api/v0 API confirms LM Studio,
+        // matching the identity gate used for model import.
+        lmstudio_native_models(
+            &self.base_url,
+            self.api_key.as_deref(),
+            std::time::Duration::from_secs(2),
+        )
+        .is_some()
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -1844,15 +3058,15 @@ impl ModelProvider for LmStudioProvider {
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
         let models_url = self.models_url();
+        let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
         let tag = match lmstudio_pull_tag(model_tag) {
             Some(t) => t,
             None => {
                 return Err(format!(
                     "Could not find a GGUF file for '{model_tag}'. \
-                     LM Studio requires a direct link to a .gguf file. \
-                     Try providing a HuggingFace repo that contains GGUF weights \
-                     (e.g. bartowski/ or ggml-org/ variants)."
+                     LM Studio downloads need a HuggingFace repo that contains \
+                     GGUF weights (e.g. bartowski/ or ggml-org/ variants)."
                 ));
             }
         };
@@ -1867,8 +3081,8 @@ impl ModelProvider for LmStudioProvider {
             // LM Studio may stream download progress as newline-delimited JSON
             // from the POST response, or it may acknowledge the request and
             // close the stream while the download proceeds in the background.
-            // In the latter case we poll the installed models list to detect
-            // eventual completion.
+            // In the latter case we poll the per-job status endpoint when a
+            // job id is available, falling back to the installed models list.
             let mut req = ureq::post(&download_url)
                 .config()
                 .timeout_global(Some(std::time::Duration::from_secs(3600)))
@@ -1880,18 +3094,38 @@ impl ModelProvider for LmStudioProvider {
 
             match resp {
                 Ok(resp) => {
-                    let reader = std::io::BufReader::new(resp.into_body().into_reader());
-                    use std::io::BufRead;
+                    use std::io::Read;
+                    let mut body = String::new();
+                    let _ = resp.into_body().into_reader().read_to_string(&mut body);
+
+                    // LM Studio 0.4.20 answers the POST with a single
+                    // pretty-printed JSON object spanning multiple lines;
+                    // older/streaming variants emit NDJSON or SSE lines.
+                    // Parse the whole body as one JSON document first so the
+                    // job_id is not lost, then fall back to per-line parsing.
+                    let chunks: Vec<String> =
+                        if serde_json::from_str::<serde_json::Value>(body.trim()).is_ok() {
+                            vec![body.trim().to_string()]
+                        } else {
+                            body.lines().map(str::to_string).collect()
+                        };
 
                     let mut saw_completion = false;
-                    for line in reader.lines() {
-                        let Ok(line) = line else { break };
+                    let mut job_id: Option<String> = None;
+                    for line in chunks {
                         if line.is_empty() {
                             continue;
                         }
 
                         // Handle SSE "data: {json}" or plain JSON lines
                         let json_str = line.strip_prefix("data: ").unwrap_or(&line);
+
+                        if let Ok(dl_resp) =
+                            serde_json::from_str::<LmStudioDownloadResponse>(json_str)
+                            && let Some(id) = lmstudio_response_job_id(&dl_resp)
+                        {
+                            job_id = Some(id.to_string());
+                        }
 
                         // Try single status object, then first element of an array
                         let status_opt: Option<LmStudioDownloadStatus> =
@@ -1901,7 +3135,7 @@ impl ModelProvider for LmStudioProvider {
                                     .and_then(|v| v.into_iter().next())
                             });
 
-                        // Also try the initial response format (has job_id)
+                        // Also try the initial response format.
                         if status_opt.is_none() {
                             if let Ok(dl_resp) =
                                 serde_json::from_str::<LmStudioDownloadResponse>(json_str)
@@ -1935,99 +3169,62 @@ impl ModelProvider for LmStudioProvider {
 
                         let st = status_opt.unwrap();
 
-                        let percent = st.progress.map(|p| p * 100.0).or_else(|| {
-                            match (st.downloaded_bytes, st.total_size_bytes) {
-                                (Some(dl), Some(total)) if total > 0 => {
-                                    Some(dl as f64 / total as f64 * 100.0)
-                                }
-                                _ => None,
+                        match lmstudio_download_terminal_status(&st.status) {
+                            Some(LmStudioDownloadTerminalStatus::Done) => {
+                                let _ = tx.send(PullEvent::Progress {
+                                    status: "Download complete".to_string(),
+                                    percent: Some(100.0),
+                                });
+                                let _ = tx.send(PullEvent::Done);
+                                saw_completion = true;
+                                break;
                             }
-                        });
-
-                        if st.status == "completed" || st.status == "already_downloaded" {
-                            let _ = tx.send(PullEvent::Progress {
-                                status: "Download complete".to_string(),
-                                percent: Some(100.0),
-                            });
-                            let _ = tx.send(PullEvent::Done);
-                            saw_completion = true;
-                            break;
-                        }
-
-                        if st.status == "failed" {
-                            let _ =
-                                tx.send(PullEvent::Error("LM Studio download failed".to_string()));
-                            return;
+                            Some(LmStudioDownloadTerminalStatus::Failed) => {
+                                let _ = tx.send(PullEvent::Error(
+                                    "LM Studio download failed".to_string(),
+                                ));
+                                return;
+                            }
+                            None => {}
                         }
 
                         let _ = tx.send(PullEvent::Progress {
                             status: "Downloading via LM Studio...".to_string(),
-                            percent,
+                            percent: lmstudio_download_status_percent(&st),
                         });
                     }
 
                     if !saw_completion {
                         // Stream ended without a completion event. The POST
                         // succeeded so LM Studio accepted the request — it
-                        // is likely downloading in the background. Poll the
-                        // installed models list to detect completion.
-                        let candidates = hf_name_to_lmstudio_candidates(&model_tag_owned);
+                        // is likely downloading in the background. Poll
+                        // per-job status when possible; otherwise fall back
+                        // to the installed models list to detect completion.
                         let poll_interval = std::time::Duration::from_secs(3);
-                        let max_polls = 600; // 30 minutes max
+                        let mut poll_budget = 600; // 30 minutes max
 
-                        let _ = tx.send(PullEvent::Progress {
-                            status: "Downloading via LM Studio (tracking)...".to_string(),
-                            percent: None,
-                        });
-
-                        for poll_num in 0..max_polls {
-                            std::thread::sleep(poll_interval);
-
-                            let mut req = ureq::get(&models_url)
-                                .config()
-                                .timeout_global(Some(std::time::Duration::from_secs(5)))
-                                .build();
-                            if let Some(ref key) = api_key {
-                                req = req.header("Authorization", &format!("Bearer {}", key));
-                            }
-                            let Ok(resp) = req.call() else {
-                                continue;
-                            };
-
-                            let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
-                                continue;
-                            };
-
-                            let installed: HashSet<String> =
-                                list.data.into_iter().map(|m| m.id.to_lowercase()).collect();
-
-                            for candidate in &candidates {
-                                if installed.contains(candidate.as_str()) {
-                                    let _ = tx.send(PullEvent::Progress {
-                                        status: "Download complete".to_string(),
-                                        percent: Some(100.0),
-                                    });
-                                    let _ = tx.send(PullEvent::Done);
-                                    return;
-                                }
-                            }
-
-                            // Send periodic progress so the UI knows we're
-                            // still tracking the background download.
-                            if poll_num % 10 == 9 {
-                                let elapsed_secs = (poll_num + 1) as u64 * poll_interval.as_secs();
-                                let _ = tx.send(PullEvent::Progress {
-                                    status: format!(
-                                        "Downloading via LM Studio ({}s elapsed)...",
-                                        elapsed_secs
-                                    ),
-                                    percent: None,
-                                });
+                        if let Some(ref job_id) = job_id {
+                            let status_url = lmstudio_download_status_url(&base_url, job_id);
+                            if poll_lmstudio_download_status(
+                                &status_url,
+                                api_key.as_deref(),
+                                &tx,
+                                poll_interval,
+                                &mut poll_budget,
+                            ) == LmStudioStatusPollResult::Finished
+                            {
+                                return;
                             }
                         }
 
-                        let _ =
-                            tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
+                        poll_lmstudio_installed_models(
+                            &models_url,
+                            api_key.as_deref(),
+                            &model_tag_owned,
+                            &tx,
+                            poll_interval,
+                            poll_budget,
+                        );
                     }
                 }
                 Err(e) => {
@@ -2109,26 +3306,33 @@ fn lmstudio_gguf_resolve_url(repo_id: &str, filename: &str) -> String {
     )
 }
 
+fn lmstudio_memory_info() -> sysinfo::System {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys
+}
+
 /// Try to find a direct GGUF file URL for an HF model name.
 ///
-/// LM Studio's download endpoint rejects base model repos (which contain
-/// safetensors/pytorch weights) and requires a direct link to a `.gguf` file.
-/// This function looks up known GGUF repos, lists their files, selects the
-/// best quantization that fits in system RAM, and returns a resolve URL.
+/// Used to verify a repo actually ships llama.cpp-compatible GGUF weights
+/// before we hand LM Studio its repo URL (LM Studio 404s on repos without
+/// downloadable artifacts). This function looks up known GGUF repos, lists
+/// their files, selects the best quantization that fits in system RAM, and
+/// returns a resolve URL; `lmstudio_pull_tag` converts it back to the repo
+/// URL form the download API accepts.
 ///
 /// Returns `None` if no GGUF files are found or the network is unavailable.
 fn lmstudio_find_gguf_url(hf_name: &str) -> Option<String> {
-    let mut sys = sysinfo::System::new_all();
-    sys.refresh_memory();
+    let sys = lmstudio_memory_info();
     let system_ram_gb = sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
     // Leave headroom for OS and overhead
     let budget_gb = system_ram_gb * 0.85;
 
     // Try known mappings first
-    if let Some(repo) = lookup_gguf_repo(hf_name) {
-        if let Some(url) = try_gguf_repo(repo, budget_gb) {
-            return Some(url);
-        }
+    if let Some(repo) = lookup_gguf_repo(hf_name)
+        && let Some(url) = try_gguf_repo(repo, budget_gb)
+    {
+        return Some(url);
     }
 
     // Try heuristic candidates (bartowski/, ggml-org/, TheBloke/)
@@ -2139,10 +3343,10 @@ fn lmstudio_find_gguf_url(hf_name: &str) -> Option<String> {
     }
 
     // Try the base repo itself (some repos host GGUF directly)
-    if hf_name.contains('/') {
-        if let Some(url) = try_gguf_repo(hf_name, budget_gb) {
-            return Some(url);
-        }
+    if hf_name.contains('/')
+        && let Some(url) = try_gguf_repo(hf_name, budget_gb)
+    {
+        return Some(url);
     }
 
     None
@@ -2160,11 +3364,14 @@ fn try_gguf_repo(repo_id: &str, budget_gb: f64) -> Option<String> {
 
 /// Given an HF model name, return the model identifier to use for LM Studio download.
 ///
-/// LM Studio's `/api/v1/models/download` requires a direct link to a `.gguf`
-/// file. For HF repo IDs, we first attempt to resolve a GGUF file URL by
-/// looking up known GGUF repos and selecting the best quantization. If that
-/// fails (network unavailable or no GGUF found), we fall back to wrapping
-/// the repo in a base HF URL for backward compatibility.
+/// LM Studio's `POST /api/v1/models/download` accepts the HuggingFace repo
+/// URL form (`https://huggingface.co/{owner}/{repo}`) and selects the
+/// quantization itself. Verified against LM Studio 0.4.20: a direct link to
+/// a `.gguf` file is rejected with HTTP 400 "Invalid HuggingFace model URL
+/// format", and a bare `owner/repo` id is rejected for community artifacts.
+/// We still resolve a concrete GGUF file first so we only hand LM Studio
+/// repos that actually ship llama.cpp-compatible weights, then convert the
+/// resolve URL back to the repo URL form the API accepts.
 ///
 /// Full HTTP(S) URLs are passed through unchanged. Bare short names (no slash)
 /// are assumed to be LM Studio first-party catalog entries.
@@ -2178,15 +3385,24 @@ pub fn lmstudio_pull_tag(hf_name: &str) -> Option<String> {
         return Some(hf_name.to_string());
     }
 
-    // Try to find a direct GGUF file URL
+    // Verify the repo ships GGUF weights, then send the repo URL form.
     if let Some(url) = lmstudio_find_gguf_url(hf_name) {
-        return Some(url);
+        return Some(lmstudio_repo_url_from_gguf_url(&url));
     }
 
     // No GGUF file found — return None so the caller can produce a
     // helpful error instead of sending a bare repo URL that LM Studio
     // will reject with HTTP 404.
     None
+}
+
+/// Convert a GGUF resolve URL (`https://huggingface.co/{repo}/resolve/main/{file}`)
+/// into the repo URL form LM Studio's download API accepts.
+fn lmstudio_repo_url_from_gguf_url(url: &str) -> String {
+    match url.split_once("/resolve/") {
+        Some((repo_url, _)) => repo_url.to_string(),
+        None => url.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,8 +3464,15 @@ impl VllmProvider {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_base_url(url: &str) -> Self {
+        Self {
+            base_url: url.to_string(),
+        }
+    }
+
     fn models_url(&self) -> String {
-        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+        openai_models_url(&self.base_url)
     }
 
     /// Single-pass startup probe.
@@ -2265,9 +3488,32 @@ impl VllmProvider {
             return (false, set, 0);
         };
 
-        let Ok(list) = resp.into_body().read_json::<VllmModelList>() else {
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
+            if endpoint_has_omlx_status(&self.base_url, std::time::Duration::from_millis(800)) {
+                return (false, set, 0);
+            }
             return (true, set, 0);
         };
+        if openai_model_list_is_omlx(&list)
+            || (list.data.is_empty()
+                && endpoint_has_omlx_status(&self.base_url, std::time::Duration::from_millis(800)))
+        {
+            return (false, set, 0);
+        }
+        // Identity gate (#791, #790): import only when the endpoint positively
+        // identifies as vLLM. Measured 2026-09-01: vLLM 0.28.0 lists models with
+        // owned_by "vllm" (Server: uvicorn is shared by any FastAPI app, so
+        // owned_by is the discriminator). An empty list never comes from vLLM
+        // itself: vllm serve refuses to start without a model to serve.
+        if classify_openai_endpoint(server_header.as_deref(), &list) != OpenAiEndpointIdentity::Vllm
+        {
+            return (false, set, 0);
+        }
         let models = list.data;
         let count = models.len();
         for m in models {
@@ -2290,29 +3536,32 @@ impl VllmProvider {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct VllmModelList {
-    data: Vec<VllmModel>,
-}
-
-#[derive(serde::Deserialize)]
-struct VllmModel {
-    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct"
-    id: String,
-}
-
 impl ModelProvider for VllmProvider {
     fn name(&self) -> &str {
         "vLLM"
     }
 
     fn is_available(&self) -> bool {
-        ureq::get(&self.models_url())
+        let Ok(resp) = ureq::get(&self.models_url())
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok()
+        else {
+            return false;
+        };
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
+            return false;
+        };
+        // Report available only when the endpoint identifies as vLLM, matching
+        // the identity gate used for model import (a foreign OpenAI server on
+        // the port is neither available nor imported).
+        classify_openai_endpoint(server_header.as_deref(), &list) == OpenAiEndpointIdentity::Vllm
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -2374,6 +3623,338 @@ pub fn has_vllm_mapping(hf_name: &str) -> bool {
 /// Given an HF model name, return the model identifier to use for vLLM.
 /// vLLM accepts HF model names directly.
 pub fn vllm_pull_tag(hf_name: &str) -> Option<String> {
+    if hf_name.is_empty() {
+        return None;
+    }
+    Some(hf_name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// RamaLama provider
+// ---------------------------------------------------------------------------
+
+/// RamaLama — container-based model runner with an OpenAI-compatible API.
+///
+/// Exposes `GET /v1/models` to list served models at
+/// `http://localhost:8080` by default. Override with `RAMALAMA_HOST`.
+///
+/// Like vLLM, RamaLama has no runtime pull endpoint — models are served
+/// via `ramalama serve <model>`. The `start_pull` implementation returns
+/// an informational error directing users to serve the desired model.
+pub struct RamaLamaProvider {
+    base_url: String,
+}
+
+fn normalize_ramalama_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return Some(host.to_string());
+    }
+
+    if host.contains("://") {
+        return None;
+    }
+
+    Some(format!("http://{host}"))
+}
+
+impl Default for RamaLamaProvider {
+    fn default() -> Self {
+        let base_url = std::env::var("RAMALAMA_HOST")
+            .ok()
+            .and_then(|raw| {
+                let normalized = normalize_ramalama_host(&raw);
+                if normalized.is_none() {
+                    eprintln!(
+                        "Warning: could not parse RAMALAMA_HOST='{}'. \
+                         Expected host:port or http(s)://host:port",
+                        raw
+                    );
+                }
+                normalized
+            })
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+        Self { base_url }
+    }
+}
+
+impl RamaLamaProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_base_url(url: &str) -> Self {
+        Self {
+            base_url: url.to_string(),
+        }
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Single-pass startup probe.
+    ///
+    /// Prefers the running server's `/v1/models`. When that is unreachable,
+    /// falls back to the local store via `ramalama ls --json`, so installed
+    /// models are still detected without a served endpoint (mirrors how Docker
+    /// Model Runner is recognized while "installed but not running").
+    /// Returns `(available, installed_models, count)`.
+    pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
+        let Ok(resp) = ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_millis(800)))
+            .build()
+            .call()
+        else {
+            // Server not reachable — fall back to the on-disk store.
+            return match Self::installed_from_store() {
+                Some((set, count)) => (true, set, count),
+                None => (false, HashSet::new(), 0),
+            };
+        };
+
+        let server_header = resp
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
+            return (true, HashSet::new(), 0);
+        };
+        // Shared identity gate (#791, #790): a llama-swap proxy answering on
+        // this port is not RamaLama, so treat it like no server at all and
+        // fall back to the on-disk store. A plain llama.cpp identity is not
+        // rejected on this path: `ramalama serve` drives llama-server inside
+        // its container, so a genuine endpoint may present it.
+        if classify_openai_endpoint(server_header.as_deref(), &list)
+            == OpenAiEndpointIdentity::LlamaSwap
+        {
+            return match Self::installed_from_store() {
+                Some((set, count)) => (true, set, count),
+                None => (false, HashSet::new(), 0),
+            };
+        }
+        let count = list.data.len();
+        let mut set = HashSet::new();
+        for m in list.data {
+            insert_ramalama_name(&mut set, &m.id);
+        }
+        (true, set, count)
+    }
+
+    /// Detect installed models from the local RamaLama store using the CLI,
+    /// so detection works without a running server. Returns `None` when the
+    /// `ramalama` binary is absent or the command fails.
+    fn installed_from_store() -> Option<(HashSet<String>, usize)> {
+        let mut child = std::process::Command::new("ramalama")
+            .args(["ls", "--json"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            std::io::Read::read_to_end(&mut stdout, &mut output).map(|_| output)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let _ = reader.join();
+                        return None;
+                    }
+                    let output = reader.join().ok()?.ok()?;
+                    return parse_ramalama_store(&output);
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
+        let (_, set, count) = self.detect_with_installed();
+        (set, count)
+    }
+}
+
+/// A row from `ramalama ls --json`. Extra fields (modified, size) are ignored.
+#[derive(serde::Deserialize)]
+struct RamaLamaStoreModel {
+    /// Transport-qualified name, e.g. "huggingface://meta-llama/Llama-3.1-8B-Instruct".
+    name: String,
+    /// Optional friendly alias from shortnames.conf; empty when unset.
+    #[serde(default)]
+    shortname: String,
+}
+
+/// Insert a RamaLama model identifier into the installed set: the full
+/// lowercased identifier plus its trailing path component, so both
+/// "huggingface://meta-llama/llama-3.1-8b-instruct" and "llama-3.1-8b-instruct"
+/// match. Matching against these is substring-based (see
+/// `is_model_installed_ramalama`).
+fn insert_ramalama_name(set: &mut HashSet<String>, raw: &str) {
+    let lower = raw.to_lowercase();
+    if let Some(name) = lower.split('/').next_back()
+        && name != lower
+    {
+        set.insert(name.to_string());
+    }
+    set.insert(lower);
+}
+
+/// Parse `ramalama ls --json` output into `(installed_set, count)`.
+fn parse_ramalama_store(json: &[u8]) -> Option<(HashSet<String>, usize)> {
+    let models: Vec<RamaLamaStoreModel> = serde_json::from_slice(json).ok()?;
+    let count = models.len();
+    let mut set = HashSet::new();
+    for m in &models {
+        insert_ramalama_name(&mut set, &m.name);
+        if !m.shortname.is_empty() {
+            insert_ramalama_name(&mut set, &m.shortname);
+        }
+    }
+    Some((set, count))
+}
+
+fn resolve_ramalama_detection(
+    server_models: Option<(HashSet<String>, usize)>,
+    store_models: Option<(HashSet<String>, usize)>,
+) -> (bool, HashSet<String>, usize) {
+    if let Some((set, count)) = server_models {
+        return (true, set, count);
+    }
+    match store_models {
+        Some((set, count)) => (true, set, count),
+        None => (false, HashSet::new(), 0),
+    }
+}
+
+impl ModelProvider for RamaLamaProvider {
+    fn name(&self) -> &str {
+        "RamaLama"
+    }
+
+    fn is_available(&self) -> bool {
+        ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(2)))
+            .build()
+            .call()
+            .is_ok()
+    }
+
+    fn installed_models(&self) -> HashSet<String> {
+        let (set, _) = self.installed_models_counted();
+        set
+    }
+
+    fn start_pull(&self, _model_tag: &str) -> Result<PullHandle, String> {
+        Err("RamaLama does not support downloading models at runtime. \
+             Serve the desired model with `ramalama serve <model>`."
+            .to_string())
+    }
+}
+
+#[cfg(test)]
+mod ramalama_detection_tests {
+    use super::{insert_ramalama_name, parse_ramalama_store, resolve_ramalama_detection};
+    use std::collections::HashSet;
+
+    #[test]
+    fn unavailable_server_uses_local_store_model() {
+        let json = br#"[{"name":"huggingface://org/model-x","shortname":""}]"#;
+        let store_models = parse_ramalama_store(json).expect("store data should parse");
+        let (available, installed, count) = resolve_ramalama_detection(None, Some(store_models));
+
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("model-x"));
+    }
+
+    #[test]
+    fn server_models_take_precedence_over_local_store() {
+        let mut server = HashSet::new();
+        insert_ramalama_name(&mut server, "org/server-model");
+        let mut store = HashSet::new();
+        insert_ramalama_name(&mut store, "org/local-model");
+
+        let (_, installed, count) = resolve_ramalama_detection(Some((server, 1)), Some((store, 1)));
+
+        assert_eq!(count, 1);
+        assert!(installed.contains("server-model"));
+        assert!(!installed.contains("local-model"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RamaLama name-matching helpers
+// ---------------------------------------------------------------------------
+
+/// RamaLama serves HuggingFace/OCI model names directly. We match against the
+/// model's full HF name and common naming patterns.
+pub fn hf_name_to_ramalama_candidates(hf_name: &str) -> Vec<String> {
+    let repo = hf_name
+        .split('/')
+        .next_back()
+        .unwrap_or(hf_name)
+        .to_lowercase();
+    let mut candidates = vec![hf_name.to_lowercase()];
+    if repo != hf_name.to_lowercase() {
+        candidates.push(repo.clone());
+    }
+    // Strip common suffixes for matching
+    let stripped = repo
+        .replace("-instruct", "")
+        .replace("-chat", "")
+        .replace("-hf", "")
+        .replace("-it", "");
+    if stripped != repo {
+        candidates.push(stripped);
+    }
+    candidates
+}
+
+/// Check if any RamaLama candidates for an HF model appear in the installed set.
+pub fn is_model_installed_ramalama(hf_name: &str, installed: &HashSet<String>) -> bool {
+    let candidates = hf_name_to_ramalama_candidates(hf_name);
+    candidates.iter().any(|candidate| {
+        installed
+            .iter()
+            .any(|installed_name| installed_name.contains(candidate))
+    })
+}
+
+/// RamaLama can serve any HuggingFace model, so we always return true.
+pub fn has_ramalama_mapping(hf_name: &str) -> bool {
+    !hf_name.is_empty()
+}
+
+/// Given an HF model name, return the model identifier to use for RamaLama.
+/// RamaLama accepts HF model names directly.
+pub fn ramalama_pull_tag(hf_name: &str) -> Option<String> {
     if hf_name.is_empty() {
         return None;
     }
@@ -2474,18 +4055,68 @@ fn docker_mr_installed_matches(installed_name: &str, candidate: &str) -> bool {
 
 /// Strip quantization suffix from a GGUF file stem.
 /// "llama-3.1-8b-instruct-q4_k_m" → "llama-3.1-8b-instruct"
-fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
+pub fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
+    // Matched on the quant *family* stem rather than each published variant:
+    // K-quants as `-qN_k` and I-quants as `-iqN_`, so `_S`/`_M`/`_L`/`_XL`
+    // and `_NL`/`_XS`/`_XXS` all reduce to the same base. Enumerating the
+    // variants instead left whole publishers unmatched — bartowski `_L` files
+    // and Unsloth Dynamic `_XL`/`IQ4_NL` files never reached the catalog id,
+    // so they read as neither installed nor served.
     let quant_patterns = [
-        "-q8_0", "-q6_k", "-q6_k_l", "-q5_k_m", "-q5_k_s", "-q4_k_m", "-q4_k_s", "-q4_0",
-        "-q3_k_m", "-q3_k_s", "-q2_k", "-iq4_xs", "-iq3_m", "-iq2_m", "-iq1_m", "-f16", "-f32",
-        "-bf16", ".q8_0", ".q6_k", ".q5_k_m", ".q4_k_m", ".q4_0", ".q3_k_m", ".q2_k",
+        "-q8_0", "-q8_k", "-q6_k", "-q5_k", "-q4_k", "-q4_0", "-q3_k", "-q2_k", "-iq4_", "-iq3_",
+        "-iq2_", "-iq1_", "-f16", "-f32", "-bf16", ".q8_0", ".q6_k", ".q5_k", ".q4_k", ".q4_0",
+        ".q3_k", ".q2_k",
     ];
     for pat in &quant_patterns {
         if let Some(pos) = stem.rfind(pat) {
-            return Some(stem[..pos].to_string());
+            let base = &stem[..pos];
+            // Unsloth "Dynamic" GGUFs embed a `-ud` marker between the model
+            // name and the quant (e.g. `qwen3.6-35b-a3b-ud-q4_k_m`). It is not
+            // part of the canonical model name, so strip it too — otherwise the
+            // stem never reduces to the catalog id and the file reads as neither
+            // installed nor served.
+            let base = base.strip_suffix("-ud").unwrap_or(base);
+            return Some(base.to_string());
         }
     }
     None
+}
+
+/// Strip an MLX quantization suffix from a lowercased model stem, so
+/// mlx-community basenames reduce to catalog slugs (#854, #869).
+/// "llama-3.2-1b-instruct-4bit" → "llama-3.2-1b-instruct"
+///
+/// End-anchored, unlike the GGUF list above: mlx-community always places the
+/// quant scheme last, and dtype-like fragments can occur inside genuine model
+/// names. Strips, in order: the quant scheme (`-<N>bit` or `-mxfp4`, each
+/// with optional trailing variant markers such as `-4bit-dwq`, date-stamped
+/// `-4bit-dwq-05082025`, `-mxfp4-q8`, `-mxfp4-bf16`, or a plain `-fp16`),
+/// then a trailing `-mlx` marker (`...-instruct-mlx-8bit` → `...-instruct`).
+///
+/// Returns `None` when nothing was stripped, so lookup callers can tell "no
+/// MLX suffix present" apart from "already reduced".
+pub fn strip_mlx_quant_suffix(stem: &str) -> Option<String> {
+    static MLX_QUANT_SUFFIX: OnceLock<Regex> = OnceLock::new();
+    let re = MLX_QUANT_SUFFIX.get_or_init(|| {
+        Regex::new(r"-(?:\d+bit(?:-[a-z0-9]+)*|mxfp4(?:-[a-z0-9]+)*|fp16)$")
+            .expect("valid MLX suffix regex")
+    });
+    let without_quant = match re.find(stem) {
+        Some(m) if m.start() > 0 => &stem[..m.start()],
+        _ => stem,
+    };
+    let base = match without_quant.strip_suffix("-mlx") {
+        Some(b) if !b.is_empty() => b,
+        _ => without_quant,
+    };
+    if base.len() == stem.len() {
+        return None;
+    }
+    let base = base.trim_matches('-');
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2578,6 +4209,13 @@ const LLAMACPP_GGUF_MAPPINGS: &[(&str, &str)] = &[
         "bartowski/Mixtral-8x7B-Instruct-v0.1-GGUF",
     ),
     // Google Gemma
+    ("gemma-4-e2b-it", "bartowski/google_gemma-4-E2B-it-GGUF"),
+    ("gemma-4-e4b-it", "bartowski/google_gemma-4-E4B-it-GGUF"),
+    (
+        "gemma-4-26b-a4b-it",
+        "bartowski/google_gemma-4-26B-A4B-it-GGUF",
+    ),
+    ("gemma-4-31b-it", "bartowski/google_gemma-4-31B-it-GGUF"),
     ("gemma-3-12b-it", "bartowski/gemma-3-12b-it-GGUF"),
     ("gemma-2-27b-it", "bartowski/gemma-2-27b-it-GGUF"),
     ("gemma-2-9b-it", "bartowski/gemma-2-9b-it-GGUF"),
@@ -2662,21 +4300,25 @@ pub fn is_model_installed_llamacpp(hf_name: &str, installed: &HashSet<String>) -
         .unwrap_or(hf_name)
         .to_lowercase();
 
-    // Direct match on model name stem
+    // Direct match on model name stem. The installed set already contains
+    // both raw file stems and quant-suffix-stripped bases (see
+    // `installed_models_counted`), so exact lookups cover files like
+    // "qwen2.5-7b-instruct-q4_k_m.gguf" matched against the plain repo name.
     if installed.contains(&repo) {
         return true;
     }
 
-    // Check with common suffixes stripped
+    // Also accept a match with common variant suffixes stripped.
+    //
+    // Deliberately no substring matching here: a single "gemma-3.gguf" on
+    // disk must not mark every gemma-3-* model in the database as installed
+    // (`repo.contains("gemma-3")` is true for all of them).
     let stripped = repo
         .replace("-instruct", "")
         .replace("-chat", "")
         .replace("-hf", "")
         .replace("-it", "");
-
-    installed.iter().any(|name| {
-        name.contains(&repo) || name.contains(&stripped) || repo.contains(name.as_str())
-    })
+    installed.contains(&stripped)
 }
 
 /// Given an HF model name, return the best GGUF repo to pull from.
@@ -2716,23 +4358,11 @@ fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn strip_trailing_quant_suffix(name: &str) -> String {
-    for suffix in ["-4bit", "-6bit", "-8bit"] {
-        if let Some(stripped) = name.strip_suffix(suffix) {
-            return stripped.to_string();
-        }
-    }
-    name.to_string()
-}
-
+/// Normalize an MLX repo basename to its catalog base: thin wrapper over
+/// [`strip_mlx_quant_suffix`] for callers that want the input back (dashes
+/// trimmed) when no MLX suffix is present (#869).
 fn normalize_mlx_repo_base(repo_lower: &str) -> String {
-    let without_quant = strip_trailing_quant_suffix(repo_lower);
-
-    without_quant
-        .strip_suffix("-mlx")
-        .unwrap_or(&without_quant)
-        .trim_matches('-')
-        .to_string()
+    strip_mlx_quant_suffix(repo_lower).unwrap_or_else(|| repo_lower.trim_matches('-').to_string())
 }
 
 fn strip_trailing_common_model_suffixes(name: &str) -> String {
@@ -2920,6 +4550,24 @@ pub fn is_model_installed_mlx(hf_name: &str, installed: &HashSet<String>) -> boo
         return true;
     }
 
+    if let Some((owner, repo)) = hf_name.split_once('/')
+        && !owner.is_empty()
+        && !repo.contains('/')
+        && (is_likely_mlx_repo(owner, repo)
+            || strip_mlx_quant_suffix(&repo.to_lowercase()).is_some())
+    {
+        // A specific conversion only matches its own repo. Servers such as
+        // oMLX report ownerless ids (`qwen2.5-0.5b-instruct-4bit`), so a bare
+        // repo name still counts, unless the HF cache scan put it there for a
+        // different owner: the scan always inserts `owner/repo` next to the
+        // bare name, which is what made `Chungulus/...` match an installed
+        // `mlx-community/...` conversion (#1103).
+        let repo_lower = repo.to_lowercase();
+        let suffix = format!("/{repo_lower}");
+        return installed.contains(&repo_lower)
+            && !installed.iter().any(|id| id.ends_with(&suffix));
+    }
+
     let candidates = hf_name_to_mlx_candidates(hf_name);
     candidates.iter().any(|c| installed.contains(c))
 }
@@ -2944,6 +4592,47 @@ pub fn mlx_pull_tag(hf_name: &str) -> String {
                     .to_lowercase()
             })
         })
+}
+
+/// Resolve the repo id an MLX pull should download, guarding the
+/// `mlx-community/{tag}` fallback (issue #294).
+///
+/// An explicit `owner/name` tag is trusted as typed. A bare tag is a guess:
+/// llmfit assumes an `mlx-community` equivalent exists. Before that guess is
+/// handed to `hf download` we (a) refuse names that mark a pre-quantized
+/// non-MLX format (AWQ/GPTQ/AutoRound have no fabricated MLX twin), and
+/// (b) verify the guessed repo actually exists, so the user gets a clear
+/// error instead of a "Model not found" pull failure against a repo llmfit
+/// invented.
+///
+/// `repo_exists` is injected so tests don't hit the network.
+fn resolve_mlx_fallback_repo(
+    model_tag: &str,
+    repo_exists: &dyn Fn(&str) -> bool,
+) -> Result<String, String> {
+    if model_tag.contains('/') {
+        return Ok(model_tag.to_string());
+    }
+
+    let tag_lower = model_tag.to_lowercase();
+    let has_mlx_marker = tag_lower.contains("mlx");
+    if !has_mlx_marker && is_likely_prequantized_repo(&tag_lower) {
+        return Err(format!(
+            "{model_tag} looks like a pre-quantized AWQ/GPTQ repo — that's a vLLM/CUDA \
+             format, not MLX, and there is no mlx-community equivalent to guess. If an \
+             MLX build of this model exists, pass its full repo id (owner/name)."
+        ));
+    }
+
+    let candidate = format!("mlx-community/{model_tag}");
+    if !repo_exists(&candidate) {
+        return Err(format!(
+            "No MLX build found: {candidate} does not exist on Hugging Face (or could not \
+             be reached). If an MLX build exists under a different name, pass its full \
+             repo id (owner/name)."
+        ));
+    }
+    Ok(candidate)
 }
 
 // ---------------------------------------------------------------------------
@@ -2973,7 +4662,15 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("codellama-13b-instruct-hf", "codellama:13b"),
     ("codellama-7b-instruct-hf", "codellama:7b"),
     // Google Gemma
+    ("gemma-4-31b-it", "gemma4:31b"),
+    ("gemma-4-26b-a4b-it", "gemma4:26b"),
+    ("gemma-4-12b-it", "gemma4:12b"),
+    ("gemma-4-e4b-it", "gemma4:e4b"),
+    ("gemma-4-e2b-it", "gemma4:e2b"),
+    ("gemma-3-27b-it", "gemma3:27b"),
     ("gemma-3-12b-it", "gemma3:12b"),
+    ("gemma-3-4b-it", "gemma3:4b"),
+    ("gemma-3-1b-it", "gemma3:1b"),
     ("gemma-2-27b-it", "gemma2:27b"),
     ("gemma-2-9b-it", "gemma2:9b"),
     ("gemma-2-2b-it", "gemma2:2b"),
@@ -2994,6 +4691,12 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("mistral-small-3.1-24b-instruct-2503", "mistral-small3.1"),
     ("mistral-large-instruct-2407", "mistral-large"),
     ("devstral-small-2505", "devstral"),
+    ("devstral-small-2-24b-instruct-2512", "devstral-small-2:24b"),
+    ("mistral-medium-3.5-128b", "mistral-medium-3.5:128b"),
+    // IBM Granite
+    ("granite-4.2-30b", "granite4.2:30b"),
+    ("granite-4.2-8b", "granite4.2:8b"),
+    ("granite-4.2-3b", "granite4.2:3b"),
     ("mixtral-8x7b-instruct-v0.1", "mixtral:8x7b"),
     ("mixtral-8x22b-instruct-v0.1", "mixtral:8x22b"),
     // Qwen 2 / 2.5
@@ -3033,6 +4736,9 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("qwen3.5-27b", "qwen3.5"),
     ("qwen3.5-35b-a3b", "qwen3.5:35b"),
     ("qwen3.5-122b-a10b", "qwen3.5:122b"),
+    // Qwen 3.8 — 27B is the only size Ollama publishes; the 2.4T-A95B MoE
+    // has no library entry.
+    ("qwen3.8-27b", "qwen3.8:27b"),
     // Qwen3-Coder-Next
     ("qwen3-coder-next", "qwen3-coder-next"),
     // DeepSeek
@@ -3187,10 +4893,12 @@ pub fn hf_name_to_ollama_candidates(hf_name: &str) -> Vec<String> {
     // Try to split off the size tag (e.g. "qwen3-coder-30b-a3b" → ("qwen3-coder", "30b-a3b"))
     // Ollama uses "name:size" format, so we look for a size-like segment.
     if let Some((name, size)) = split_name_and_size(&base) {
-        // "name:size" is the primary Ollama format
+        // "name:size" is the primary Ollama format. Deliberately *not* the bare
+        // family name: this model announces its size, so an install of a
+        // different size in the same family is a different model. Adding the
+        // stem here is what let one `qwen3:8b` mark every `Qwen3-*` entry in
+        // the catalog installed (#861).
         candidates.push(format!("{}:{}", name, size));
-        // Also try bare family name (Ollama inserts both into the installed set)
-        candidates.push(name.to_string());
     }
 
     // Also try the full lowered name and stripped name as-is
@@ -3209,7 +4917,45 @@ pub fn has_ollama_mapping(hf_name: &str) -> bool {
     lookup_ollama_tag(hf_name).is_some()
 }
 
-fn ollama_installed_matches_candidate(installed_name: &str, candidate: &str) -> bool {
+/// Largest ratio between a catalog entry's parameter count and an installed
+/// tag's size before the two are treated as different models. Deliberately
+/// loose: Ollama tags round (`phi4:14b` for a 14.7B model), so the check is
+/// only meant to catch mismatches of a different order, like a 14B tag
+/// standing in for a 684B model.
+const OLLAMA_SIZE_MISMATCH_RATIO: f64 = 2.0;
+
+/// Parse the size out of an Ollama tag: `deepseek-r1:14b` -> `14.0`,
+/// `qwen2.5-coder:7b-instruct-q4_K_M` -> `7.0`. Returns `None` for tags with
+/// no parseable size, including `8x7b`-style MoE tags and bare family stems.
+fn ollama_tag_size_b(installed_name: &str) -> Option<f64> {
+    let size = installed_name.split(':').nth(1)?;
+    let head = size.split('-').next()?;
+    head.strip_suffix('b')?.parse::<f64>().ok()
+}
+
+/// Does an installed tag's size agree with the catalog entry's parameter
+/// count? Unknown on either side means "no opinion", which keeps the previous
+/// permissive behaviour rather than dropping a real install.
+fn ollama_size_is_compatible(installed_name: &str, catalog_params_b: Option<f64>) -> bool {
+    let (Some(catalog), Some(tag)) = (catalog_params_b, ollama_tag_size_b(installed_name)) else {
+        return true;
+    };
+    if catalog <= 0.0 || tag <= 0.0 {
+        return true;
+    }
+    let ratio = if catalog > tag {
+        catalog / tag
+    } else {
+        tag / catalog
+    };
+    ratio <= OLLAMA_SIZE_MISMATCH_RATIO
+}
+
+fn ollama_installed_matches_candidate(
+    installed_name: &str,
+    candidate: &str,
+    catalog_params_b: Option<f64>,
+) -> bool {
     if installed_name == candidate {
         return true;
     }
@@ -3221,12 +4967,34 @@ fn ollama_installed_matches_candidate(installed_name: &str, candidate: &str) -> 
         return installed_name.starts_with(&format!("{candidate}-"));
     }
 
-    false
+    // A size-less candidate is family-level by construction — either an
+    // `OLLAMA_MAPPINGS` entry whose tag carries no size (`phi-4` → `phi4`,
+    // `qwq-32b` → `qwq`) or an HF name with no size to parse. Any tag of that
+    // family is *usually* the model in question, so match `phi4:14b` too.
+    //
+    // "Usually" is why the size check is here. Some families publish one bare
+    // tag for wildly different models: `deepseek-r1` covers both the 684B
+    // original and the 14B Qwen distill, so `deepseek-r1:14b` would otherwise
+    // mark the 397 GB entry installed. Candidates derived from a *sized* HF
+    // name never reach here (see `hf_name_to_ollama_candidates`).
+    installed_name.starts_with(&format!("{candidate}:"))
+        && ollama_size_is_compatible(installed_name, catalog_params_b)
 }
 
 /// Check if any of the Ollama candidates for an HF model appear in the
 /// installed set.
 pub fn is_model_installed(hf_name: &str, installed: &HashSet<String>) -> bool {
+    is_model_installed_sized(hf_name, None, installed)
+}
+
+/// Like [`is_model_installed`], but takes the catalog entry's parameter count
+/// so a family-level tag match can be rejected when the sizes disagree. Pass
+/// `None` when the size is unknown; the match is then as permissive as before.
+pub fn is_model_installed_sized(
+    hf_name: &str,
+    catalog_params_b: Option<f64>,
+    installed: &HashSet<String>,
+) -> bool {
     // Quick check: the installed set may contain the full HF name (lowercased)
     // from providers that report it verbatim (e.g. MLX server, /api/v1/installed).
     if installed.contains(&hf_name.to_lowercase()) {
@@ -3235,9 +5003,9 @@ pub fn is_model_installed(hf_name: &str, installed: &HashSet<String>) -> bool {
 
     let candidates = hf_name_to_ollama_candidates(hf_name);
     candidates.iter().any(|candidate| {
-        installed
-            .iter()
-            .any(|installed_name| ollama_installed_matches_candidate(installed_name, candidate))
+        installed.iter().any(|installed_name| {
+            ollama_installed_matches_candidate(installed_name, candidate, catalog_params_b)
+        })
     })
 }
 
@@ -3247,9 +5015,350 @@ pub fn ollama_pull_tag(hf_name: &str) -> Option<String> {
     lookup_ollama_tag(hf_name).map(|s| s.to_string())
 }
 
+/// Match a running provider's model tag (an Ollama-style id, or a GGUF file
+/// path/stem as reported by llama-server) against an HF-style model name,
+/// reusing the installed-column heuristics.
+///
+/// Two deliberately separate passes: Ollama-style candidate matching runs
+/// only against the verbatim id, while file paths (".../gemma-3.Q8_0.gguf")
+/// get exact stem matching only — feeding a bare stem into the Ollama
+/// candidate heuristics would match whole families.
+pub fn tag_matches_model(tag: &str, hf_name: &str) -> bool {
+    let lower = tag.to_lowercase();
+
+    let mut tag_set = HashSet::new();
+    tag_set.insert(lower.clone());
+    if is_model_installed(hf_name, &tag_set) {
+        return true;
+    }
+
+    let stem = lower
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&lower)
+        .trim_end_matches(".gguf")
+        .to_string();
+    let mut stem_set = HashSet::new();
+    if let Some(base) = strip_gguf_quant_suffix(&stem) {
+        stem_set.insert(base);
+    }
+    // Third arm: MLX community tags carry mlx-community basenames
+    // (`llama-3.2-1b-instruct-4bit`); strip the quant tail so they reduce to
+    // catalog slugs through the same exact-stem path as GGUF stems (#854).
+    if let Some(base) = strip_mlx_quant_suffix(&stem) {
+        stem_set.insert(base);
+    }
+    stem_set.insert(stem);
+    is_model_installed_llamacpp(hf_name, &stem_set)
+}
+
+#[cfg(test)]
+mod llamacpp_binary_tests {
+    use super::{LlamaCppBinaryStyle, resolve_llamacpp_binaries};
+
+    fn s(path: &str) -> Option<String> {
+        Some(path.to_string())
+    }
+
+    #[test]
+    fn classic_binaries_win_and_keep_separate_style() {
+        let (cli, server, style) = resolve_llamacpp_binaries(
+            s("/usr/local/bin/llama-cli"),
+            s("/usr/local/bin/llama-server"),
+            s("/home/u/.local/bin/llama"),
+        );
+
+        assert_eq!(cli.as_deref(), Some("/usr/local/bin/llama-cli"));
+        assert_eq!(server.as_deref(), Some("/usr/local/bin/llama-server"));
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+        assert!(style.cli_args().is_empty());
+        assert!(style.server_args().is_empty());
+    }
+
+    #[test]
+    fn any_classic_binary_ignores_the_omnibus_one() {
+        // A mixed install resolves to the classic names only; the single
+        // `llama` binary is never invoked without its subcommands.
+        let (cli, server, style) = resolve_llamacpp_binaries(
+            s("/usr/local/bin/llama-cli"),
+            None,
+            s("/home/u/.local/bin/llama"),
+        );
+
+        assert_eq!(cli.as_deref(), Some("/usr/local/bin/llama-cli"));
+        assert_eq!(server, None);
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+    }
+
+    #[test]
+    fn omnibus_binary_fills_both_modes_with_subcommands() {
+        let (cli, server, style) =
+            resolve_llamacpp_binaries(None, None, s("/home/u/.local/bin/llama"));
+
+        assert_eq!(cli.as_deref(), Some("/home/u/.local/bin/llama"));
+        assert_eq!(server.as_deref(), Some("/home/u/.local/bin/llama"));
+        assert_eq!(style, LlamaCppBinaryStyle::Omnibus);
+        assert_eq!(style.cli_args(), &["cli"]);
+        assert_eq!(style.server_args(), &["serve"]);
+    }
+
+    #[test]
+    fn nothing_found_reports_separate_unavailable() {
+        let (cli, server, style) = resolve_llamacpp_binaries(None, None, None);
+
+        assert_eq!(cli, None);
+        assert_eq!(server, None);
+        assert_eq!(style, LlamaCppBinaryStyle::Separate);
+    }
+
+    #[test]
+    fn style_labels_are_stable() {
+        assert_eq!(LlamaCppBinaryStyle::Separate.label(), "separate");
+        assert_eq!(LlamaCppBinaryStyle::Omnibus.label(), "omnibus");
+        assert_eq!(LlamaCppBinaryStyle::Separate.cli_command(), "llama-cli");
+        assert_eq!(LlamaCppBinaryStyle::Omnibus.cli_command(), "llama cli");
+    }
+
+    /// Fake `llama` commands for the `llama cli --help` check.
+    #[cfg(unix)]
+    mod omnibus_check {
+        use super::super::is_llamacpp_omnibus_within;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        /// Writes an executable shell script named `llama` into a fresh
+        /// per-test directory and returns its path.
+        fn fake_llama(test: &str, body: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "llmfit-fake-llama-{}-{}",
+                std::process::id(),
+                test
+            ));
+            std::fs::create_dir_all(&dir).expect("create fake llama dir");
+            let path = dir.join("llama");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake llama");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake llama executable");
+            path
+        }
+
+        fn check(path: &std::path::Path, timeout: Duration) -> bool {
+            is_llamacpp_omnibus_within(path.to_str().expect("utf-8 temp path"), timeout)
+        }
+
+        #[test]
+        fn accepts_binary_that_answers_cli_help() {
+            // Only succeeds for exactly `llama cli --help`.
+            let llama = fake_llama(
+                "accepts",
+                r#"[ "$#" -eq 2 ] && [ "$1" = cli ] && [ "$2" = --help ]"#,
+            );
+            assert!(check(&llama, Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn rejects_unrelated_llama_command() {
+            // Like llama-stack: an unknown `cli` subcommand is an error.
+            let llama = fake_llama("rejects", "echo \"unknown command: $1\" >&2; exit 2");
+            assert!(!check(&llama, Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn hung_binary_times_out_as_not_llamacpp() {
+            let llama = fake_llama("hangs", "exec sleep 30");
+            let started = Instant::now();
+            assert!(!check(&llama, Duration::from_millis(200)));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn missing_binary_is_not_llamacpp() {
+            let missing = std::env::temp_dir().join("llmfit-no-such-llama-binary");
+            assert!(!check(&missing, Duration::from_secs(5)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lmstudio_memory_detection_does_not_collect_processes() {
+        let sys = lmstudio_memory_info();
+
+        assert!(sys.processes().is_empty());
+        assert!(sys.cpus().is_empty());
+        if sysinfo::IS_SUPPORTED_SYSTEM {
+            assert!(sys.total_memory() > 0);
+        }
+    }
+
+    // Install layouts from issue #731 (Windows, LM Studio + Docker Desktop
+    // installed but their servers not running) must be recognized. Expected
+    // paths are built with join() so separators stay portable across the
+    // 3-OS CI matrix.
+    #[test]
+    fn test_lmstudio_install_candidates_windows_layouts() {
+        let pf = Path::new(r"C:\Program Files");
+        let lad = Path::new(r"C:\Users\ben\AppData\Local");
+        let home = Path::new(r"C:\Users\ben");
+        let candidates = lmstudio_install_candidates(pf.to_str(), lad.to_str(), Some(home));
+        // Reporter's per-machine install.
+        assert!(candidates.contains(&pf.join("LM Studio").join("LM Studio.exe")));
+        // Installer's per-user default.
+        assert!(candidates.contains(&lad.join("Programs").join("LM Studio").join("LM Studio.exe")));
+        // First-run data dir (any OS).
+        assert!(candidates.contains(&home.join(".lmstudio")));
+    }
+
+    #[test]
+    fn test_lmstudio_install_candidates_unix_layouts() {
+        let home = Path::new("/home/ben");
+        let candidates = lmstudio_install_candidates(None, None, Some(home));
+        assert!(candidates.contains(&PathBuf::from("/Applications/LM Studio.app")));
+        assert!(candidates.contains(&home.join("Applications").join("LM Studio.app")));
+        assert!(candidates.contains(&home.join(".lmstudio")));
+    }
+
+    fn fake_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    // `hf download` writes wherever huggingface_hub resolves its cache:
+    // HF_HUB_CACHE, then the legacy HUGGINGFACE_HUB_CACHE, then $HF_HOME/hub,
+    // then $XDG_CACHE_HOME/huggingface/hub, then ~/.cache/huggingface/hub.
+    #[test]
+    fn test_hf_cache_dirs_prefer_hf_hub_cache() {
+        let home = PathBuf::from("/home/ben");
+        let dirs = hf_cache_dirs_for(
+            fake_env(&[
+                ("HF_HUB_CACHE", "/data/hub"),
+                ("HUGGINGFACE_HUB_CACHE", "/data/legacy-hub"),
+                ("HF_HOME", "/data/hf"),
+                ("XDG_CACHE_HOME", "/data/xdg"),
+            ]),
+            Some(home.join(".cache")),
+            Some(home),
+        );
+        assert_eq!(dirs, vec![PathBuf::from("/data/hub")]);
+    }
+
+    #[test]
+    fn test_hf_cache_dirs_accept_legacy_huggingface_hub_cache() {
+        let home = PathBuf::from("/home/ben");
+        let dirs = hf_cache_dirs_for(
+            fake_env(&[
+                ("HUGGINGFACE_HUB_CACHE", "/data/legacy-hub"),
+                ("HF_HOME", "/data/hf"),
+            ]),
+            Some(home.join(".cache")),
+            Some(home),
+        );
+        assert_eq!(dirs, vec![PathBuf::from("/data/legacy-hub")]);
+    }
+
+    #[test]
+    fn test_hf_cache_dirs_use_hf_home_before_xdg_cache_home() {
+        let dirs = hf_cache_dirs_for(
+            fake_env(&[("HF_HOME", "/data/hf"), ("XDG_CACHE_HOME", "/data/xdg")]),
+            None,
+            None,
+        );
+        assert_eq!(dirs, vec![PathBuf::from("/data/hf").join("hub")]);
+    }
+
+    #[test]
+    fn test_hf_cache_dirs_include_xdg_cache_home_on_macos() {
+        let home = PathBuf::from("/Users/ben");
+        let caches = home.join("Library").join("Caches");
+        let dirs = hf_cache_dirs_for(
+            fake_env(&[("XDG_CACHE_HOME", "/Users/ben/xdg")]),
+            Some(caches.clone()),
+            Some(home.clone()),
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/Users/ben/xdg")
+                    .join("huggingface")
+                    .join("hub"),
+                caches.join("huggingface").join("hub"),
+                home.join(".cache").join("huggingface").join("hub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hf_cache_dirs_list_xdg_cache_home_once_on_linux() {
+        // On Linux dirs::cache_dir() already is $XDG_CACHE_HOME.
+        let home = PathBuf::from("/home/ben");
+        let xdg = home.join("xdg");
+        let dirs = hf_cache_dirs_for(
+            fake_env(&[("XDG_CACHE_HOME", "/home/ben/xdg")]),
+            Some(xdg.clone()),
+            Some(home.clone()),
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                xdg.join("huggingface").join("hub"),
+                home.join(".cache").join("huggingface").join("hub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hf_cache_dirs_default_to_platform_and_home_cache() {
+        let home = PathBuf::from("/home/ben");
+        let dirs = hf_cache_dirs_for(fake_env(&[]), Some(home.join(".cache")), Some(home.clone()));
+        assert_eq!(
+            dirs,
+            vec![home.join(".cache").join("huggingface").join("hub")]
+        );
+    }
+
+    #[test]
+    fn test_docker_desktop_install_candidates_windows_layouts() {
+        let pf = Path::new(r"C:\Program Files");
+        let home = Path::new(r"C:\Users\ben");
+        let candidates = docker_desktop_install_candidates(pf.to_str(), Some(home));
+        let docker = pf.join("Docker").join("Docker");
+        // Classic exe location.
+        assert!(candidates.contains(&docker.join("Docker Desktop.exe")));
+        // Reporter's frontend\ layout from newer Docker Desktop releases.
+        assert!(candidates.contains(&docker.join("frontend").join("Docker Desktop.exe")));
+        assert!(
+            candidates.contains(
+                &home
+                    .join(".docker")
+                    .join("cli-plugins")
+                    .join("docker-model.exe")
+            )
+        );
+    }
+
+    #[test]
+    fn test_docker_desktop_install_candidates_unix_layouts() {
+        let home = Path::new("/home/ben");
+        let candidates = docker_desktop_install_candidates(None, Some(home));
+        assert!(candidates.contains(&PathBuf::from("/Applications/Docker.app")));
+        assert!(candidates.contains(&PathBuf::from("/opt/docker-desktop")));
+        assert!(candidates.contains(&home.join(".docker").join("desktop")));
+        assert!(
+            candidates.contains(
+                &home
+                    .join(".docker")
+                    .join("cli-plugins")
+                    .join("docker-model")
+            )
+        );
+    }
 
     #[test]
     fn test_hf_name_to_mlx_candidates() {
@@ -3315,6 +5424,19 @@ mod tests {
     }
 
     #[test]
+    fn test_hf_name_to_mlx_candidates_normalizes_dwq_repo() {
+        // #869: a DWQ repo id must generate candidates from its catalog
+        // base, not carry the unstripped quant tail into every variant.
+        let candidates = hf_name_to_mlx_candidates("mlx-community/Qwen3-8B-4bit-DWQ");
+
+        assert!(candidates.contains(&"qwen3-8b-4bit".to_string()));
+        assert!(candidates.contains(&"qwen3-8b".to_string()));
+        assert!(!candidates.iter().any(|c| c.contains("-dwq-4bit")));
+        assert!(!candidates.iter().any(|c| c.contains("-dwq-8bit")));
+        assert!(!candidates.iter().any(|c| c.contains("-dwq-mlx")));
+    }
+
+    #[test]
     fn test_mlx_pull_tag_prefers_explicit_repo_id() {
         let tag = mlx_pull_tag("lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-8bit");
         assert_eq!(
@@ -3356,18 +5478,114 @@ mod tests {
     }
 
     #[test]
+    fn test_mlx_installed_conversion_requires_exact_repo() {
+        let installed = HashSet::from([
+            "mlx-community/qwen3.8-27b-4bit".to_string(),
+            "qwen3.8-27b-4bit".to_string(),
+        ]);
+
+        assert!(is_model_installed_mlx(
+            "MLX-Community/Qwen3.8-27B-4bit",
+            &installed
+        ));
+        assert!(is_model_installed_mlx("Qwen/Qwen3.8-27B", &installed));
+        for absent in [
+            "mlx-community/Qwen3.8-27B-8bit",
+            "mlx-community/Qwen3.8-27B-4bit-DWQ",
+            "Chungulus/Qwen3.8-27B-4bit",
+            "Chungulus/Qwen3.8-27B-MLX-8bit-Group32",
+            "NexVeridian/Qwen3.8-27B-5bit",
+        ] {
+            assert!(!is_model_installed_mlx(absent, &installed), "{absent}");
+        }
+    }
+
+    // oMLX reports ownerless ids (see test_openai_model_list_detects_omlx_owner);
+    // an exact repo-name match must still mark the conversion installed.
+    #[test]
+    fn test_mlx_installed_conversion_accepts_ownerless_server_id() {
+        let installed = HashSet::from(["qwen2.5-0.5b-instruct-4bit".to_string()]);
+
+        assert!(is_model_installed_mlx(
+            "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+            &installed
+        ));
+        assert!(is_model_installed_mlx(
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            &installed
+        ));
+        assert!(!is_model_installed_mlx(
+            "mlx-community/Qwen2.5-0.5B-Instruct-8bit",
+            &installed
+        ));
+    }
+
+    // The cache scan inserts `owner/repo` and the bare repo name; the bare
+    // name must not let another owner's conversion of the same name match.
+    #[test]
+    fn test_mlx_installed_conversion_rejects_bare_name_from_other_owner() {
+        let installed = HashSet::from([
+            "mlx-community/qwen3.8-27b-4bit".to_string(),
+            "qwen3.8-27b-4bit".to_string(),
+        ]);
+
+        assert!(is_model_installed_mlx(
+            "mlx-community/Qwen3.8-27B-4bit",
+            &installed
+        ));
+        assert!(!is_model_installed_mlx(
+            "Chungulus/Qwen3.8-27B-4bit",
+            &installed
+        ));
+    }
+
+    #[test]
     fn test_lmstudio_pull_tag_resolves_gguf_url() {
-        // HF repo IDs should resolve to a direct GGUF file URL via known
-        // mappings or heuristic repo lookups. The exact URL depends on
-        // available files and system RAM, so we only assert the shape.
+        // HF repo IDs resolve through GGUF verification but must come back
+        // as the repo URL form: LM Studio 0.4.20 rejects direct .gguf links
+        // with HTTP 400 "Invalid HuggingFace model URL format".
         // Returns None when no GGUF file can be found (no fallback to bare repo URL).
         if let Some(tag) = lmstudio_pull_tag("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct") {
             assert!(
                 tag.starts_with("https://huggingface.co/")
-                    && tag.contains("/resolve/main/")
-                    && tag.ends_with(".gguf")
+                    && !tag.contains("/resolve/")
+                    && !tag.ends_with(".gguf")
             );
         }
+    }
+
+    #[test]
+    fn test_hf_gguf_search_url_sorts_on_a_valid_hub_field() {
+        let url = hf_gguf_search_url("qwen3");
+        // `sort=trending` is not a Hub field: it answers HTTP 400 and
+        // search_hf_gguf then reports "no GGUF models found" for every query.
+        assert!(
+            url.contains("sort=trendingScore"),
+            "unexpected sort parameter in {url}"
+        );
+        assert!(!url.contains("sort=trending&"));
+        assert!(url.contains("library=gguf"));
+        assert!(url.contains("search=qwen3"));
+    }
+
+    #[test]
+    fn test_hf_gguf_search_url_encodes_the_query() {
+        assert!(hf_gguf_search_url("qwen 3/coder").contains("search=qwen%203%2Fcoder"));
+    }
+
+    #[test]
+    fn test_lmstudio_repo_url_from_gguf_url() {
+        assert_eq!(
+            lmstudio_repo_url_from_gguf_url(
+                "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+            ),
+            "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF"
+        );
+        // URLs without a /resolve/ segment pass through unchanged.
+        assert_eq!(
+            lmstudio_repo_url_from_gguf_url("https://huggingface.co/org/repo"),
+            "https://huggingface.co/org/repo"
+        );
     }
 
     #[test]
@@ -3473,6 +5691,80 @@ mod tests {
     }
 
     #[test]
+    fn test_lmstudio_download_status_url_formats_base_urls() {
+        assert_eq!(
+            lmstudio_download_status_url("http://127.0.0.1:1234", "abc123"),
+            "http://127.0.0.1:1234/api/v1/models/download/status/abc123"
+        );
+
+        assert_eq!(
+            lmstudio_download_status_url("http://lmstudio.example.test:4321/", "job-42"),
+            "http://lmstudio.example.test:4321/api/v1/models/download/status/job-42"
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_download_response_parses_optional_job_id() {
+        let with_job: LmStudioDownloadResponse =
+            serde_json::from_str(r#"{"job_id":"abc123","status":"download_started"}"#).unwrap();
+        assert_eq!(lmstudio_response_job_id(&with_job), Some("abc123"));
+
+        let without_job: LmStudioDownloadResponse =
+            serde_json::from_str(r#"{"status":"download_started"}"#).unwrap();
+        assert_eq!(lmstudio_response_job_id(&without_job), None);
+    }
+
+    #[test]
+    fn test_lmstudio_download_status_percent_and_terminal_mapping() {
+        let progress: LmStudioDownloadStatus =
+            serde_json::from_str(r#"{"status":"downloading","progress":0.42}"#).unwrap();
+        assert_eq!(lmstudio_download_status_percent(&progress), Some(42.0));
+        assert_eq!(lmstudio_download_terminal_status(&progress.status), None);
+
+        assert_eq!(
+            lmstudio_download_terminal_status("completed"),
+            Some(LmStudioDownloadTerminalStatus::Done)
+        );
+        assert_eq!(
+            lmstudio_download_terminal_status("already_downloaded"),
+            Some(LmStudioDownloadTerminalStatus::Done)
+        );
+        assert_eq!(
+            lmstudio_download_terminal_status("failed"),
+            Some(LmStudioDownloadTerminalStatus::Failed)
+        );
+
+        let mut empty_statuses = 0;
+        for expected in [false, false, true] {
+            assert_eq!(
+                lmstudio_empty_status_limit_reached("", &mut empty_statuses),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_lmstudio_status_poll_error_falls_back_without_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut poll_budget = 1;
+        let result = poll_lmstudio_download_status(
+            "http://127.0.0.1:1/api/v1/models/download/status/abc123",
+            None,
+            &tx,
+            std::time::Duration::from_millis(0),
+            &mut poll_budget,
+        );
+
+        assert_eq!(result, LmStudioStatusPollResult::Fallback);
+        assert_eq!(poll_budget, 0);
+        assert!(
+            !rx.try_iter()
+                .any(|event| matches!(event, PullEvent::Error(_))),
+            "status polling errors must fall back instead of emitting an error"
+        );
+    }
+
+    #[test]
     fn test_is_model_installed_mlx_with_owner_prefixed_repo_id() {
         let mut installed = HashSet::new();
         installed.insert("lmstudio-community/qwen3-coder-30b-a3b-instruct-mlx-8bit".to_string());
@@ -3541,6 +5833,39 @@ mod tests {
     }
 
     #[test]
+    fn test_qwen3_8_resolves_to_its_ollama_tag() {
+        assert_eq!(
+            hf_name_to_ollama_candidates("Qwen/Qwen3.8-27B"),
+            vec!["qwen3.8:27b".to_string()]
+        );
+    }
+
+    // Regression for #866: every gemma3 size Ollama ships must resolve
+    // through the explicit mapping, so an `ollama pull gemma3:4b` install
+    // is detected and the model stays pullable. Only the 12B was mapped.
+    #[test]
+    fn test_gemma3_family_resolves_to_its_ollama_tags() {
+        for (hf_name, tag) in [
+            ("google/gemma-3-1b-it", "gemma3:1b"),
+            ("google/gemma-3-4b-it", "gemma3:4b"),
+            ("google/gemma-3-12b-it", "gemma3:12b"),
+            ("google/gemma-3-27b-it", "gemma3:27b"),
+        ] {
+            assert_eq!(
+                hf_name_to_ollama_candidates(hf_name),
+                vec![tag.to_string()],
+                "candidates for {hf_name}"
+            );
+            assert!(has_ollama_mapping(hf_name), "mapping for {hf_name}");
+            let installed = HashSet::from([tag.to_string()]);
+            assert!(
+                is_model_installed(hf_name, &installed),
+                "install of {tag} must mark {hf_name} installed"
+            );
+        }
+    }
+
+    #[test]
     fn test_llama_mapping() {
         let candidates = hf_name_to_ollama_candidates("meta-llama/Llama-3.1-8B-Instruct");
         assert!(candidates.contains(&"llama3.1:8b".to_string()));
@@ -3566,6 +5891,44 @@ mod tests {
         assert_eq!(
             normalize_ollama_host("ollama.example.com:11434"),
             Some("http://ollama.example.com:11434".to_string())
+        );
+    }
+
+    #[test]
+    fn ollama_url_without_ollama_host_is_localhost() {
+        assert_eq!(ollama_url_from(None), "http://localhost:11434");
+    }
+
+    #[test]
+    fn ollama_url_adds_the_scheme_ollama_host_omits() {
+        // `127.0.0.1:11434` is the form Ollama itself documents.
+        assert_eq!(
+            ollama_url_from(Some("127.0.0.1:11434")),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_url_keeps_an_explicit_scheme() {
+        assert_eq!(
+            ollama_url_from(Some("https://ollama.example.com:11434")),
+            "https://ollama.example.com:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_url_replaces_a_wildcard_bind_address_with_localhost() {
+        assert_eq!(
+            ollama_url_from(Some("0.0.0.0:11434")),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_url_falls_back_to_localhost_for_an_unsupported_scheme() {
+        assert_eq!(
+            ollama_url_from(Some("ftp://ollama.example.com:11434")),
+            "http://localhost:11434"
         );
     }
 
@@ -3764,6 +6127,32 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_gguf_repo_gemma4_bartowski_mappings() {
+        // The four Gemma 4 instruct models resolve to the Bartowski GGUF
+        // repos (issue #332). Bartowski publishes these under owner-prefixed
+        // names ("google_..."), which the heuristic candidates never produce,
+        // so the explicit mappings are load-bearing. The scraper-provided
+        // gguf_sources in the model database are untouched and remain
+        // available as fallbacks.
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-E2B-it"),
+            Some("bartowski/google_gemma-4-E2B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-E4B-it"),
+            Some("bartowski/google_gemma-4-E4B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-26B-A4B-it"),
+            Some("bartowski/google_gemma-4-26B-A4B-it-GGUF")
+        );
+        assert_eq!(
+            lookup_gguf_repo("google/gemma-4-31B-it"),
+            Some("bartowski/google_gemma-4-31B-it-GGUF")
+        );
+    }
+
+    #[test]
     fn test_lookup_gguf_repo_unknown_returns_none() {
         assert!(lookup_gguf_repo("totally-unknown/model-xyz").is_none());
     }
@@ -3809,6 +6198,41 @@ mod tests {
     }
 
     #[test]
+    fn test_select_best_ternary_gguf_prefers_i2s_and_rejects_kquant() {
+        // A repo shipping both an ordinary k-quant and a ternary artifact must
+        // resolve to the ternary file for the bitnet.cpp runtime.
+        let mixed = vec![
+            ("model-Q4_K_M.gguf".to_string(), 4_000_000_000u64),
+            ("model-i2_s.gguf".to_string(), 1_200_000_000u64),
+        ];
+        let picked = LlamaCppProvider::select_best_ternary_gguf(&mixed);
+        assert_eq!(picked.map(|(f, _)| f), Some("model-i2_s.gguf".to_string()));
+
+        // A k-quant-only repo has no ternary artifact — return None so the
+        // caller errors instead of pulling an incompatible file.
+        let kquant_only = vec![("model-Q4_K_M.gguf".to_string(), 4_000_000_000u64)];
+        assert!(LlamaCppProvider::select_best_ternary_gguf(&kquant_only).is_none());
+    }
+
+    #[test]
+    fn test_is_ternary_gguf_filename_accepts_only_ternary() {
+        assert!(LlamaCppProvider::is_ternary_gguf_filename(
+            "model-i2_s.gguf"
+        ));
+        assert!(LlamaCppProvider::is_ternary_gguf_filename(
+            "BitNet-b1.58-TQ1_0.gguf"
+        ));
+        assert!(LlamaCppProvider::is_ternary_gguf_filename("m-tq2_0.gguf"));
+        // An explicit k-quant must be rejected so bitnet.cpp never receives it.
+        assert!(!LlamaCppProvider::is_ternary_gguf_filename(
+            "model-Q4_K_M.gguf"
+        ));
+        assert!(!LlamaCppProvider::is_ternary_gguf_filename(
+            "model-Q8_0.gguf"
+        ));
+    }
+
+    #[test]
     fn test_select_best_gguf_respects_budget() {
         let files = vec![
             ("model-Q2_K.gguf".to_string(), 2_000_000_000u64),
@@ -3824,6 +6248,34 @@ mod tests {
             "should select Q2_K for 3.7GB budget, got: {}",
             name
         );
+    }
+
+    #[test]
+    fn test_select_best_gguf_prefers_iq4_xs_over_3bit_and_2bit() {
+        // File sizes from unsloth/Qwen3-14B-GGUF. At a 7.7 GiB budget Q4_K_S
+        // (7.98 GiB) does not fit, IQ4_XS (7.58 GiB) does: the 4-bit i-quant
+        // should win over the 3- and 2-bit k-quants that also fit.
+        let gib = |g: f64| (g * 1024.0 * 1024.0 * 1024.0) as u64;
+        let files = vec![
+            ("Qwen3-14B-Q2_K.gguf".to_string(), gib(5.36)),
+            ("Qwen3-14B-Q3_K_S.gguf".to_string(), gib(6.20)),
+            ("Qwen3-14B-Q3_K_M.gguf".to_string(), gib(6.82)),
+            ("Qwen3-14B-IQ4_XS.gguf".to_string(), gib(7.58)),
+            ("Qwen3-14B-Q4_K_S.gguf".to_string(), gib(7.98)),
+            ("Qwen3-14B-Q4_K_M.gguf".to_string(), gib(8.38)),
+        ];
+        let (name, _) = LlamaCppProvider::select_best_gguf(&files, 7.7).unwrap();
+        assert_eq!(name, "Qwen3-14B-IQ4_XS.gguf");
+
+        // IQ3_M (~3.7 bpw) sits between Q3_K_M and Q3_K_S.
+        let files = vec![
+            ("model-Q2_K.gguf".to_string(), gib(5.0)),
+            ("model-Q3_K_S.gguf".to_string(), gib(6.0)),
+            ("model-IQ3_M.gguf".to_string(), gib(6.4)),
+            ("model-Q3_K_M.gguf".to_string(), gib(6.8)),
+        ];
+        let (name, _) = LlamaCppProvider::select_best_gguf(&files, 6.5).unwrap();
+        assert_eq!(name, "model-IQ3_M.gguf");
     }
 
     #[test]
@@ -4045,10 +6497,230 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_gguf_quant_suffix_unsloth_ud_marker() {
+        // Unsloth "Dynamic" GGUFs carry a `-ud` marker before the quant; it
+        // must be stripped alongside the quant so the stem reduces to the
+        // canonical model name.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen3.6-35b-a3b-ud-q4_k_m").as_deref(),
+            Some("qwen3.6-35b-a3b")
+        );
+        // Non-Unsloth files are unaffected.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen2.5-7b-instruct-q4_k_m").as_deref(),
+            Some("qwen2.5-7b-instruct")
+        );
+    }
+
+    #[test]
+    fn test_strip_gguf_quant_suffix_covers_every_k_and_i_variant() {
+        // Publishers ship far more variants than Q4_K_M: bartowski `_L`,
+        // Unsloth Dynamic `_XL`, and the IQ family's `_NL`/`_XS`/`_XXS`.
+        // Every one must reduce to the same base name.
+        for stem in [
+            "mymodel-q3_k_l",
+            "mymodel-q4_k_l",
+            "mymodel-q4_k_xl",
+            "mymodel-q5_k_xl",
+            "mymodel-q6_k_l",
+            "mymodel-q8_k_xl",
+            "mymodel-iq4_nl",
+            "mymodel-iq4_xs",
+            "mymodel-iq3_xxs",
+            "mymodel-iq2_m",
+            // Same set behind the Unsloth `-ud` marker.
+            "mymodel-ud-q4_k_xl",
+            "mymodel-ud-iq4_nl",
+        ] {
+            assert_eq!(
+                strip_gguf_quant_suffix(stem).as_deref(),
+                Some("mymodel"),
+                "failed to strip quant from {stem}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tag_matches_model_unsloth_dynamic_quants() {
+        // Community submissions record the on-disk file name verbatim. These
+        // three tags from the NVIDIA GB10 set (#872) were silently dropped
+        // during lookup because their quants had no matching pattern.
+        assert!(tag_matches_model(
+            "Step-3.7-Flash-UD-IQ4_NL.gguf",
+            "stepfun-ai/Step-3.7-Flash"
+        ));
+        assert!(tag_matches_model(
+            "Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf",
+            "Qwen/Qwen-AgentWorld-35B-A3B"
+        ));
+        assert!(tag_matches_model(
+            "LFM2.5-8B-A1B-UD-Q4_K_XL.gguf",
+            "LiquidAI/LFM2.5-8B-A1B"
+        ));
+    }
+
+    #[test]
+    fn test_is_model_installed_llamacpp_unsloth_ud() {
+        // `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` on disk yields these set entries
+        // (see `installed_models_counted`) and must mark the catalog model as
+        // installed despite the embedded `-ud` marker.
+        let installed: HashSet<String> = ["qwen3.6-35b-a3b-ud-q4_k_m", "qwen3.6-35b-a3b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_model_installed_llamacpp(
+            "Qwen/Qwen3.6-35B-A3B",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_tag_matches_model_unsloth_ud_gguf() {
+        // End-to-end: a llama-server serving an Unsloth UD GGUF reports the
+        // file name as the model id; it must match the catalog HF name so the
+        // model is benchmarkable (regression: `-ud` broke the exact stem match).
+        assert!(tag_matches_model(
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "Qwen/Qwen3.6-35B-A3B"
+        ));
+    }
+
+    #[test]
+    fn test_strip_mlx_quant_suffix_patterns() {
+        // Plain bit-widths.
+        assert_eq!(
+            strip_mlx_quant_suffix("llama-3.2-1b-instruct-4bit").as_deref(),
+            Some("llama-3.2-1b-instruct")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("internlm2_5-20b-chat-8bit").as_deref(),
+            Some("internlm2_5-20b-chat")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("phi-4-2bit").as_deref(),
+            Some("phi-4")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("gemma-2-2b-it-6bit").as_deref(),
+            Some("gemma-2-2b-it")
+        );
+        // Variant markers after the bit-width, including date-stamped DWQ.
+        assert_eq!(
+            strip_mlx_quant_suffix("meta-llama-3.1-8b-instruct-4bit-dwq").as_deref(),
+            Some("meta-llama-3.1-8b-instruct")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("qwen3-8b-4bit-dwq-05082025").as_deref(),
+            Some("qwen3-8b")
+        );
+        // Compound schemes stripped as whole units.
+        assert_eq!(
+            strip_mlx_quant_suffix("gpt-oss-20b-mxfp4-q4").as_deref(),
+            Some("gpt-oss-20b")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("mistral-7b-v0.1-fp16").as_deref(),
+            Some("mistral-7b-v0.1")
+        );
+        // #869: odd bit-widths and mxfp4 variant markers.
+        assert_eq!(
+            strip_mlx_quant_suffix("minimax-m2.1-3bit").as_deref(),
+            Some("minimax-m2.1")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("glm-5.2-mxfp4").as_deref(),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("gpt-oss-20b-mxfp4-q8").as_deref(),
+            Some("gpt-oss-20b")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("gpt-oss-120b-mxfp4-bf16").as_deref(),
+            Some("gpt-oss-120b")
+        );
+        // #869: trailing -mlx marker stripped once the quant is gone.
+        assert_eq!(
+            strip_mlx_quant_suffix("qwen3-coder-30b-a3b-instruct-mlx-8bit").as_deref(),
+            Some("qwen3-coder-30b-a3b-instruct")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("bge-m3-mlx-fp16").as_deref(),
+            Some("bge-m3")
+        );
+        assert_eq!(
+            strip_mlx_quant_suffix("bge-m3-mlx").as_deref(),
+            Some("bge-m3")
+        );
+        // Mid-name fragments and bare widths are not suffixes.
+        assert_eq!(strip_mlx_quant_suffix("some-4bitish-model"), None);
+        assert_eq!(strip_mlx_quant_suffix("4bit"), None);
+        assert_eq!(strip_mlx_quant_suffix("-4bit"), None);
+    }
+
+    #[test]
+    fn test_tag_matches_model_mlx_community_tags() {
+        // End-to-end: verbatim `model` tags from the apple-m4-pro MLX
+        // community submissions (#853) must resolve to their catalog HF
+        // names, exactly like GGUF stems do (#854).
+        assert!(tag_matches_model(
+            "Llama-3.2-1B-Instruct-4bit",
+            "meta-llama/Llama-3.2-1B-Instruct"
+        ));
+        assert!(tag_matches_model("Qwen3-14B-4bit", "Qwen/Qwen3-14B"));
+        assert!(tag_matches_model(
+            "gpt-oss-20b-MXFP4-Q4",
+            "openai/gpt-oss-20b"
+        ));
+        // #869: compound mxfp4 markers and the -mlx infix now resolve too.
+        assert!(tag_matches_model(
+            "gpt-oss-20b-MXFP4-Q8",
+            "openai/gpt-oss-20b"
+        ));
+        assert!(tag_matches_model(
+            "Qwen3-Coder-30B-A3B-Instruct-MLX-8bit",
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+        ));
+        // One model's basename must not match another model.
+        assert!(!tag_matches_model(
+            "Qwen3-8B-4bit",
+            "meta-llama/Llama-3.2-1B-Instruct"
+        ));
+    }
+
+    #[test]
     fn test_is_model_installed_llamacpp_not_installed() {
         let installed = HashSet::new();
         assert!(!is_model_installed_llamacpp(
             "meta-llama/Llama-3.1-8B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_is_model_installed_llamacpp_no_family_false_positives() {
+        // A single "gemma-3.Q8_0.gguf" on disk yields these stems — it must
+        // mark ONLY repos actually named "gemma-3" as installed, not the
+        // whole gemma-3 family (regression: substring matching ticked every
+        // gemma-3-* model in the table).
+        let installed: HashSet<String> = ["gemma-3.q8_0", "gemma-3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_model_installed_llamacpp(
+            "tiny-random/gemma-3",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "google/gemma-3-27b-it",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "google/gemma-3-4b-it",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "unsloth/gemma-3-270m-it",
             &installed
         ));
     }
@@ -4073,6 +6745,55 @@ mod tests {
     fn test_has_ollama_mapping_known() {
         assert!(has_ollama_mapping("meta-llama/Llama-3.1-8B-Instruct"));
         assert!(has_ollama_mapping("Qwen/Qwen2.5-7B-Instruct"));
+    }
+
+    #[test]
+    fn test_ollama_mappings_gemma4() {
+        for (hf_name, tag) in [
+            ("google/gemma-4-31B-it", "gemma4:31b"),
+            ("google/gemma-4-26B-A4B-it", "gemma4:26b"),
+            ("google/gemma-4-12B-it", "gemma4:12b"),
+            ("google/gemma-4-E4B-it", "gemma4:e4b"),
+            ("google/gemma-4-E2B-it", "gemma4:e2b"),
+        ] {
+            assert_eq!(hf_name_to_ollama_candidates(hf_name), vec![tag.to_string()]);
+        }
+        // Base (non-instruct) checkpoints are not what the Ollama tags ship.
+        assert!(!has_ollama_mapping("google/gemma-4-31B"));
+
+        // `ollama pull gemma4:31b` (#1024).
+        let installed: HashSet<String> = ["gemma4:31b".to_string(), "gemma4".to_string()].into();
+        assert!(is_model_installed("google/gemma-4-31B-it", &installed));
+        assert!(!is_model_installed("google/gemma-4-26B-A4B-it", &installed));
+    }
+
+    #[test]
+    fn test_ollama_mappings_sept_2026_catalog_additions() {
+        for (hf_name, tag) in [
+            ("ibm-granite/granite-4.2-3b", "granite4.2:3b"),
+            ("ibm-granite/granite-4.2-8b", "granite4.2:8b"),
+            ("ibm-granite/granite-4.2-30b", "granite4.2:30b"),
+            (
+                "mistralai/Mistral-Medium-3.5-128B",
+                "mistral-medium-3.5:128b",
+            ),
+            (
+                "mistralai/Devstral-Small-2-24B-Instruct-2512",
+                "devstral-small-2:24b",
+            ),
+        ] {
+            assert_eq!(hf_name_to_ollama_candidates(hf_name), vec![tag.to_string()]);
+        }
+        // The 2505 Devstral keeps its own tag.
+        assert_eq!(
+            hf_name_to_ollama_candidates("mistralai/Devstral-Small-2505"),
+            vec!["devstral".to_string()]
+        );
+
+        // `ollama pull gemma4:12b` (#1024).
+        let installed: HashSet<String> = ["gemma4:12b".to_string(), "gemma4".to_string()].into();
+        assert!(is_model_installed("google/gemma-4-12B-it", &installed));
+        assert!(!is_model_installed("google/gemma-4-31B-it", &installed));
     }
 
     #[test]
@@ -4107,13 +6828,73 @@ mod tests {
         assert!(!tag.is_empty());
     }
 
+    // ── resolve_mlx_fallback_repo (issue #294) ───────────────────────
+
+    #[test]
+    fn test_resolve_mlx_explicit_repo_passes_through_unverified() {
+        // An explicit owner/name is trusted as typed — no existence probe.
+        let repo = resolve_mlx_fallback_repo("mlx-community/Qwen3-8B-4bit", &|_: &str| {
+            panic!("explicit repo ids must not be probed")
+        });
+        assert_eq!(repo.unwrap(), "mlx-community/Qwen3-8B-4bit");
+    }
+
+    #[test]
+    fn test_resolve_mlx_fallback_verified_when_repo_exists() {
+        let repo = resolve_mlx_fallback_repo("qwen3-8b-4bit", &|r: &str| {
+            r == "mlx-community/qwen3-8b-4bit"
+        });
+        assert_eq!(repo.unwrap(), "mlx-community/qwen3-8b-4bit");
+    }
+
+    #[test]
+    fn test_resolve_mlx_fallback_errors_when_repo_missing() {
+        let err = resolve_mlx_fallback_repo("qwen3-30b-a3b-instruct-2507-4bit", &|_: &str| false)
+            .unwrap_err();
+        assert!(
+            err.contains("mlx-community/qwen3-30b-a3b-instruct-2507-4bit"),
+            "error should name the guessed repo, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mlx_fallback_refuses_awq_tag() {
+        // The #294 shape: an AWQ repo name with no MLX marker must be
+        // refused before any network probe or download starts.
+        let err = resolve_mlx_fallback_repo("qwen3-30b-a3b-instruct-2507-awq-4bit", &|_: &str| {
+            panic!("prequantized tags must be refused before probing")
+        })
+        .unwrap_err();
+        assert!(err.contains("AWQ/GPTQ"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_mlx_fallback_allows_awq_named_mlx_conversion() {
+        // mlx-community conversions sometimes keep "AWQ" in the name; an MLX
+        // marker wins over the prequantized marker (existence still checked).
+        let repo = resolve_mlx_fallback_repo("qwen3-8b-awq-mlx-4bit", &|_: &str| true);
+        assert_eq!(repo.unwrap(), "mlx-community/qwen3-8b-awq-mlx-4bit");
+    }
+
+    #[test]
+    fn test_is_likely_prequantized_repo() {
+        assert!(is_likely_prequantized_repo(
+            "qwen3-30b-a3b-instruct-2507-awq-4bit"
+        ));
+        assert!(is_likely_prequantized_repo("model-gptq-int4"));
+        assert!(is_likely_prequantized_repo("model-autoround-4bit"));
+        assert!(!is_likely_prequantized_repo("qwen3-8b-4bit"));
+        assert!(!is_likely_prequantized_repo("llama-3.1-8b-instruct"));
+    }
+
     // ── ollama_installed_matches_candidate ────────────────────────────
 
     #[test]
     fn test_ollama_installed_matches_exact() {
         assert!(ollama_installed_matches_candidate(
             "llama3.1:8b",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
     }
 
@@ -4121,7 +6902,8 @@ mod tests {
     fn test_ollama_installed_matches_variant_suffix() {
         assert!(ollama_installed_matches_candidate(
             "llama3.1:8b-instruct-q4_K_M",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
     }
 
@@ -4129,8 +6911,470 @@ mod tests {
     fn test_ollama_installed_no_match() {
         assert!(!ollama_installed_matches_candidate(
             "qwen2.5:7b",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
+    }
+
+    // ── size-aware family matching ───────────────────────────────────
+
+    fn deepseek_14b_installed() -> HashSet<String> {
+        let mut installed = HashSet::new();
+        installed.insert("deepseek-r1:14b".to_string());
+        installed
+    }
+
+    #[test]
+    fn test_ollama_tag_size_parsing() {
+        assert_eq!(ollama_tag_size_b("deepseek-r1:14b"), Some(14.0));
+        assert_eq!(ollama_tag_size_b("deepseek-r1:1.5b"), Some(1.5));
+        assert_eq!(
+            ollama_tag_size_b("qwen2.5-coder:7b-instruct-q4_K_M"),
+            Some(7.0)
+        );
+        // No size to read: bare family stem, MoE-style tag, or a plain name.
+        assert_eq!(ollama_tag_size_b("glm-4.7-flash"), None);
+        assert_eq!(ollama_tag_size_b("mixtral:8x7b"), None);
+        assert_eq!(ollama_tag_size_b("deepseek-r1:latest"), None);
+    }
+
+    #[test]
+    fn test_sized_family_tag_does_not_mark_much_larger_model_installed() {
+        // `deepseek-r1` is the mapped tag for the 684B original *and* the
+        // family prefix of the 14B distill. Having the distill must not claim
+        // the 397 GB model is on disk.
+        let installed = deepseek_14b_installed();
+        assert!(!is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            Some(684.5),
+            &installed
+        ));
+        assert!(!is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1-0528",
+            Some(684.5),
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_sized_family_tag_still_matches_the_model_it_belongs_to() {
+        let installed = deepseek_14b_installed();
+        // The distill maps to `deepseek-r1:14b` outright.
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            Some(14.8),
+            &installed
+        ));
+        // And the real 684B model is matched by a tag of its own size.
+        let mut big = HashSet::new();
+        big.insert("deepseek-r1:671b".to_string());
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            Some(684.5),
+            &big
+        ));
+    }
+
+    #[test]
+    fn test_size_rounding_in_tags_still_matches() {
+        // Ollama tags round: phi4:14b is a 14.7B model, qwq:32b is 32.8B.
+        let mut installed = HashSet::new();
+        installed.insert("phi4:14b".to_string());
+        installed.insert("qwq:32b".to_string());
+        assert!(is_model_installed_sized(
+            "microsoft/phi-4",
+            Some(14.7),
+            &installed
+        ));
+        assert!(is_model_installed_sized(
+            "Qwen/QwQ-32B",
+            Some(32.8),
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_unknown_catalog_size_stays_permissive() {
+        // With no parameter count recorded there is nothing to compare, so
+        // behaviour must be exactly what it was before the size check.
+        let installed = deepseek_14b_installed();
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            None,
+            &installed
+        ));
+        assert!(is_model_installed("deepseek-ai/DeepSeek-R1", &installed));
+    }
+
+    // ── recursive gguf scan / LM Studio models directory ─────────────
+
+    /// Minimal scratch directory that removes itself. Avoids a `tempfile`
+    /// dev-dependency for the handful of tests that need a real tree.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "llmfit-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp tree");
+            Self(dir)
+        }
+
+        fn touch(&self, rel: &str) {
+            let path = self.0.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parents");
+            }
+            std::fs::write(&path, b"").expect("write file");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn names_of(paths: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_mlx_cache_scan_requires_snapshot_weights() {
+        let tree = TempTree::new("mlx-cache");
+        for relative in [
+            "models--mlx-community--RefsOnly-4bit/refs/main",
+            "models--mlx-community--ReadmeOnly-4bit/snapshots/revision/README.md",
+            "models--mlx-community--ConfigOnly-4bit/snapshots/revision/config.json",
+            "models--mlx-community--EmptyWeights-4bit/snapshots/revision/model.safetensors",
+            "models--mlx-community--Incomplete-4bit/snapshots/revision/model.safetensors.incomplete",
+            "models--mlx-community--BlobsOnly-4bit/blobs/model.safetensors",
+        ] {
+            tree.touch(relative);
+        }
+        for relative in [
+            "models--mlx-community--Qwen3.8-27B-4bit/snapshots/revision/model-00001-of-00002.safetensors",
+            "models--other--Legacy-MLX/snapshots/revision/weights.npz",
+            "models--other--Standard-7B/snapshots/revision/model.safetensors",
+            "models--mlx-community--Model-GGUF/snapshots/revision/model.safetensors",
+            "models--mlx-community--BlobsOnly-4bit/blobs/model.safetensors",
+        ] {
+            tree.touch(relative);
+            std::fs::write(tree.path().join(relative), b"weights").expect("write weights");
+        }
+
+        let installed = scan_hf_cache_for_mlx_in(&[tree.path().to_path_buf()]);
+        assert_eq!(
+            installed,
+            HashSet::from([
+                "mlx-community/qwen3.8-27b-4bit".to_string(),
+                "qwen3.8-27b-4bit".to_string(),
+                "other/legacy-mlx".to_string(),
+                "legacy-mlx".to_string(),
+            ])
+        );
+        assert!(is_model_installed_mlx("Qwen/Qwen3.8-27B", &installed));
+        assert!(!is_model_installed_mlx(
+            "Chungulus/Qwen3.8-27B-MLX-8bit-Group32",
+            &installed
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mlx_cache_scan_resolves_weight_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new("mlx-cache-symlinks");
+        for model in ["Present", "Missing"] {
+            let repo = tree
+                .path()
+                .join(format!("models--mlx-community--{model}-4bit"));
+            std::fs::create_dir_all(repo.join("snapshots/revision")).expect("create snapshot");
+            std::fs::create_dir_all(repo.join("blobs")).expect("create blobs");
+            if model == "Present" {
+                std::fs::write(repo.join("blobs/hash"), b"weights").expect("write blob");
+            }
+            symlink(
+                "../../blobs/hash",
+                repo.join("snapshots/revision/model.safetensors"),
+            )
+            .expect("link weights");
+        }
+
+        let installed = scan_hf_cache_for_mlx_in(&[tree.path().to_path_buf()]);
+        assert!(installed.contains("mlx-community/present-4bit"));
+        assert!(!installed.contains("mlx-community/missing-4bit"));
+    }
+
+    #[test]
+    fn test_collect_gguf_files_descends_and_caps_depth() {
+        let tree = TempTree::new("scan");
+        tree.touch("root.gguf");
+        tree.touch("publisher/mid.gguf");
+        tree.touch("publisher/repo/leaf.gguf");
+        tree.touch("publisher/repo/notes.txt");
+        // One level past the cap.
+        tree.touch("publisher/repo/nested/toodeep.gguf");
+
+        let found = names_of(&collect_gguf_files(tree.path(), GGUF_SCAN_MAX_DEPTH));
+        assert_eq!(found, vec!["leaf.gguf", "mid.gguf", "root.gguf"]);
+    }
+
+    #[test]
+    fn test_collect_gguf_files_flat_when_depth_is_one() {
+        let tree = TempTree::new("flat");
+        tree.touch("root.gguf");
+        tree.touch("publisher/mid.gguf");
+
+        assert_eq!(
+            names_of(&collect_gguf_files(tree.path(), 1)),
+            vec!["root.gguf"]
+        );
+        assert!(collect_gguf_files(tree.path(), 0).is_empty());
+    }
+
+    #[test]
+    fn test_collect_gguf_files_missing_root_is_empty() {
+        let missing = std::env::temp_dir().join("llmfit-does-not-exist-9f3c1a");
+        assert!(collect_gguf_files(&missing, GGUF_SCAN_MAX_DEPTH).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[test]
+    fn test_collect_gguf_files_follows_symlinked_models() {
+        // `DirEntry::file_type` describes the link rather than its target, so
+        // a type check that does not resolve silently drops symlinked models.
+        // Creating a symlink needs elevation on Windows, so skip there when
+        // it is not permitted rather than failing the run.
+        // The target sits outside the scanned tree, so the link is the only
+        // way in and there is no alias for the dedupe pass to collapse.
+        let store = TempTree::new("symlink-store");
+        store.touch("real-model.gguf");
+
+        let tree = TempTree::new("symlink");
+        tree.touch("plain-model.gguf");
+        let link = tree.path().join("linked-model.gguf");
+        if symlink_file(&store.path().join("real-model.gguf"), &link).is_err() {
+            return;
+        }
+
+        let found = names_of(&collect_gguf_files(tree.path(), GGUF_SCAN_MAX_DEPTH));
+        assert_eq!(found, vec!["linked-model.gguf", "plain-model.gguf"]);
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[test]
+    fn test_collect_gguf_files_does_not_follow_directory_symlinks() {
+        // A directory symlink can point anywhere, including outside the tree
+        // being scanned. Following one would pull unrelated files into
+        // installed detection and put them in front of callers that act on
+        // the returned paths.
+        let outside = TempTree::new("outside");
+        outside.touch("secret-model.gguf");
+
+        let tree = TempTree::new("escape");
+        tree.touch("inside.gguf");
+        if symlink_dir(outside.path(), &tree.path().join("escape-hatch")).is_err() {
+            return;
+        }
+
+        let found = names_of(&collect_gguf_files(tree.path(), GGUF_SCAN_MAX_DEPTH));
+        assert_eq!(found, vec!["inside.gguf"]);
+    }
+
+    #[test]
+    fn test_collect_gguf_files_collapses_symlink_aliases() {
+        // A symlink beside the file it points at is one model, not two.
+        let tree = TempTree::new("alias");
+        tree.touch("real-model.gguf");
+        if symlink_file(
+            &tree.path().join("real-model.gguf"),
+            &tree.path().join("alias-model.gguf"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let found = collect_gguf_files(tree.path(), GGUF_SCAN_MAX_DEPTH);
+        assert_eq!(found.len(), 1, "expected one model, got {found:?}");
+        assert_eq!(names_of(&found), vec!["real-model.gguf"]);
+    }
+
+    #[test]
+    fn test_dedupe_prefers_target_even_when_alias_is_seen_first() {
+        // Under a symlinked root neither path equals its canonical form, so a
+        // tie-break based on path equality silently never fires and the
+        // survivor comes down to directory order. `dedupe_by_target` is called
+        // directly with the alias first so the ordering is not left to the
+        // filesystem: whichever order they arrive in, the real file must win,
+        // because callers look models up by stem.
+        let store = TempTree::new("realroot");
+        store.touch("model.gguf");
+        if symlink_file(
+            &store.path().join("model.gguf"),
+            &store.path().join("alias.gguf"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let links = TempTree::new("linkroot");
+        let root_link = links.path().join("root");
+        if symlink_dir(store.path(), &root_link).is_err() {
+            return;
+        }
+
+        let alias_first = vec![root_link.join("alias.gguf"), root_link.join("model.gguf")];
+        let kept = dedupe_by_target(alias_first);
+        assert_eq!(kept.len(), 1, "expected one model, got {kept:?}");
+        assert_eq!(names_of(&kept), vec!["model.gguf"]);
+
+        let target_first = vec![root_link.join("model.gguf"), root_link.join("alias.gguf")];
+        assert_eq!(
+            names_of(&dedupe_by_target(target_first)),
+            vec!["model.gguf"]
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_models_dir_layout() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(
+            lmstudio_models_dir_for(Some(&home)),
+            Some(home.join(".lmstudio").join("models"))
+        );
+        assert_eq!(lmstudio_models_dir_for(None), None);
+    }
+
+    fn lmstudio_tree() -> TempTree {
+        let tree = TempTree::new("lms");
+        tree.touch(
+            "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        );
+        tree.touch("lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q8_0.gguf");
+        tree.touch("lmstudio-community/gemma-4-12B-it-GGUF/mmproj-gemma-4-12B-it-BF16.gguf");
+        tree
+    }
+
+    #[test]
+    fn test_scan_lmstudio_models_dir_names_and_projector_handling() {
+        let tree = lmstudio_tree();
+        let (set, count) = scan_lmstudio_models_dir_at(Some(tree.path()));
+
+        // Two models, not three: the mmproj file is a projector, not a model.
+        assert_eq!(count, 2);
+        assert!(set.contains("lmstudio-community/meta-llama-3.1-8b-instruct-gguf"));
+        assert!(set.contains("meta-llama-3.1-8b-instruct"));
+        assert!(set.contains("gemma-4-12b-it"));
+        assert!(!set.iter().any(|n| n.starts_with("mmproj-")));
+    }
+
+    #[test]
+    fn test_lmstudio_disk_match_is_exact_not_substring() {
+        let tree = lmstudio_tree();
+        let (set, _) = scan_lmstudio_models_dir_at(Some(tree.path()));
+
+        assert!(is_model_installed_lmstudio_disk(
+            "unsloth/Meta-Llama-3.1-8B-Instruct",
+            &set
+        ));
+        assert!(is_model_installed_lmstudio_disk(
+            "google/gemma-4-12B-it",
+            &set
+        ));
+
+        // A catalog entry literally named "llama" is a substring of
+        // "meta-llama-3.1-8b-instruct". Equality is what keeps it out.
+        assert!(!is_model_installed_lmstudio_disk(
+            "Resilient-Coders/llama",
+            &set
+        ));
+        // The base model is a different model from the Instruct one.
+        assert!(!is_model_installed_lmstudio_disk(
+            "meta-llama/Llama-3.1-8B",
+            &set
+        ));
+    }
+
+    #[test]
+    fn test_lmstudio_disk_base_model_does_not_claim_variants() {
+        // Only the base model is on disk. The `-it`, `-instruct` and `-chat`
+        // entries are distinct catalog models and must stay uninstalled.
+        let tree = TempTree::new("variant");
+        tree.touch("unsloth/gemma-4-12b-GGUF/gemma-4-12b-Q8_0.gguf");
+        let (set, _) = scan_lmstudio_models_dir_at(Some(tree.path()));
+
+        assert!(is_model_installed_lmstudio_disk(
+            "unsloth/gemma-4-12b",
+            &set
+        ));
+        assert!(!is_model_installed_lmstudio_disk(
+            "google/gemma-4-12B-it",
+            &set
+        ));
+        assert!(!is_model_installed_lmstudio_disk(
+            "google/gemma-4-12B-instruct",
+            &set
+        ));
+        assert!(!is_model_installed_lmstudio_disk(
+            "google/gemma-4-12B-chat",
+            &set
+        ));
+    }
+
+    #[test]
+    fn test_collect_gguf_files_ignores_directories_named_like_models() {
+        // A directory called `something.gguf` is not a model, and whatever is
+        // inside it still needs scanning.
+        let tree = TempTree::new("ggufdir");
+        tree.touch("decoy.gguf/real.gguf");
+
+        let found = collect_gguf_files(tree.path(), GGUF_SCAN_MAX_DEPTH);
+        assert_eq!(names_of(&found), vec!["real.gguf"]);
+        assert!(found.iter().all(|p| p.is_file()));
+    }
+
+    #[test]
+    fn test_scan_lmstudio_models_dir_without_home_is_empty() {
+        let (set, count) = scan_lmstudio_models_dir_at(None);
+        assert!(set.is_empty());
+        assert_eq!(count, 0);
     }
 
     // ── parse_repo_gguf_entries ──────────────────────────────────────
@@ -4389,6 +7633,467 @@ mod tests {
         );
     }
 
+    // ── OpenAI-compatible identity disambiguation ─────────────────────
+
+    #[test]
+    fn test_omlx_status_payload_detected() {
+        let payload = serde_json::json!({
+            "status": "ok",
+            "version": "0.4.4",
+            "models_discovered": 1,
+            "model_memory_max": 12_649_259_752u64,
+            "cache_efficiency": 0.0
+        });
+
+        assert!(is_omlx_status_payload(&payload));
+    }
+
+    #[test]
+    fn test_omlx_status_payload_rejects_generic_status() {
+        let payload = serde_json::json!({
+            "status": "ok",
+            "version": "1.0.0"
+        });
+
+        assert!(!is_omlx_status_payload(&payload));
+    }
+
+    #[test]
+    fn test_openai_model_list_detects_omlx_owner() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "Qwen2.5-0.5B-Instruct-4bit",
+                    "object": "model",
+                    "owned_by": "omlx",
+                    "max_model_len": 32768
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(openai_model_list_is_omlx(&list));
+    }
+
+    #[test]
+    fn test_openai_model_list_keeps_regular_vllm_available() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "object": "model",
+                    "owned_by": "vllm"
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(!openai_model_list_is_omlx(&list));
+    }
+
+    /// Verbatim `/v1/models` body captured from llama-swap v251 (4ec3175)
+    /// on 2026-08-23. The regression tests below feed it to both providers.
+    const LLAMA_SWAP_MODELS_FIXTURE: &str = r#"{"data":[{"id":"llama-3.2-1b-instruct","object":"model","created":1787482072,"owned_by":"llama-swap","meta":{"llamaswap":{"type":"model"}},"status":{"value":"unloaded"}}],"object":"list"}"#;
+
+    /// Verbatim `/v1/models` body captured from llama-server build 10520
+    /// (cd644c395) on 2026-08-23.
+    const LLAMA_SERVER_MODELS_FIXTURE: &str = r#"{"models":[{"name":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","model":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","modified_at":"","size":"","digest":"","type":"model","description":"","tags":[""],"capabilities":["completion"],"parameters":"","details":{"parent_model":"","format":"gguf","family":"","families":[""],"parameter_size":"","quantization_level":""}}],"object":"list","data":[{"id":"models/Llama-3.2-1B-Instruct-Q4_K_M.gguf","aliases":["models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"],"tags":[],"object":"model","created":1787482072,"owned_by":"llamacpp","meta":{"vocab_type":2,"n_vocab":128256,"n_ctx":131072,"n_ctx_train":131072,"n_embd":2048,"n_params":1235814432,"size":799862912,"ftype":"Q4_K - Medium"}}]}"#;
+
+    /// Verbatim `/v1/models` body captured from mlx_lm.server 0.31.3 on
+    /// 2026-08-23: no `owned_by` field at all.
+    const MLX_LM_MODELS_FIXTURE: &str = r#"{"object": "list", "data": [{"id": "mlx-community/Llama-3.2-1B-Instruct-4bit", "object": "model", "created": 1787482072}]}"#;
+
+    /// Verbatim `/v1/models` body captured from vLLM 0.28.0 on 2026-09-01.
+    const VLLM_MODELS_FIXTURE: &str = r#"{"object":"list","data":[{"id":"facebook/opt-125m","object":"model","created":1788290125,"owned_by":"vllm","root":"facebook/opt-125m","parent":null,"max_model_len":512}]}"#;
+    const FERRUM_MODELS_FIXTURE: &str = r#"{"data":[{"id":"ferrum","owned_by":"ferrum"}]}"#;
+
+    /// Verbatim `/v1/models` body captured from Docker Model Runner on
+    /// 2026-09-01: owned_by "docker" plus a per-model `dmr` object.
+    const DOCKER_MR_MODELS_FIXTURE: &str = r#"{"object":"list","data":[{"id":"docker.io/ai/smollm2:360M-Q4_K_M","object":"model","created":1742816981,"owned_by":"docker","dmr":{"architecture":"llama","parameters":"361.82 M","quantization":"IQ2_XXS/Q4_K_M","size":"256.35 MiB"}}]}"#;
+
+    /// Verbatim `/api/v0/models` body captured from LM Studio 0.4.23 on
+    /// 2026-09-01. The `compatibility_type`/`state` fields are LM Studio-native
+    /// and absent from the OpenAI schema, which is how the runtime is identified.
+    const LM_STUDIO_MODELS_FIXTURE: &str = r#"{"data":[{"id":"text-embedding-nomic-embed-text-v1.5","object":"model","type":"embeddings","publisher":"nomic-ai","arch":"nomic-bert","compatibility_type":"gguf","quantization":"Q4_K_M","state":"loaded","max_context_length":2048}],"object":"list"}"#;
+
+    #[test]
+    fn test_classify_openai_endpoint_measured_payloads() {
+        let swap: OpenAiModelList =
+            serde_json::from_str(LLAMA_SWAP_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(None, &swap),
+            OpenAiEndpointIdentity::LlamaSwap
+        );
+
+        let llamacpp: OpenAiModelList =
+            serde_json::from_str(LLAMA_SERVER_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("llama.cpp"), &llamacpp),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+        // The body alone is enough: the entry carries `owned_by: "llamacpp"`.
+        assert_eq!(
+            classify_openai_endpoint(None, &llamacpp),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+
+        let mlx: OpenAiModelList =
+            serde_json::from_str(MLX_LM_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("BaseHTTP/0.6 Python/3.14.7"), &mlx),
+            OpenAiEndpointIdentity::Unrecognized
+        );
+        // A llama.cpp Server header marks the endpoint even when the body
+        // carries no owner, as during model load.
+        let empty: OpenAiModelList = serde_json::from_str(r#"{"object":"list","data":[]}"#)
+            .expect("empty list should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("llama.cpp"), &empty),
+            OpenAiEndpointIdentity::LlamaCpp
+        );
+        assert_eq!(
+            classify_openai_endpoint(None, &empty),
+            OpenAiEndpointIdentity::Unrecognized
+        );
+
+        // Follow-up providers, measured 2026-09-01.
+        let vllm: OpenAiModelList =
+            serde_json::from_str(VLLM_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(Some("uvicorn"), &vllm),
+            OpenAiEndpointIdentity::Vllm
+        );
+
+        let ferrum: OpenAiModelList =
+            serde_json::from_str(FERRUM_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(None, &ferrum),
+            OpenAiEndpointIdentity::Ferrum
+        );
+
+        let docker: OpenAiModelList =
+            serde_json::from_str(DOCKER_MR_MODELS_FIXTURE).expect("fixture should parse");
+        assert_eq!(
+            classify_openai_endpoint(None, &docker),
+            OpenAiEndpointIdentity::DockerModelRunner
+        );
+    }
+
+    /// Serve one HTTP response carrying the given body on an ephemeral
+    /// loopback port, and return its base URL.
+    fn serve_fixture(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+        std::thread::spawn(move || {
+            // Serve every connection: LM Studio detection probes both
+            // /v1/models and the native /api/v0/models on the same base URL.
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    // Regression for #791: a llama-swap response on the probed port must not
+    // be imported as MLX models. Goes through the real probe, which applies
+    // classify_openai_endpoint, the same gate the RamaLama path uses below.
+    // On non-macOS the MLX probe skips the network path entirely, which
+    // satisfies the same assertion.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_mlx() {
+        let provider = MlxProvider::with_server_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (_, installed) = provider.detect_with_installed();
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    // Regression for #790: the same llama-swap response must not mark the
+    // RamaLama provider as serving models. Same gate as the MLX path above.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_ramalama() {
+        let provider = RamaLamaProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (_, installed, _count) = provider.detect_with_installed();
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    // Control: the same harness with a payload carrying no foreign marker IS
+    // imported, so the rejection above comes from the identity gate and not
+    // from a failed fetch.
+    #[test]
+    fn test_unmarked_endpoint_still_imported_as_ramalama() {
+        let provider = RamaLamaProvider::with_base_url(&serve_fixture(MLX_LM_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("mlx-community/llama-3.2-1b-instruct-4bit"));
+    }
+
+    // #790 follow-up, vLLM. Positive identification: only an endpoint that
+    // identifies as vLLM is imported, so both a llama-swap proxy and a plain
+    // llama.cpp server answering on the port are rejected.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_vllm() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    #[test]
+    fn test_llama_cpp_endpoint_not_imported_as_vllm() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(LLAMA_SERVER_MODELS_FIXTURE));
+        let (available, _installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+    }
+
+    // Control: an unmarked OpenAI payload is NOT imported. Under positive
+    // identification, vLLM imports only an endpoint that identifies as vLLM,
+    // so a foreign server on the port is rejected rather than trusted.
+    #[test]
+    fn test_unmarked_endpoint_not_imported_as_vllm() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(MLX_LM_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+        assert!(!installed.contains("mlx-community/llama-3.2-1b-instruct-4bit"));
+    }
+
+    // A genuine vLLM endpoint (owned_by "vllm", measured 2026-09-01) IS
+    // imported.
+    #[test]
+    fn test_vllm_endpoint_imported_as_vllm() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(VLLM_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("facebook/opt-125m"));
+    }
+
+    // Availability must match the identity gate, not mere reachability:
+    // a foreign OpenAI server on the port is not "available".
+    #[test]
+    fn test_vllm_not_available_for_foreign_endpoint() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        assert!(!provider.is_available());
+    }
+
+    #[test]
+    fn test_vllm_available_for_vllm_endpoint() {
+        let provider = VllmProvider::with_base_url(&serve_fixture(VLLM_MODELS_FIXTURE));
+        assert!(provider.is_available());
+    }
+
+    #[test]
+    fn test_lmstudio_not_available_for_foreign_endpoint() {
+        let provider = LmStudioProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        assert!(!provider.is_available());
+    }
+
+    #[test]
+    fn test_lmstudio_available_for_lmstudio_endpoint() {
+        let provider = LmStudioProvider::with_base_url(&serve_fixture(LM_STUDIO_MODELS_FIXTURE));
+        assert!(provider.is_available());
+    }
+
+    // An empty `data` array on /api/v0/models carries no native field, so a
+    // foreign service exposing that path with an empty list is not identified
+    // as LM Studio.
+    #[test]
+    fn test_empty_native_list_not_identified_as_lmstudio() {
+        let provider =
+            LmStudioProvider::with_base_url(&serve_fixture(r#"{"object":"list","data":[]}"#));
+        assert!(!provider.is_available());
+        let (available, _installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+    }
+
+    // #790 follow-up, LM Studio. Positive identification via the native
+    // /api/v0 API: only an endpoint that identifies as LM Studio is imported.
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_lmstudio() {
+        let provider = LmStudioProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    #[test]
+    fn test_unmarked_endpoint_not_imported_as_lmstudio() {
+        let provider = LmStudioProvider::with_base_url(&serve_fixture(MLX_LM_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+        assert!(!installed.contains("mlx-community/llama-3.2-1b-instruct-4bit"));
+    }
+
+    // A genuine LM Studio endpoint is identified by its native /api/v0/models
+    // route (measured 2026-09-01) and IS imported.
+    #[test]
+    fn test_lmstudio_endpoint_imported_as_lmstudio() {
+        // Same body served on /v1/models (for ids) and the native /api/v0/models
+        // probe (for identity); the native fields make lmstudio_native_models identify it.
+        let provider = LmStudioProvider::with_base_url(&serve_fixture(LM_STUDIO_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("text-embedding-nomic-embed-text-v1.5"));
+    }
+
+    // #790 follow-up, Docker Model Runner. Positive identification: only an
+    // endpoint that identifies as Docker Model Runner (owned_by "docker") is
+    // imported. The OS gate short-circuits the network probe on Linux, so
+    // these exercise the identity gate on macOS/Windows only.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_llama_swap_endpoint_not_imported_as_docker_mr() {
+        let provider =
+            DockerModelRunnerProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+        assert!(!installed.contains("llama-3.2-1b-instruct"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_llama_cpp_endpoint_not_imported_as_docker_mr() {
+        let provider =
+            DockerModelRunnerProvider::with_base_url(&serve_fixture(LLAMA_SERVER_MODELS_FIXTURE));
+        let (available, _installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+    }
+
+    // A genuine Docker Model Runner endpoint (owned_by "docker", measured
+    // 2026-09-01) IS imported.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_docker_mr_endpoint_imported_as_docker_mr() {
+        let provider =
+            DockerModelRunnerProvider::with_base_url(&serve_fixture(DOCKER_MR_MODELS_FIXTURE));
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 1);
+        assert!(installed.contains("docker.io/ai/smollm2:360m-q4_k_m"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_docker_mr_not_available_for_foreign_endpoint() {
+        let provider =
+            DockerModelRunnerProvider::with_base_url(&serve_fixture(LLAMA_SWAP_MODELS_FIXTURE));
+        assert!(!provider.is_available());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_docker_mr_available_for_docker_mr_endpoint() {
+        let provider =
+            DockerModelRunnerProvider::with_base_url(&serve_fixture(DOCKER_MR_MODELS_FIXTURE));
+        assert!(provider.is_available());
+    }
+
+    /// Serve different bodies per path prefix on an ephemeral loopback port,
+    /// so a probe hitting both `/v1/models` and `/` can be exercised.
+    #[cfg(not(target_os = "linux"))]
+    fn serve_routes(routes: &'static [(&'static str, &'static str, &'static str)]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (_, content_type, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| path.starts_with(prefix))
+                    .or_else(|| routes.last())
+                    .expect("routes not empty");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    // A running Docker Model Runner with no models yet returns an empty
+    // /v1/models list with no owned_by marker; the root banner identifies it,
+    // so the provider stays visible (measured root body, 2026-09-01).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_empty_docker_mr_endpoint_still_available() {
+        let base = serve_routes(&[
+            (
+                "/v1/models",
+                "application/json",
+                r#"{"object":"list","data":[]}"#,
+            ),
+            ("/", "text/plain", "Docker Model Runner is running"),
+        ]);
+        let provider = DockerModelRunnerProvider::with_base_url(&base);
+        assert!(provider.is_available());
+        let (available, installed, count) = provider.detect_with_installed();
+        assert!(available);
+        assert_eq!(count, 0);
+        assert!(installed.is_empty());
+    }
+
+    // An empty model list on a server whose root does NOT carry the banner
+    // stays unidentified: reachability alone is not evidence.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_empty_unmarked_endpoint_not_available_as_docker_mr() {
+        let base = serve_routes(&[
+            (
+                "/v1/models",
+                "application/json",
+                r#"{"object":"list","data":[]}"#,
+            ),
+            ("/", "text/plain", "some other server"),
+        ]);
+        let provider = DockerModelRunnerProvider::with_base_url(&base);
+        assert!(!provider.is_available());
+        let (available, _installed, count) = provider.detect_with_installed();
+        assert!(!available);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_openai_model_list_without_owner_is_not_omlx() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "object": "model"
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(!openai_model_list_is_omlx(&list));
+    }
+
     // ── vLLM ──────────────────────────────────────────────────────────
 
     #[test]
@@ -4461,6 +8166,112 @@ mod tests {
     }
 
     #[test]
+    fn test_hf_name_to_ramalama_candidates() {
+        let candidates = hf_name_to_ramalama_candidates("meta-llama/Llama-3.1-8B-Instruct");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == "meta-llama/llama-3.1-8b-instruct")
+        );
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b-instruct"));
+        // stripped variant (without -instruct)
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b"));
+    }
+
+    #[test]
+    fn test_is_model_installed_ramalama() {
+        let mut installed = HashSet::new();
+        installed.insert("meta-llama/llama-3.1-8b-instruct".to_string());
+        assert!(is_model_installed_ramalama(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            &installed
+        ));
+        assert!(!is_model_installed_ramalama(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_has_ramalama_mapping() {
+        assert!(has_ramalama_mapping("meta-llama/Llama-3.1-8B-Instruct"));
+        assert!(!has_ramalama_mapping(""));
+    }
+
+    #[test]
+    fn test_ramalama_pull_tag() {
+        assert_eq!(
+            ramalama_pull_tag("meta-llama/Llama-3.1-8B-Instruct"),
+            Some("meta-llama/Llama-3.1-8B-Instruct".to_string())
+        );
+        assert_eq!(ramalama_pull_tag(""), None);
+    }
+
+    #[test]
+    fn test_parse_ramalama_store_extracts_names() {
+        let json = br#"[
+            {"shortname":"granite","name":"ollama://granite-code:8b","modified":"2026-01-01","size":123},
+            {"shortname":"","name":"huggingface://meta-llama/Llama-3.1-8B-Instruct","modified":"2026-01-01","size":456}
+        ]"#;
+        let (set, count) = parse_ramalama_store(json).expect("valid json parses");
+        assert_eq!(count, 2);
+        // Full transport-qualified names, lowercased.
+        assert!(set.contains("ollama://granite-code:8b"));
+        assert!(set.contains("huggingface://meta-llama/llama-3.1-8b-instruct"));
+        // Trailing path components, for substring matching.
+        assert!(set.contains("granite-code:8b"));
+        assert!(set.contains("llama-3.1-8b-instruct"));
+        // Shortname included when present.
+        assert!(set.contains("granite"));
+    }
+
+    #[test]
+    fn test_parse_ramalama_store_matches_hf_model() {
+        let json = br#"[{"shortname":"","name":"huggingface://meta-llama/Llama-3.1-8B-Instruct","modified":"x","size":1}]"#;
+        let (set, _) = parse_ramalama_store(json).expect("valid json parses");
+        // Store-detected models resolve through the same matcher as the server path.
+        assert!(is_model_installed_ramalama(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            &set
+        ));
+    }
+
+    #[test]
+    fn test_parse_ramalama_store_empty_and_invalid() {
+        let (set, count) = parse_ramalama_store(b"[]").expect("empty array parses");
+        assert_eq!(count, 0);
+        assert!(set.is_empty());
+        assert!(parse_ramalama_store(b"not json").is_none());
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_with_scheme() {
+        assert_eq!(
+            normalize_ramalama_host("http://myhost:8080"),
+            Some("http://myhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_without_scheme() {
+        assert_eq!(
+            normalize_ramalama_host("myhost:8080"),
+            Some("http://myhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_rejects_unsupported_scheme() {
+        assert_eq!(normalize_ramalama_host("ftp://myhost:8080"), None);
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_empty() {
+        assert_eq!(normalize_ramalama_host(""), None);
+        assert_eq!(normalize_ramalama_host("  "), None);
+    }
+
+    #[test]
     fn test_docker_model_runner_host_filtering() {
         // Test the DOCKER_MODEL_RUNNER_HOST filtering logic without mutating the
         // process environment. is_docker_desktop_running() applies
@@ -4477,5 +8288,150 @@ mod tests {
         assert!(!host_is_set(Some("   ")));
         // Missing env var should NOT count
         assert!(!host_is_set(None));
+    }
+
+    #[test]
+    fn test_ollama_build_installed_set_skips_cloud_models() {
+        let models = vec![
+            ollama_entry("qwen3-coder:480b-cloud", 0), // cloud: -cloud suffix + size 0
+            ollama_entry("gpt-oss:120b-cloud", 0),     // cloud
+            ollama_entry("llama3.1:8b-instruct-q4_K_M", 4_700_000_000), // local
+        ];
+
+        let (set, count) = build_installed_set(models);
+
+        // Only the local model is counted and inserted.
+        assert_eq!(count, 1, "cloud models must not count as installed");
+        assert!(set.contains("llama3.1:8b-instruct-q4_k_m"));
+        // The tag is sized, so no family stem — see #861.
+        assert!(!set.contains("llama3.1"));
+
+        // The cloud family stem must NOT leak in — that was the #619 false positive.
+        assert!(
+            !set.contains("qwen3-coder"),
+            "cloud family stem must not mark unrelated models installed"
+        );
+        assert!(!set.contains("gpt-oss"));
+        assert!(!set.contains("qwen3-coder:480b-cloud"));
+    }
+
+    #[test]
+    fn test_ollama_is_cloud_detection() {
+        assert!(ollama_entry("qwen3-coder:480b-cloud", 0).is_cloud());
+
+        // A local model with a real on-disk size is not cloud.
+        assert!(!ollama_entry("llama3.1:8b", 4_700_000_000).is_cloud());
+
+        // Defensive: a zero-size entry is treated as not-local even without the suffix.
+        assert!(ollama_entry("mystery:latest", 0).is_cloud());
+    }
+
+    // ── installed-set breadth (#861) ─────────────────────────────────
+
+    fn ollama_entry(name: &str, size: u64) -> OllamaModel {
+        OllamaModel {
+            name: name.to_string(),
+            size,
+            ..Default::default()
+        }
+    }
+
+    fn ollama_entry_sized(name: &str, parameter_size: &str) -> OllamaModel {
+        OllamaModel {
+            name: name.to_string(),
+            size: 4_700_000_000,
+            details: OllamaModelDetails {
+                parameter_size: parameter_size.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn sized_install_does_not_mark_the_family_installed() {
+        // The #861 report: three models installed, dozens shown as installed.
+        let (installed, _) = build_installed_set(vec![ollama_entry_sized("qwen3:8b", "8.2B")]);
+
+        assert!(is_model_installed("Qwen/Qwen3-8B", &installed));
+        for sibling in [
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-4B",
+            "Qwen/Qwen3-32B",
+            "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "unsloth/Qwen3-30B-A3B-GGUF",
+        ] {
+            assert!(
+                !is_model_installed(sibling, &installed),
+                "{sibling} must not look installed because qwen3:8b is"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_install_resolves_to_its_parameter_size() {
+        // `ollama pull qwen3` leaves a `:latest` tag whose size only the
+        // reported parameter count reveals.
+        let (installed, _) = build_installed_set(vec![ollama_entry_sized("qwen3:latest", "8.2B")]);
+
+        assert!(installed.contains("qwen3:8b"));
+        assert!(is_model_installed("Qwen/Qwen3-8B", &installed));
+        assert!(!is_model_installed("Qwen/Qwen3-32B", &installed));
+    }
+
+    #[test]
+    fn latest_install_without_a_parameter_size_stays_family_level() {
+        // No parameter count to work with: the family stem is all we have, and
+        // it only matches catalog entries that carry no size of their own.
+        let (installed, _) = build_installed_set(vec![ollama_entry("qwq:latest", 4_700_000_000)]);
+
+        assert!(is_model_installed("Qwen/QwQ-32B", &installed));
+    }
+
+    #[test]
+    fn sizeless_mapping_still_matches_a_sized_install() {
+        // `OLLAMA_MAPPINGS` resolves microsoft/phi-4 to the size-less tag
+        // `phi4`, which Ollama stores as `phi4:14b`.
+        let (installed, _) = build_installed_set(vec![ollama_entry_sized("phi4:14b", "14.7B")]);
+
+        assert!(is_model_installed("microsoft/phi-4", &installed));
+    }
+
+    #[test]
+    fn every_mapped_model_is_still_detected_from_its_own_tag() {
+        // Narrowing what counts as installed must not cost us any model in the
+        // authoritative table: pulling exactly the tag a model maps to has to
+        // mark that model, and only that model, installed.
+        for (hf_suffix, tag) in OLLAMA_MAPPINGS {
+            let (installed, _) = build_installed_set(vec![ollama_entry(tag, 4_700_000_000)]);
+            assert!(
+                is_model_installed(hf_suffix, &installed),
+                "{hf_suffix} not detected from its own tag {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_size_yields_marketing_and_verbatim_tags() {
+        // Most tags carry the marketing size: qwen2.5:14b reports "14.8B".
+        assert_eq!(size_tokens_from_parameter_size("14.8B"), ["14b", "14.8b"]);
+        assert_eq!(size_tokens_from_parameter_size("8.2B"), ["8b", "8.2b"]);
+        // Decimal-tagged families (solar:10.7b) need the verbatim form.
+        assert_eq!(size_tokens_from_parameter_size("10.7B"), ["10b", "10.7b"]);
+        // A whole number yields one token, not a duplicate.
+        assert_eq!(size_tokens_from_parameter_size("8B"), ["8b"]);
+        // Sub-1B counts are reported in M and have no usable tag form.
+        assert!(size_tokens_from_parameter_size("596.05M").is_empty());
+        assert!(size_tokens_from_parameter_size("").is_empty());
+    }
+
+    #[test]
+    fn latest_install_of_a_decimal_tagged_family_is_detected() {
+        // `solar:latest` is `solar:10.7b`; the truncated "10b" alias alone
+        // would miss it.
+        let (installed, _) = build_installed_set(vec![ollama_entry_sized("solar:latest", "10.7B")]);
+
+        assert!(is_model_installed(
+            "upstage/SOLAR-10.7B-Instruct-v1.0",
+            &installed
+        ));
     }
 }

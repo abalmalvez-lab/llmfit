@@ -1,5 +1,538 @@
 # Changelog
 
+## [1.1.20](https://github.com/AlexsJones/llmfit/compare/v1.1.19...v1.1.20) (2026-11-03)
+
+
+### Bug Fixes
+
+* NVFP4 and MXFP4 safetensors repos are no longer offered as llama.cpp fits, so they don't top the list on ROCm and CPU machines ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+* 39 large models now have real attention-head counts from their `config.json` (including Llama-3.1-405B and MiniMax-M1), so `--cluster` can check their tensor-parallel splits ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+* `diff` and the TUI compare view no longer put a model that doesn't fit, or whose cluster split is refused, ahead of one that fits ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+* **cluster:** the banner shows the VRAM pool actually used when `--memory` is set ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+* **cluster:** Ray discovery sets `backend` from the GPU vendor where Ray reports it, and otherwise names the nodes that need `backend` set instead of assuming CUDA ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+* **cluster:** `--json` errors from `cluster init`, `cluster status`, `cluster clear` and `--cluster`; "1 node" instead of "1 nodes"; `cpu_cores` taken from the machine's core count, not Ray's `CPU` resource ([#1230](https://github.com/AlexsJones/llmfit/issues/1230))
+
+## [1.1.19](https://github.com/AlexsJones/llmfit/compare/v1.1.18...v1.1.19) (2026-11-03)
+
+
+### Features
+
+* cluster mode (preview): find models that fit a Ray or multi-node GPU cluster — see [docs/cluster.md](https://github.com/AlexsJones/llmfit/blob/main/docs/cluster.md) ([#1224](https://github.com/AlexsJones/llmfit/issues/1224), [#1225](https://github.com/AlexsJones/llmfit/issues/1225), [#1228](https://github.com/AlexsJones/llmfit/issues/1228); takes over [#279](https://github.com/AlexsJones/llmfit/issues/279) by [@michaeljabbour](https://github.com/michaeljabbour))
+* distinguish exact and legacy PCIe benchmark matches ([#1211](https://github.com/AlexsJones/llmfit/issues/1211)) ([52a6f49](https://github.com/AlexsJones/llmfit/commit/52a6f49c3851ab0146d2a78277bd233af87399b8))
+
+
+### Bug Fixes
+
+* exclude NVFP4 on ROCm GPUs ([#1203](https://github.com/AlexsJones/llmfit/issues/1203)) ([e3d5fe5](https://github.com/AlexsJones/llmfit/commit/e3d5fe56ae35bb344dca8ee348b935f9ea294da0))
+* **hardware:** avoid collecting unrelated process information ([#1200](https://github.com/AlexsJones/llmfit/issues/1200)) ([a560b35](https://github.com/AlexsJones/llmfit/commit/a560b353a1fd1132fabe3b9da2844a540ecb6080))
+* match benchmark calibration by PCIe link width ([#1202](https://github.com/AlexsJones/llmfit/issues/1202)) ([ad2859b](https://github.com/AlexsJones/llmfit/commit/ad2859bf60d63d9c9c70d6ea6a90d44f1a801c6f))
+* **models:** keep the most-downloaded repo as a deduped model's identity ([#1205](https://github.com/AlexsJones/llmfit/issues/1205)) ([242407f](https://github.com/AlexsJones/llmfit/commit/242407f236930d4d5b73e35a03ed8db56f47b6dc))
+* **models:** `supports_tp` now allows GQA KV-head replication like vLLM (TP larger than the KV-head count), which changes the TUI tensor-parallel filter and API results for all users ([f01092f](https://github.com/AlexsJones/llmfit/commit/f01092f9fa8c9f3e68ac266fa4a6981647524683))
+* **models:** stop flagging non-chat models as tool-capable ([#1207](https://github.com/AlexsJones/llmfit/issues/1207)) ([012eba4](https://github.com/AlexsJones/llmfit/commit/012eba41940cc10abccf41da916e8c06f2c20de5))
+* **providers:** prevent false MLX installed matches ([#1206](https://github.com/AlexsJones/llmfit/issues/1206)) ([6a4f070](https://github.com/AlexsJones/llmfit/commit/6a4f07000b192bda8346c1736d594b1b0d1cb829))
+* **scraper:** read the HF migration createdAt as no release date ([#1194](https://github.com/AlexsJones/llmfit/issues/1194)) ([1b3c707](https://github.com/AlexsJones/llmfit/commit/1b3c707401b06e0e2f0a5922200cd1d25df399c2)), closes [#176](https://github.com/AlexsJones/llmfit/issues/176)
+* **scraper:** use the GGUF header count when the config estimate is lower ([#1166](https://github.com/AlexsJones/llmfit/issues/1166)) ([7c88807](https://github.com/AlexsJones/llmfit/commit/7c8880719880916b62fc756d36e8010f3721500b))
+* **tui:** align simulation popup cursor with the wider VRAM/GPU label ([855c75c](https://github.com/AlexsJones/llmfit/commit/855c75c62ebb1e349b73995df61606a9cd635108))
+* **web:** restore jsdom localStorage in tests on Node 25+ ([#1222](https://github.com/AlexsJones/llmfit/issues/1222)) ([1068476](https://github.com/AlexsJones/llmfit/commit/10684767b3d8b41074788de719fa820a86c46efb))
+
+## [1.1.18](https://github.com/AlexsJones/llmfit/compare/v1.1.17...v1.1.18) (2026-10-28)
+
+
+### Features
+
+* **bench:** discover and benchmark models loaded in LM Studio ([#1129](https://github.com/AlexsJones/llmfit/issues/1129)) ([ccc1390](https://github.com/AlexsJones/llmfit/commit/ccc1390757b23398b3e81964debeef75e41a2be4))
+* **cli:** show backend-incompatible models on request ([#1143](https://github.com/AlexsJones/llmfit/issues/1143)) ([eb8db38](https://github.com/AlexsJones/llmfit/commit/eb8db3835157d1c300ffa9050ac58f63df11617c))
+* **hardware:** detect and show the PCIe link of NVIDIA GPUs ([#1153](https://github.com/AlexsJones/llmfit/issues/1153)) ([b8124fb](https://github.com/AlexsJones/llmfit/commit/b8124fb6c4ae9a943dac86440020dc0bdefdada1))
+* **scraper:** backfill release_date for catalog entries without one ([#1060](https://github.com/AlexsJones/llmfit/issues/1060)) ([31a90a4](https://github.com/AlexsJones/llmfit/commit/31a90a4465f2f5658589bdfd2eedd2e77aaa28d4)), closes [#176](https://github.com/AlexsJones/llmfit/issues/176)
+* **web:** catch the dashboard up with estimate confidence, concurrency, storage and TUI filters ([#1094](https://github.com/AlexsJones/llmfit/issues/1094)) ([363b683](https://github.com/AlexsJones/llmfit/commit/363b683f73b6abf2ed496810460ba54ffd31eaf2))
+
+
+### Bug Fixes
+
+* **bench:** read OLLAMA_HOST like the Ollama provider does ([#1171](https://github.com/AlexsJones/llmfit/issues/1171)) ([ea1ceb9](https://github.com/AlexsJones/llmfit/commit/ea1ceb946e53587af77694de744ffd54e35e5441))
+* **build:** give the Windows binary an 8 MB main-thread stack ([#1198](https://github.com/AlexsJones/llmfit/issues/1198)) ([f2f07d4](https://github.com/AlexsJones/llmfit/commit/f2f07d46c4ce867ff86bdafbd91442873e3d9c8d))
+* **claim:** reject --quant labels it does not recognize ([#1162](https://github.com/AlexsJones/llmfit/issues/1162)) ([628184e](https://github.com/AlexsJones/llmfit/commit/628184eb5c6391fad4770cc9e0836eceb2f60e93))
+* **claim:** size the MoE bandwidth floor from active parameters ([#1150](https://github.com/AlexsJones/llmfit/issues/1150)) ([2491243](https://github.com/AlexsJones/llmfit/commit/2491243295b91eb927f1d12e25711e1a4806f7d5))
+* **cli:** accept the sizing flags after the subcommand ([#1172](https://github.com/AlexsJones/llmfit/issues/1172)) ([fdc859d](https://github.com/AlexsJones/llmfit/commit/fdc859d5e8af2fc93bcf5b5412d4e6862c56e3cc))
+* **cli:** exit quietly when stdout is a closed pipe ([#1185](https://github.com/AlexsJones/llmfit/issues/1185)) ([9245299](https://github.com/AlexsJones/llmfit/commit/9245299bb1f26ea58914f9216b7151b102169765))
+* **cli:** match every word of a multi-word search ([#1188](https://github.com/AlexsJones/llmfit/issues/1188)) ([b7c4812](https://github.com/AlexsJones/llmfit/commit/b7c4812e57084df9adb2e6c4b9e5b962d2416768))
+* **cli:** reject --memory and --ram values that do not parse ([#1160](https://github.com/AlexsJones/llmfit/issues/1160)) ([42f2395](https://github.com/AlexsJones/llmfit/commit/42f2395fde13d289825ae80b73893127659342f9))
+* **cli:** return structured JSON errors from plan, concurrency and claim ([#1191](https://github.com/AlexsJones/llmfit/issues/1191)) ([a552271](https://github.com/AlexsJones/llmfit/commit/a5522715950586df6c8ee24ec02a6e093f3264dd))
+* **diff:** compare named models whatever their fit ([#1190](https://github.com/AlexsJones/llmfit/issues/1190)) ([3b4dff2](https://github.com/AlexsJones/llmfit/commit/3b4dff260272d64df597a8eac4d5befcbca9ea23))
+* **fit:** gate pre-quantized FP4 repos on the GPU's kernel support, not the catalog quant ([#1127](https://github.com/AlexsJones/llmfit/issues/1127)) ([781e76a](https://github.com/AlexsJones/llmfit/commit/781e76a5d0f6ffe10476347fa06a6d83ecc414da))
+* **fit:** report the quant the MoE offload path chose ([#1121](https://github.com/AlexsJones/llmfit/issues/1121)) ([bb92661](https://github.com/AlexsJones/llmfit/commit/bb92661dd21c639c064a99baadabf840bbdf91bb)), closes [#1119](https://github.com/AlexsJones/llmfit/issues/1119)
+* **fit:** size GPU-loaded MoE models at the quant they are rated at ([#1141](https://github.com/AlexsJones/llmfit/issues/1141)) ([0490df0](https://github.com/AlexsJones/llmfit/commit/0490df0fca459dea77630258f4459941a59fae10))
+* **fit:** size MoE offload for pre-quantized models at their own quant ([#1131](https://github.com/AlexsJones/llmfit/issues/1131)) ([06e236b](https://github.com/AlexsJones/llmfit/commit/06e236bd1b64f14ab6e820008e02f634bb77f307))
+* **fit:** size usable context from the active experts under MoE offload ([#1169](https://github.com/AlexsJones/llmfit/issues/1169)) ([6ee2785](https://github.com/AlexsJones/llmfit/commit/6ee278555bbf6dc374138c821e70270edf52979c))
+* **fit:** size usable context within the Marginal ceiling ([#1126](https://github.com/AlexsJones/llmfit/issues/1126)) ([a680dd7](https://github.com/AlexsJones/llmfit/commit/a680dd755e6c6f4c4b6e89e7a0663387b5da1995))
+* **fit:** treat mlx-community repos as Apple-only ([#1130](https://github.com/AlexsJones/llmfit/issues/1130)) ([399b7e9](https://github.com/AlexsJones/llmfit/commit/399b7e9a86b04c5b083c6b574c7dcf88c5ee649a))
+* **hardware:** drop the detected free VRAM when --memory overrides it ([#1195](https://github.com/AlexsJones/llmfit/issues/1195)) ([e293250](https://github.com/AlexsJones/llmfit/commit/e2932505802097e75fe94d2185a54115679728b1))
+* **hardware:** keep registry VRAM when PowerShell exits non-zero ([#1183](https://github.com/AlexsJones/llmfit/issues/1183)) ([d47b38b](https://github.com/AlexsJones/llmfit/commit/d47b38bbad0f7872bbce2b210168e18e70f8c53d)), closes [#1180](https://github.com/AlexsJones/llmfit/issues/1180)
+* **hardware:** skip legacy Intel iGPUs with lspci controller names ([#1148](https://github.com/AlexsJones/llmfit/issues/1148)) ([bffd1b6](https://github.com/AlexsJones/llmfit/commit/bffd1b66b28cb50a7c1e231c5dd5ef84b65bb5dc))
+* **mcp:** report plan_hardware failures as tool errors ([#1193](https://github.com/AlexsJones/llmfit/issues/1193)) ([d202d9d](https://github.com/AlexsJones/llmfit/commit/d202d9dd28578532e19e872bc97136ac8df428ca))
+* **models:** score F32 like F16 instead of a 4-bit quant ([#1186](https://github.com/AlexsJones/llmfit/issues/1186)) ([21bed2c](https://github.com/AlexsJones/llmfit/commit/21bed2c2db33fbc77d6fa4d88cd9d7114c008008))
+* **models:** size MLA KV cache from the compressed latent ([#1145](https://github.com/AlexsJones/llmfit/issues/1145)) ([85ae435](https://github.com/AlexsJones/llmfit/commit/85ae43569e1e2eb81ceb3951fd4f547ce0fb783d))
+* **models:** stop sanitization hiding sub-260M and decimal-size models ([#1104](https://github.com/AlexsJones/llmfit/issues/1104)) ([3e53c5c](https://github.com/AlexsJones/llmfit/commit/3e53c5ca851bbc8082bd7bb8fe87b9d1ca4680aa))
+* **plan:** estimate F32 speed from 4 bytes per parameter ([#1170](https://github.com/AlexsJones/llmfit/issues/1170)) ([8423800](https://github.com/AlexsJones/llmfit/commit/842380095b7a07c9347c7096b33dfc78bdb94d2d))
+* **plan:** grade paths and upgrade deltas with fit's thresholds ([#1125](https://github.com/AlexsJones/llmfit/issues/1125)) ([4b9fdd9](https://github.com/AlexsJones/llmfit/commit/4b9fdd9c5d1da3aa38ee5f7de872a5555c029a3e))
+* **providers:** detect llama.cpp installed as single llama binary ([#1136](https://github.com/AlexsJones/llmfit/issues/1136)) ([2cc11f7](https://github.com/AlexsJones/llmfit/commit/2cc11f7a5bfd2f7c67cb9457b0be52d6355f2b72))
+* **scraper:** keep a rate-limited base lookup out of the params cache ([#1071](https://github.com/AlexsJones/llmfit/issues/1071)) ([29bab4d](https://github.com/AlexsJones/llmfit/commit/29bab4d109dcdeebb4e3c1c62d78f67b24a1024a)), closes [#1067](https://github.com/AlexsJones/llmfit/issues/1067)
+* **scraper:** keep the stated context window for llama3 rope scaling ([#1167](https://github.com/AlexsJones/llmfit/issues/1167)) ([65ddd28](https://github.com/AlexsJones/llmfit/commit/65ddd28f77f82fdd3f6c62a93cc06da135c3fa03))
+* **serve:** accept localhost-only routes over --unix-socket ([#1146](https://github.com/AlexsJones/llmfit/issues/1146)) ([1c0b6bd](https://github.com/AlexsJones/llmfit/commit/1c0b6bde53b06e5c4dbafc529b52aa5a732c6003))
+* **serve:** answer unparsable query strings and bodies with JSON errors ([#1192](https://github.com/AlexsJones/llmfit/issues/1192)) ([176289d](https://github.com/AlexsJones/llmfit/commit/176289d8b097e9591ee582712962b14948203bed))
+* **serve:** only replace a stale socket at the --unix-socket path ([#1152](https://github.com/AlexsJones/llmfit/issues/1152)) ([e915091](https://github.com/AlexsJones/llmfit/commit/e915091dd58f7fefaa9814d2d34ee61bd754fdc0))
+* **tui:** keep inference bench selection visible ([#1177](https://github.com/AlexsJones/llmfit/issues/1177)) ([687399b](https://github.com/AlexsJones/llmfit/commit/687399b7592c719df6a1d8d644b1baa708b1497d))
+* **tui:** replace CPR-dependent Terminal::clear() with same-size fullscreen resize() ([#1196](https://github.com/AlexsJones/llmfit/issues/1196)) ([56d4174](https://github.com/AlexsJones/llmfit/commit/56d4174e977f329c4c77461ee5dc131519b4281b))
+* **update:** detect MoE models from config.json expert counts ([#1142](https://github.com/AlexsJones/llmfit/issues/1142)) ([fa80482](https://github.com/AlexsJones/llmfit/commit/fa80482e0fff5187dd28919d8badb9ed7bfe1937))
+
+## [1.1.17](https://github.com/AlexsJones/llmfit/compare/v1.1.16...v1.1.17) (2026-10-08)
+
+
+### Features
+
+* **cli:** add --memory-percent and --ram-percent overrides ([#1089](https://github.com/AlexsJones/llmfit/issues/1089)) ([17d45bd](https://github.com/AlexsJones/llmfit/commit/17d45bd667bb9cca95008182e07852d2208087c1))
+* **tui:** add mouse support to existing controls ([#1110](https://github.com/AlexsJones/llmfit/issues/1110)) ([8caf925](https://github.com/AlexsJones/llmfit/commit/8caf9256739d8d3e4f5359462990f8cf18f1856c))
+
+
+### Bug Fixes
+
+* **api:** make include_too_tight=true return too_tight rows ([#1087](https://github.com/AlexsJones/llmfit/issues/1087)) ([cbd30d7](https://github.com/AlexsJones/llmfit/commit/cbd30d7d512885c1eff2e545da37c09f2768963c))
+* **cli:** honor --json in search ([#1113](https://github.com/AlexsJones/llmfit/issues/1113)) ([f89395b](https://github.com/AlexsJones/llmfit/commit/f89395bed72a3d4905e792688d8119141f3b792e)), closes [#901](https://github.com/AlexsJones/llmfit/issues/901)
+* **cli:** reject unknown recommend filter values ([#1114](https://github.com/AlexsJones/llmfit/issues/1114)) ([35fdd4f](https://github.com/AlexsJones/llmfit/commit/35fdd4f941f75e991a6a53a02efaae73a6e04582))
+* **fit:** dense CpuOffload TPS uses measured DDR bandwidth and the GPU/RAM split ([#1108](https://github.com/AlexsJones/llmfit/issues/1108)) ([b3a5974](https://github.com/AlexsJones/llmfit/commit/b3a5974325e3a312605de1caeb8ba2c6e9677dc9))
+* **fit:** make ranking deterministic across runs ([#1066](https://github.com/AlexsJones/llmfit/issues/1066)) ([f2eafd0](https://github.com/AlexsJones/llmfit/commit/f2eafd0797ac5424c9663c03fbd218f1c3679364))
+* **fit:** pick the best quant within the Marginal ceiling ([#1120](https://github.com/AlexsJones/llmfit/issues/1120)) ([449fe95](https://github.com/AlexsJones/llmfit/commit/449fe9555231036ba77e2a0c5caa7a43be6cae71)), closes [#1118](https://github.com/AlexsJones/llmfit/issues/1118)
+* **hardware:** treat an Intel adapter with no series name as integrated ([#1100](https://github.com/AlexsJones/llmfit/issues/1100)) ([c299bc5](https://github.com/AlexsJones/llmfit/commit/c299bc5f891d2b57e5f79aa8915fe1406876ddaa))
+* **models:** prefer name-declared size when scraped params are implausible ([#925](https://github.com/AlexsJones/llmfit/issues/925)) ([f433cf6](https://github.com/AlexsJones/llmfit/commit/f433cf6737e8ffd34f23201f3a8d39d90e09e158))
+
+
+### Performance Improvements
+
+* **hardware:** run lspci once per process ([#1065](https://github.com/AlexsJones/llmfit/issues/1065)) ([0728894](https://github.com/AlexsJones/llmfit/commit/0728894b93e0ec0dd2b3e6aff178e34268b42cda))
+* **tui:** optimize model search filtering in apply_filters for 40%+ speedup ([#934](https://github.com/AlexsJones/llmfit/issues/934)) ([ca864d0](https://github.com/AlexsJones/llmfit/commit/ca864d0977460042dd08831659f21b8463514e8b))
+
+## [1.1.16](https://github.com/AlexsJones/llmfit/compare/v1.1.15...v1.1.16) (2026-09-19)
+
+
+### Features
+
+* **concurrency:** concurrent-session capacity estimator ([#140](https://github.com/AlexsJones/llmfit/issues/140)) ([#999](https://github.com/AlexsJones/llmfit/issues/999)) ([1936acc](https://github.com/AlexsJones/llmfit/commit/1936acc7fbd2fad0a5e7a2fe7510f4004d4007e4))
+* **models:** Sept 2026 model refresh (GLM-5.3, Qwen3.8-Flash-Next, DeepSeek-V4.1, Kimi-K3 and more) ([#1055](https://github.com/AlexsJones/llmfit/issues/1055)) ([6dd1f3c](https://github.com/AlexsJones/llmfit/commit/6dd1f3cd3098cc0e2abe9e4a1ccdaa518e614aeb))
+* recognize native ternary (1.58-bit) models ([#886](https://github.com/AlexsJones/llmfit/issues/886)) ([569a9ac](https://github.com/AlexsJones/llmfit/commit/569a9ac6cf80679631fb4a12830f1b832c4f5f30))
+* **storage:** add disk planning for model libraries ([#1023](https://github.com/AlexsJones/llmfit/issues/1023)) ([42c2641](https://github.com/AlexsJones/llmfit/commit/42c2641b75ba610997718b90231ef2a412b66bf3))
+
+
+### Bug Fixes
+
+* **bench:** error when the requested model is not available ([#1041](https://github.com/AlexsJones/llmfit/issues/1041)) ([f66aad9](https://github.com/AlexsJones/llmfit/commit/f66aad9a416c8d8f199dd19fd44298a433dc4e61))
+* **bench:** ignore implausible tok/s from degenerate Ollama timings ([#1042](https://github.com/AlexsJones/llmfit/issues/1042)) ([86a0d08](https://github.com/AlexsJones/llmfit/commit/86a0d08a9fe98ad35fc9ec11e90f627aeb1e864e))
+* **bench:** stop wall timer after body read in OpenAI and Ollama paths ([#1037](https://github.com/AlexsJones/llmfit/issues/1037)) ([63753e9](https://github.com/AlexsJones/llmfit/commit/63753e9ab2a95f14896512a5a566fb0c37e8271f)), closes [#1028](https://github.com/AlexsJones/llmfit/issues/1028)
+* **fit:** size and price MXFP4-native models at MXFP4 ([#1059](https://github.com/AlexsJones/llmfit/issues/1059)) ([650cd1e](https://github.com/AlexsJones/llmfit/commit/650cd1e86b7b21c217b1e75d3ef2384b3be8bb5d))
+* **hardware:** recognize A-series Apple Silicon unified memory ([#1044](https://github.com/AlexsJones/llmfit/issues/1044)) ([e138964](https://github.com/AlexsJones/llmfit/commit/e1389649a2ba311b5124605978bdb381235a21bd))
+* **plan:** grade GPU paths against free VRAM, not total capacity ([#1058](https://github.com/AlexsJones/llmfit/issues/1058)) ([0d48118](https://github.com/AlexsJones/llmfit/commit/0d48118b29c86cb59653001f394f4a98d18f9626)), closes [#835](https://github.com/AlexsJones/llmfit/issues/835)
+* **providers:** find HF models in HF_HUB_CACHE and XDG_CACHE_HOME ([#1051](https://github.com/AlexsJones/llmfit/issues/1051)) ([83d4963](https://github.com/AlexsJones/llmfit/commit/83d49632abcfb77d74d3ca9e2f923543c070158c))
+* **providers:** map Gemma 4 instruct models to their Ollama tags ([#1043](https://github.com/AlexsJones/llmfit/issues/1043)) ([a172f2a](https://github.com/AlexsJones/llmfit/commit/a172f2ae580a5c082c2b6267315273177958257d)), closes [#1024](https://github.com/AlexsJones/llmfit/issues/1024)
+* **providers:** map gemma4:12b and other Sept 2026 catalog additions to Ollama tags ([#1056](https://github.com/AlexsJones/llmfit/issues/1056)) ([01c805c](https://github.com/AlexsJones/llmfit/commit/01c805c3cb537c10cf052165c0d35662734bb647)), closes [#1024](https://github.com/AlexsJones/llmfit/issues/1024)
+* **scraper:** budget GGUF source probing so the weekly run can finish ([#1061](https://github.com/AlexsJones/llmfit/issues/1061)) ([44de365](https://github.com/AlexsJones/llmfit/commit/44de3655e0a680c1c6ab1896317645432f7b2e57))
+* **scraper:** coerce list-valued expert counts; a failed estimate cannot abort a scrape ([#1064](https://github.com/AlexsJones/llmfit/issues/1064)) ([84007d5](https://github.com/AlexsJones/llmfit/commit/84007d5d684cf4721cd7eee7eedb8e961812e33a))
+* **scraper:** never size hybrid SSM models by the estimator; cap by declared size ([#1063](https://github.com/AlexsJones/llmfit/issues/1063)) ([2dd0628](https://github.com/AlexsJones/llmfit/commit/2dd06281bc20bae908d2fe9c8d5e1d1b8c8344eb))
+* **scraper:** pace HuggingFace requests on the ratelimit headers ([#1047](https://github.com/AlexsJones/llmfit/issues/1047)) ([c0fd811](https://github.com/AlexsJones/llmfit/commit/c0fd8118063d723cd10e95ea69a8b63996c738a2))
+* **scraper:** revalidate retained catalog entries (fixes packed AWQ/GPTQ/INT4 parameter counts) ([#1057](https://github.com/AlexsJones/llmfit/issues/1057)) ([a4b669c](https://github.com/AlexsJones/llmfit/commit/a4b669c814430ab751cffe9857de9ff0aabd0260))
+* **update:** read the context window from config.json ([#1054](https://github.com/AlexsJones/llmfit/issues/1054)) ([9db4a4c](https://github.com/AlexsJones/llmfit/commit/9db4a4cbd466971aba9763130eee5f4caed152f8)), closes [#1021](https://github.com/AlexsJones/llmfit/issues/1021)
+* **update:** request every mapped field in the HuggingFace list expand[] ([#1048](https://github.com/AlexsJones/llmfit/issues/1048)) ([b662f4d](https://github.com/AlexsJones/llmfit/commit/b662f4d1e549a882e9fdb90b3decc8bd00d2cf01)), closes [#1021](https://github.com/AlexsJones/llmfit/issues/1021)
+
+## [1.1.15](https://github.com/AlexsJones/llmfit/compare/v1.1.14...v1.1.15) (2026-09-10)
+
+
+### Bug Fixes
+
+* **bench:** identify Ferrum and vLLM by endpoint owner ([#994](https://github.com/AlexsJones/llmfit/issues/994)) ([b3e09fd](https://github.com/AlexsJones/llmfit/commit/b3e09fd2d8141acedd0987fb73c4a4778a3c8332))
+* **bench:** normalize latency formatting ([#1001](https://github.com/AlexsJones/llmfit/issues/1001)) ([1e7bdb3](https://github.com/AlexsJones/llmfit/commit/1e7bdb3ecf43071597ffd2eb2305dfac35e22a40))
+* **tui:** render only visible model rows ([#1017](https://github.com/AlexsJones/llmfit/issues/1017)) ([ff7a70b](https://github.com/AlexsJones/llmfit/commit/ff7a70bafa925daf28f348b5a2b4573ab0e8e75d))
+
+## [1.1.14](https://github.com/AlexsJones/llmfit/compare/v1.1.13...v1.1.14) (2026-09-03)
+
+
+### Bug Fixes
+
+* **docker:** build each platform natively instead of cross-compiling under QEMU ([#996](https://github.com/AlexsJones/llmfit/issues/996)) ([1e1638c](https://github.com/AlexsJones/llmfit/commit/1e1638c3ac08cc704f601d77ae6a021e886a677b))
+
+## [1.1.13](https://github.com/AlexsJones/llmfit/compare/v1.1.12...v1.1.13) (2026-09-03)
+
+
+### Features
+
+* add --llama-cpp-path global CLI flag mirroring LLAMA_CPP_PATH env var ([#583](https://github.com/AlexsJones/llmfit/issues/583)) ([3222da5](https://github.com/AlexsJones/llmfit/commit/3222da59b816bdd6bdf5c2522dd08eccb8967a8e))
+* **docker:** add multi-stage build ([#911](https://github.com/AlexsJones/llmfit/issues/911)) ([ed8c184](https://github.com/AlexsJones/llmfit/commit/ed8c1847aa3719d7bc2915fa68ed5bf5713335ea))
+* **docker:** add web frontend service and multi-stage container support ([ed8c184](https://github.com/AlexsJones/llmfit/commit/ed8c1847aa3719d7bc2915fa68ed5bf5713335ea))
+* hardware profiles, MoE Tier-2 fixes, and estimate confidence ([#969](https://github.com/AlexsJones/llmfit/issues/969)) ([#971](https://github.com/AlexsJones/llmfit/issues/971)) ([a8a1a93](https://github.com/AlexsJones/llmfit/commit/a8a1a93f7f742295ca98cb865a8671687c6cd6e2))
+
+
+### Bug Fixes
+
+* **cli:** return JSON errors for missing models ([#966](https://github.com/AlexsJones/llmfit/issues/966)) ([1a147ed](https://github.com/AlexsJones/llmfit/commit/1a147ed26e413d8c299282ef18acf50a2d173982))
+* **hardware:** recover BIOS UMA carveout on Linux APUs and drop legacy Intel iGPUs ([#964](https://github.com/AlexsJones/llmfit/issues/964)) ([#995](https://github.com/AlexsJones/llmfit/issues/995)) ([bb01690](https://github.com/AlexsJones/llmfit/commit/bb016906fd4744e124ece56dca361919b25b1505))
+* **models:** keep architecture metadata when config.json fetch misses ([#963](https://github.com/AlexsJones/llmfit/issues/963)) ([ec652ba](https://github.com/AlexsJones/llmfit/commit/ec652ba1c32c5092cbbc0b6b1bb63fcdbe9ee90d))
+* **plan:** honor hardware profile bandwidth ([f9d8e48](https://github.com/AlexsJones/llmfit/commit/f9d8e48d08ede41618e7901cbcd89787fc428e56))
+* **providers:** find LM Studio models on disk, not just loaded ones ([#902](https://github.com/AlexsJones/llmfit/issues/902)) ([413246f](https://github.com/AlexsJones/llmfit/commit/413246ff41116c6f42a174d5dd7e961585f48248))
+* **providers:** identify vLLM, LM Studio and Docker Model Runner by evidence ([#984](https://github.com/AlexsJones/llmfit/issues/984)) ([b624527](https://github.com/AlexsJones/llmfit/commit/b624527f1903991bf41a1d496c9b5b1f3931291a)), closes [#791](https://github.com/AlexsJones/llmfit/issues/791) [#790](https://github.com/AlexsJones/llmfit/issues/790)
+* **providers:** unify the two MLX quant-suffix strippers ([#895](https://github.com/AlexsJones/llmfit/issues/895)) ([02c2fa5](https://github.com/AlexsJones/llmfit/commit/02c2fa56691883320ac812a9f0c9975c6c955fc1)), closes [#869](https://github.com/AlexsJones/llmfit/issues/869)
+* **providers:** verify server identity before importing models ([#791](https://github.com/AlexsJones/llmfit/issues/791)) ([#938](https://github.com/AlexsJones/llmfit/issues/938)) ([9319453](https://github.com/AlexsJones/llmfit/commit/93194537f298f1312ea1af806c27085addd1389c)), closes [#790](https://github.com/AlexsJones/llmfit/issues/790)
+* **quality:** disable Ollama thinking for benchmarks ([#975](https://github.com/AlexsJones/llmfit/issues/975)) ([eb11c9e](https://github.com/AlexsJones/llmfit/commit/eb11c9e366e00b4c65c4dad04cdd729cd1bd6839))
+* **quality:** preserve benchmark regex escapes ([#967](https://github.com/AlexsJones/llmfit/issues/967)) ([4f8b489](https://github.com/AlexsJones/llmfit/commit/4f8b48978bf5094a085aaf8dc99fee5901707d02))
+* **share:** explain a refused write to the user's own fork ([#865](https://github.com/AlexsJones/llmfit/issues/865)) ([d6bfa10](https://github.com/AlexsJones/llmfit/commit/d6bfa1094f6e1cc83749c408ec5c490c9935d709)), closes [#862](https://github.com/AlexsJones/llmfit/issues/862)
+
+## [1.1.12](https://github.com/AlexsJones/llmfit/compare/v1.1.11...v1.1.12) (2026-08-27)
+
+
+### Bug Fixes
+
+* **hardware:** stop mobile GPUs inheriting desktop specs ([#919](https://github.com/AlexsJones/llmfit/issues/919)) ([#922](https://github.com/AlexsJones/llmfit/issues/922)) ([0eb997a](https://github.com/AlexsJones/llmfit/commit/0eb997ad2df9cf2e3b5e39b8d9e7286292765816))
+* **ollama:** map the gemma3 family sizes to their catalog ids ([#950](https://github.com/AlexsJones/llmfit/issues/950)) ([38dea9f](https://github.com/AlexsJones/llmfit/commit/38dea9fbd4764bc66660bfef4b0796bc97c1ae74)), closes [#866](https://github.com/AlexsJones/llmfit/issues/866)
+* **providers:** map the four Gemma 4 models to their Bartowski GGUF repos ([#332](https://github.com/AlexsJones/llmfit/issues/332)) ([#955](https://github.com/AlexsJones/llmfit/issues/955)) ([66f2846](https://github.com/AlexsJones/llmfit/commit/66f284616f0363ee1fe7188f1cf10a8deef4c0c3))
+* use trendingScore when searching the HF Hub for GGUF repos ([#952](https://github.com/AlexsJones/llmfit/issues/952)) ([be8d8d7](https://github.com/AlexsJones/llmfit/commit/be8d8d7e502585695dc61f9bd059fbfffee55971))
+
+## [1.1.11](https://github.com/AlexsJones/llmfit/compare/v1.1.10...v1.1.11) (2026-08-25)
+
+
+### Bug Fixes
+
+* account for hybrid attention in KV cache ([#953](https://github.com/AlexsJones/llmfit/issues/953)) ([76ad75d](https://github.com/AlexsJones/llmfit/commit/76ad75dc92dfcc4fd67f6e12e5d6d34b61468d79))
+* **fit:** stop flagging pre-quantized models that fit as insufficient ([#898](https://github.com/AlexsJones/llmfit/issues/898)) ([e1379a9](https://github.com/AlexsJones/llmfit/commit/e1379a96df718b033d86fa93b385da8a9d4e707a))
+* **ollama:** stop a size-less family tag claiming a much larger model ([#899](https://github.com/AlexsJones/llmfit/issues/899)) ([fabb63b](https://github.com/AlexsJones/llmfit/commit/fabb63bb114a41476768dfc24ebddde1608326c0))
+* **plan:** use active MoE params in fallback estimates ([#924](https://github.com/AlexsJones/llmfit/issues/924)) ([e11c6e1](https://github.com/AlexsJones/llmfit/commit/e11c6e1925118423ce20aeb8bc20c2ffcc07081b))
+* **providers:** match every K-quant and I-quant GGUF variant ([#873](https://github.com/AlexsJones/llmfit/issues/873)) ([2042c3a](https://github.com/AlexsJones/llmfit/commit/2042c3a9da65c08b32d5ae81e46a343fd28964b4))
+
+## [1.1.10](https://github.com/AlexsJones/llmfit/compare/v1.1.9...v1.1.10) (2026-08-17)
+
+
+### Features
+
+* **mcp:** add RamaLama runtime discovery ([#875](https://github.com/AlexsJones/llmfit/issues/875)) ([b9d5f57](https://github.com/AlexsJones/llmfit/commit/b9d5f578f6ee96dd551969feb6b0eb61ad0527c9))
+* **models:** add the Qwen3.8 family and fix Qwen generation parsing ([#893](https://github.com/AlexsJones/llmfit/issues/893)) ([6e024b2](https://github.com/AlexsJones/llmfit/commit/6e024b2e512677d6912ef95ac8bfedbf3224d583))
+
+
+### Bug Fixes
+
+* **bench:** align 7900 XT hardwareName with the existing slug entries ([c25754a](https://github.com/AlexsJones/llmfit/commit/c25754ac029f35b8a59037096c1b6e4e70fc86e2))
+* expose MiniMax M3 vision capability ([#793](https://github.com/AlexsJones/llmfit/issues/793)) ([4801d4a](https://github.com/AlexsJones/llmfit/commit/4801d4a75b175aeab264806b3bb82ff7436f54ce))
+* **ollama:** stop one sized install marking a whole model family installed ([#863](https://github.com/AlexsJones/llmfit/issues/863)) ([c9a5678](https://github.com/AlexsJones/llmfit/commit/c9a567883e7827dcaa2230af027a5e8cc4b400ae))
+* **providers:** resolve MLX community tags to catalog ids ([#854](https://github.com/AlexsJones/llmfit/issues/854)) ([#860](https://github.com/AlexsJones/llmfit/issues/860)) ([b79f2df](https://github.com/AlexsJones/llmfit/commit/b79f2dfd2e2020bd9f8dc4b3781fd017286a21d5))
+
+## [1.1.9](https://github.com/AlexsJones/llmfit/compare/v1.1.8...v1.1.9) (2026-08-09)
+
+
+### Bug Fixes
+
+* **cli:** don't auto-spawn dashboard for read-only subcommands ([#838](https://github.com/AlexsJones/llmfit/issues/838)) ([e638ced](https://github.com/AlexsJones/llmfit/commit/e638ced5255a40a9fa0b00ac94e0f43e251d5ca9))
+* **hardware:** match adapter names through OEM-mangled trademark symbols ([edf7af2](https://github.com/AlexsJones/llmfit/commit/edf7af2c56421f9e4ccf0a057df4e3496bf3a0e2))
+* **hardware:** read 64-bit registry VRAM and full DIMM total for AMD APU UMA carveouts ([#817](https://github.com/AlexsJones/llmfit/issues/817)) ([c57afd3](https://github.com/AlexsJones/llmfit/commit/c57afd3e2dace008cc0fc6d5c913be25b83ba90f)), closes [#810](https://github.com/AlexsJones/llmfit/issues/810)
+* **hardware:** read true Windows VRAM from the display driver registry ([#831](https://github.com/AlexsJones/llmfit/issues/831)) ([bd7f07a](https://github.com/AlexsJones/llmfit/commit/bd7f07a554f5a17e47513a3b544f1e08a96cd25f)), closes [#830](https://github.com/AlexsJones/llmfit/issues/830)
+* **hardware:** skip legacy Intel HD GPUs ([#841](https://github.com/AlexsJones/llmfit/issues/841)) ([0943a50](https://github.com/AlexsJones/llmfit/commit/0943a505eef636f9e3c97e2ffec0705bfc0aabe2))
+* normalize llama.cpp GGUF model IDs ([#833](https://github.com/AlexsJones/llmfit/issues/833)) ([03c487d](https://github.com/AlexsJones/llmfit/commit/03c487d802754d59eb7eafc14bc69e1a4f0cc22b))
+* **plan:** grade run_paths fit_level against the machine's real memory pools ([#813](https://github.com/AlexsJones/llmfit/issues/813)) ([6e72c22](https://github.com/AlexsJones/llmfit/commit/6e72c2204f253c666d70277d20856b90bbae274e))
+* **plan:** honour CalcConfig so plan and fit agree under tuned settings ([#834](https://github.com/AlexsJones/llmfit/issues/834)) ([db72ff9](https://github.com/AlexsJones/llmfit/commit/db72ff98ab34b998f519e03e584e47b866cdeb88))
+* **plan:** route speed estimates through fit.rs so MoE models aren't 4x underestimated ([#807](https://github.com/AlexsJones/llmfit/issues/807)) ([e7683c1](https://github.com/AlexsJones/llmfit/commit/e7683c17e4cce700f86b3e7e67ffaa9a87538dcd))
+* resolve generic AMD/ATI APU identity ([#842](https://github.com/AlexsJones/llmfit/issues/842)) ([0474cd7](https://github.com/AlexsJones/llmfit/commit/0474cd7bc8a754ef38df82a04ddf6651e959c974))
+* **share:** give the declared memory tier a floor below 8 GB ([#818](https://github.com/AlexsJones/llmfit/issues/818)) ([34b050a](https://github.com/AlexsJones/llmfit/commit/34b050a9a2c4039fca07188b46fe128ac0ec4161)), closes [#816](https://github.com/AlexsJones/llmfit/issues/816)
+* **share:** strip absolute GGUF paths from the pending store model field ([#820](https://github.com/AlexsJones/llmfit/issues/820)) ([777f2c4](https://github.com/AlexsJones/llmfit/commit/777f2c48a7d036ddb6bee43fe9578b7a67c474fd))
+
+## [1.1.8](https://github.com/AlexsJones/llmfit/compare/v1.1.7...v1.1.8) (2026-08-04)
+
+
+### Features
+
+* **tui:** show per-preset benchmark counts in the hardware picker ([16663ae](https://github.com/AlexsJones/llmfit/commit/16663ae36b19e1d81ea13f51879d578ece089442))
+
+
+### Bug Fixes
+
+* **scraper:** drop catalog entries carrying credential-shaped strings ([de79d9a](https://github.com/AlexsJones/llmfit/commit/de79d9a7206504a9d0a5edc5d10f1f08b8ae2ff5))
+* **tui:** keep UI responsive while fetching the benchmark leaderboard ([6056794](https://github.com/AlexsJones/llmfit/commit/6056794baf8fa0f0348b2bc7fca4dda849f6a18d))
+
+## [1.1.7](https://github.com/AlexsJones/llmfit/compare/v1.1.6...v1.1.7) (2026-08-02)
+
+
+### Features
+
+* **cli:** add provider filter to fit ([#823](https://github.com/AlexsJones/llmfit/issues/823)) ([bb5a341](https://github.com/AlexsJones/llmfit/commit/bb5a341e525f2d73230162ea1f35a0cbe9183250))
+* detect RamaLama store models via `ramalama ls` when no server is running ([#744](https://github.com/AlexsJones/llmfit/issues/744)) ([850e809](https://github.com/AlexsJones/llmfit/commit/850e80900a583ebb07f8efeab07589dcfd444d92))
+* **tui:** mark list rows matched through a GGUF source ([#814](https://github.com/AlexsJones/llmfit/issues/814)) ([ba1db79](https://github.com/AlexsJones/llmfit/commit/ba1db7906c99046277d10e24a6f38dd12b3225e1))
+* **tui:** spell out active advanced range filters instead of cryptic R/M markers ([8aee7ce](https://github.com/AlexsJones/llmfit/commit/8aee7cefb95a24c9b5179eb9ad5a07e72b1c2141))
+
+
+### Bug Fixes
+
+* **hardware:** detect Jetson/Tegra Orin iGPU as unified memory ([#792](https://github.com/AlexsJones/llmfit/issues/792)) ([0e37d07](https://github.com/AlexsJones/llmfit/commit/0e37d07d9e7f3d9a056049b4decd8186401107ee))
+* poll LM Studio's real download status endpoint (/api/v1/models/download/status/:job_id) and correct stale docs ([f744292](https://github.com/AlexsJones/llmfit/commit/f744292f86f559acefd9d91adb435e5bd23f93b8))
+* send HF repo URLs to LM Studio downloads and parse single-object POST responses ([b7fe566](https://github.com/AlexsJones/llmfit/commit/b7fe5660739ed4a38e8ff8a68887564649b6c65f))
+
+## [1.1.6](https://github.com/AlexsJones/llmfit/compare/v1.1.5...v1.1.6) (2026-07-21)
+
+
+### Features
+
+* **tui:** [SIMULATED] GPU indicator and / search in the community leaderboard ([7584ce8](https://github.com/AlexsJones/llmfit/commit/7584ce803539dba79c8cb640079ee5bb26490420))
+* **tui:** [SIMULATED] GPU indicator and / search in the community leaderboard ([c3bcb14](https://github.com/AlexsJones/llmfit/commit/c3bcb1414543fbffe06ea67669de76491da3c548))
+
+
+### Bug Fixes
+
+* **tui:** let plan-mode text fields accept q/j/k instead of treating them as bindings ([7b8491f](https://github.com/AlexsJones/llmfit/commit/7b8491f6d6c3c2238dcb0ddda4bcf798a2f13b2a)), closes [#781](https://github.com/AlexsJones/llmfit/issues/781)
+* **tui:** plan-mode text fields no longer treat q/j/k as bindings ([cac6b58](https://github.com/AlexsJones/llmfit/commit/cac6b5894670ecfb9f1d9b5b0c1e9d69c32e88f6))
+
+## [1.1.5](https://github.com/AlexsJones/llmfit/compare/v1.1.4...v1.1.5) (2026-07-20)
+
+
+### Bug Fixes
+
+* don't offer MLX downloads for AWQ/GPTQ repos; verify the mlx-community fallback exists before pulling ([1cc50ff](https://github.com/AlexsJones/llmfit/commit/1cc50ffc122c8d77eeb85916884005b29daef4a1))
+* **providers,tui:** stop offering MLX downloads for AWQ/GPTQ repos and verify the mlx-community fallback exists ([e36d832](https://github.com/AlexsJones/llmfit/commit/e36d8325b873c68d8cd2f2d35765cca157e6ba26)), closes [#294](https://github.com/AlexsJones/llmfit/issues/294)
+
+## [1.1.4](https://github.com/AlexsJones/llmfit/compare/v1.1.3...v1.1.4) (2026-07-19)
+
+
+### Features
+
+* **api:** expose usable_context and effective_context_length in the models envelope ([086def6](https://github.com/AlexsJones/llmfit/commit/086def6858a654bcad13ad2cd151b5b0690e2e34))
+* **api:** unify fit envelope serializers, exposing parity fields on REST/MCP ([2fb0a1c](https://github.com/AlexsJones/llmfit/commit/2fb0a1ca958286bfa28d56b2f1f9be5521857844))
+* **api:** unify fit envelope serializers, exposing parity fields on REST/MCP ([c6bdccc](https://github.com/AlexsJones/llmfit/commit/c6bdccc2cb501ea63ad9936d3281c4e6237ab609))
+* **cli:** expose usable_context and effective_context_length in JSON ([edcd6ef](https://github.com/AlexsJones/llmfit/commit/edcd6efebe0315d44b98753483c94a28f718c552))
+* **core:** report macOS GPU-available unified memory ([2e845e7](https://github.com/AlexsJones/llmfit/commit/2e845e73ffc5564214be4d4deac690f855af098a))
+* **core:** report macOS GPU-available unified memory ([f082483](https://github.com/AlexsJones/llmfit/commit/f082483c77e58c2015b7de303c7c4c88d7cf0627))
+
+
+### Bug Fixes
+
+* **ci:** list Cargo.lock/Cargo.toml separately in workflow path filters ([1af2174](https://github.com/AlexsJones/llmfit/commit/1af21740a95fca88cd8ebcad3342cfde868324db))
+* **ci:** list Cargo.lock/Cargo.toml separately in workflow path filters ([6d1cb1c](https://github.com/AlexsJones/llmfit/commit/6d1cb1cf3684d5c96ba4d6c71026aa00366c9e10))
+* **core:** clamp GPU-available display to the shared pool ([7d188b5](https://github.com/AlexsJones/llmfit/commit/7d188b5683b6f3de524d5a4af4771caee80293b2))
+* **core:** clear gpu_available_gb on overrides; drop redundant sysctl check ([c67a4eb](https://github.com/AlexsJones/llmfit/commit/c67a4eb4357e7f1054881c216b7e90af47839cdb))
+* **tui:** force a full clear after entering the alternate screen ([34df3dc](https://github.com/AlexsJones/llmfit/commit/34df3dc6ff1377108bb6892fca5e69fc384a59c1))
+* **tui:** force a full clear after entering the alternate screen ([ebf045c](https://github.com/AlexsJones/llmfit/commit/ebf045cf5ddb40b1d13a3689f41b376c45de6fc4)), closes [#732](https://github.com/AlexsJones/llmfit/issues/732)
+
+## [1.1.3](https://github.com/AlexsJones/llmfit/compare/v1.1.2...v1.1.3) (2026-07-14)
+
+
+### Features
+
+* add NCAI VAETKI model to curated model database ([bdbf338](https://github.com/AlexsJones/llmfit/commit/bdbf338010ebeac9d5797beb42993b8c31845bcd))
+* add RamaLama as a detection provider ([5bef0b2](https://github.com/AlexsJones/llmfit/commit/5bef0b2e49920acee70a354e802f8656097106fb))
+
+
+### Bug Fixes
+
+* **hardware:** read discrete Intel Arc VRAM from sysfs (xe/i915) ([9bbaa8d](https://github.com/AlexsJones/llmfit/commit/9bbaa8d0542ab2e5ad4ee5691e95b6ddf37667d6))
+* **hardware:** read discrete Intel Arc VRAM from sysfs (xe/i915) ([9fbbcb8](https://github.com/AlexsJones/llmfit/commit/9fbbcb8312e6989d7b35f7ae24c7b36562ccce68)), closes [#609](https://github.com/AlexsJones/llmfit/issues/609)
+* match Unsloth `-UD` dynamic GGUFs to catalog models ([b3de39d](https://github.com/AlexsJones/llmfit/commit/b3de39dac4339df45f4ddff9ac71a6dbbf9fdc10))
+* match Unsloth `-UD` dynamic GGUFs to catalog models ([e9b66be](https://github.com/AlexsJones/llmfit/commit/e9b66be1506095fbd905fbe3d9b9c2d1c13a7f03))
+* name AMD unified APUs when rocm-smi reports "N/A", gate junk shares ([ba96f4c](https://github.com/AlexsJones/llmfit/commit/ba96f4c3cbdb6e1cc2dcbb8db7f390e625b02193))
+* name AMD unified APUs when rocm-smi reports "N/A", gate junk shares ([e282011](https://github.com/AlexsJones/llmfit/commit/e282011f58bf0582ad606a907d51c9b743ea0b6e))
+* **providers:** detect oMLX as an MLX runtime ([f649952](https://github.com/AlexsJones/llmfit/commit/f649952c39028dd2da06c3461efe8b43b9fdbe3b))
+* **providers:** show LM Studio/Docker Desktop as installed when idle ([bca491e](https://github.com/AlexsJones/llmfit/commit/bca491e380fbeb37719a80b6f2f94838750078b9))
+* **providers:** show LM Studio/Docker Desktop as installed when idle ([5a22add](https://github.com/AlexsJones/llmfit/commit/5a22add2266e9079e6853f187de1fff3904ff6b1)), closes [#731](https://github.com/AlexsJones/llmfit/issues/731)
+* **serve:** include per-GPU memory_bandwidth_gbps in /api/v1/system ([ce3f7bf](https://github.com/AlexsJones/llmfit/commit/ce3f7bfcccd56567a1c5b75c5770347d1acd668b))
+* **serve:** include per-GPU memory_bandwidth_gbps in /api/v1/system ([8b9b7aa](https://github.com/AlexsJones/llmfit/commit/8b9b7aa3c2cbf05028cfbd44a636d512bb87e687)), closes [#747](https://github.com/AlexsJones/llmfit/issues/747)
+
+## [1.1.2](https://github.com/AlexsJones/llmfit/compare/v1.1.1...v1.1.2) (2026-07-10)
+
+
+### Features
+
+* **share:** ship the registered OAuth App client id — interactive login enabled ([a94ffcb](https://github.com/AlexsJones/llmfit/commit/a94ffcbe9412f0974224c87290ae01f89d01e009))
+* **share:** ship the registered OAuth App client id — interactive login enabled ([325f8a3](https://github.com/AlexsJones/llmfit/commit/325f8a3ff34adf0772990335e93f1efad212d735))
+
+## [1.1.1](https://github.com/AlexsJones/llmfit/compare/v1.1.0...v1.1.1) (2026-07-10)
+
+
+### Features
+
+* **bench:** ship merged community benchmarks to every user in the next release ([f2fd476](https://github.com/AlexsJones/llmfit/commit/f2fd47672ff1b81bacdba3169e163f235a32070a))
+* **bench:** ship merged community benchmarks to every user in the next release ([5c46f92](https://github.com/AlexsJones/llmfit/commit/5c46f92a2411edbfa7a829cc0e4c92f355189d76))
+
+## [1.1.0](https://github.com/AlexsJones/llmfit/compare/v1.0.1...v1.1.0) (2026-07-10)
+
+
+### Features
+
+* bench --share — contribute benchmarks as PRs without the gh CLI (RFC [#710](https://github.com/AlexsJones/llmfit/issues/710)) ([5114694](https://github.com/AlexsJones/llmfit/commit/51146943d75d09faeb7cc7412f32984638679ee7))
+* **bench:** add --share to contribute benchmarks via PR without gh CLI ([721eb66](https://github.com/AlexsJones/llmfit/commit/721eb666ab4c0fc15e3ea75a510aacb127d04a5d))
+* **bench:** detect llama-server as a first-class provider ([6dc367b](https://github.com/AlexsJones/llmfit/commit/6dc367be97329be00301a8aeeb63fc753d0c9ac2))
+* **bench:** local benchmark store — save runs, share the backlog later ([0e22a75](https://github.com/AlexsJones/llmfit/commit/0e22a75abc2da4da0f8c51797f79f391fc74cd3c))
+* **bench:** local store follow-ups — share backlog, dedup PRs, local-measurement overrides + calibration ([390cbf1](https://github.com/AlexsJones/llmfit/commit/390cbf1c6726580c308cc9113df0eede7ae7dba1))
+* **fit:** local benchmark runs override estimated tok/s ([274c048](https://github.com/AlexsJones/llmfit/commit/274c048bc3366bc74851128062cce27e81287d88))
+* **fit:** purge test-stub catalog entries; calibrate estimates from local benchmarks ([fb049c2](https://github.com/AlexsJones/llmfit/commit/fb049c210c13f65c0d77ac8da0ce50aec7c0b332))
+* **share:** reuse open benchmark PR and make submissions idempotent ([52f3afb](https://github.com/AlexsJones/llmfit/commit/52f3afb10b6fb521d880bae896cae15b117d9c69))
+* **tui:** expose installed/GGUF availability filter in the Filter modal ([dd940d5](https://github.com/AlexsJones/llmfit/commit/dd940d5288980c8ee9cac5724d4a75318d4be9d3))
+* **tui:** filter by installed models in the Filter modal ([75f4f1e](https://github.com/AlexsJones/llmfit/commit/75f4f1ec773435288b59ff83e699091bef253820))
+* **tui:** offer to benchmark the selected model on entering leaderboard ([61f6a47](https://github.com/AlexsJones/llmfit/commit/61f6a4705c5b72e0838aa957ef4507efde86bfaa))
+
+
+### Bug Fixes
+
+* **data:** verify GGUF source provenance; unlink wrong-model quants ([63b2d3a](https://github.com/AlexsJones/llmfit/commit/63b2d3aada13d87b276666497074c8c816d8805b))
+* **providers:** stop marking whole model families as installed for llama.cpp ([f839633](https://github.com/AlexsJones/llmfit/commit/f8396335b0fe748555e0764f0386ab7e17fac73e))
+* **tests:** pin GitHub-credential state in bench-offer toggle test ([618ba16](https://github.com/AlexsJones/llmfit/commit/618ba162a146b623711202264a3405695be1a037))
+* **tests:** pin GitHub-credential state in bench-offer toggle test ([fb5caff](https://github.com/AlexsJones/llmfit/commit/fb5caffc371907d53578c1919bf6ffa5a1616b11))
+
+## [1.0.1](https://github.com/AlexsJones/llmfit/compare/v1.0.0...v1.0.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* bump internal llmfit-core version requirement to 1.0.0 ([7274a45](https://github.com/AlexsJones/llmfit/commit/7274a450a04107b3272cf958a5f20e18a516a406))
+
+## [1.0.0](https://github.com/AlexsJones/llmfit/compare/v0.9.38...v1.0.0) (2026-07-09)
+
+
+### Features
+
+* add global --tui flag to force interactive TUI ([749b22f](https://github.com/AlexsJones/llmfit/commit/749b22fcd30d72fb2c57a1b1c91af3d834c68c3f))
+* add global --tui flag to force interactive TUI ([#547](https://github.com/AlexsJones/llmfit/issues/547)) ([f0146b1](https://github.com/AlexsJones/llmfit/commit/f0146b1b4e3d1233fe9a3dc4dcbcc84f5aa6ca83))
+* add model language metadata ([784af4d](https://github.com/AlexsJones/llmfit/commit/784af4d8c17c6c16762c0ca9fb1f0a19072916a3))
+* add TTS model discovery ([40a69f6](https://github.com/AlexsJones/llmfit/commit/40a69f62697a5d92af38f8f24d337b3b2eac648f))
+* auto-detect system RAM bandwidth for MoE-offload estimates ([c10f567](https://github.com/AlexsJones/llmfit/commit/c10f567a7c355e5d52586a44d778b7553fed2bfd))
+* auto-detect system RAM bandwidth for MoE-offload estimates ([f469543](https://github.com/AlexsJones/llmfit/commit/f469543c9c13b762748af20c60ec9fb9ea971c3d))
+* discover TTS language metadata in scraper ([74cd130](https://github.com/AlexsJones/llmfit/commit/74cd1306197000a8573cb102a51e4ca47262d923))
+* estimate basis + measured tok/s provenance ([#292](https://github.com/AlexsJones/llmfit/issues/292)) ([93f6806](https://github.com/AlexsJones/llmfit/commit/93f6806fb0cd50fec555ab0166acc71f1d483231))
+* expose estimate basis and local verification commands ([#292](https://github.com/AlexsJones/llmfit/issues/292)) ([af54caf](https://github.com/AlexsJones/llmfit/commit/af54caf3a35c85f394df2c22ba26c9c6b6b5a98c))
+* pin Huihui-Qwen3.6-35B-A3B-abliterated and add GGUF source ([d048900](https://github.com/AlexsJones/llmfit/commit/d048900953dc4196a5bf59a4af692558cb5cc282))
+* pin Huihui-Qwen3.6-35B-A3B-abliterated and add GGUF source ([#656](https://github.com/AlexsJones/llmfit/issues/656)) ([e0a5654](https://github.com/AlexsJones/llmfit/commit/e0a56545387b05f4f966a0e8e5d07c0c66a14276))
+* surface community-measured tok/s when hardware matches benchmark data ([34eca7e](https://github.com/AlexsJones/llmfit/commit/34eca7e8432c42ccf0fb20a36b1e839f827dfb80))
+* surface community-measured tok/s when hardware matches benchmark data ([730cc5d](https://github.com/AlexsJones/llmfit/commit/730cc5d1e404a672671c9d2633866d1557c38002))
+
+
+### Bug Fixes
+
+* harden AMD sysfs GPU detection against silent card drops ([#303](https://github.com/AlexsJones/llmfit/issues/303), [#638](https://github.com/AlexsJones/llmfit/issues/638)) ([84a6cfa](https://github.com/AlexsJones/llmfit/commit/84a6cfa7c430906d77b8803fec28e5c362461a3c))
+* harden AMD sysfs GPU detection against silent card drops ([#303](https://github.com/AlexsJones/llmfit/issues/303), [#638](https://github.com/AlexsJones/llmfit/issues/638)) ([4dc94ca](https://github.com/AlexsJones/llmfit/commit/4dc94ca3fca3601dcbf040128ae4ed9b699875e3))
+* keep text generation discovery budget ([5b55e2c](https://github.com/AlexsJones/llmfit/commit/5b55e2c5710f28b2ff79e9cde4ba4f94df6f9fd2))
+* mark TTS models as unsupported runtime ([5ca524e](https://github.com/AlexsJones/llmfit/commit/5ca524e6ea8a23d93c4a130971f99f837c82226d))
+* **ollama:** don't mark cloud models as locally installed (closes [#619](https://github.com/AlexsJones/llmfit/issues/619)) ([580afee](https://github.com/AlexsJones/llmfit/commit/580afee47da41837d27f51cadfba99e1cbed4022))
+* preserve popularity metadata through scraper merge and discovery ([b2b35d6](https://github.com/AlexsJones/llmfit/commit/b2b35d60d15e93953e73061a336ad0368c04572c))
+* resolve [#171](https://github.com/AlexsJones/llmfit/issues/171) — Include ONNX models. ([9939e67](https://github.com/AlexsJones/llmfit/commit/9939e67b309b24252e1838bdc231d3a1d0885704))
+* support TTS catalog metadata ([c98b3d5](https://github.com/AlexsJones/llmfit/commit/c98b3d5fa72418b65a1e84c5cb5d1eb8a310b857))
+* use cross-platform which crate for binary detection in TUI ([55d77ec](https://github.com/AlexsJones/llmfit/commit/55d77ecd0f66f670641ead6da19ffd8fec2bcf3c))
+* use cross-platform which crate for binary detection in TUI ([d450daa](https://github.com/AlexsJones/llmfit/commit/d450daac08313145687d366d1cc6dc4db57046fe))
+* wire onnx catalog into model database ([f2e7dba](https://github.com/AlexsJones/llmfit/commit/f2e7dbafce1aba08e76d18494c1e556141ac2a13))
+
+
+### Miscellaneous Chores
+
+* cut 1.0.0 ([21ebc84](https://github.com/AlexsJones/llmfit/commit/21ebc847dede0eb05b214296c075d8d2f21c51c5))
+
+## [0.9.38](https://github.com/AlexsJones/llmfit/compare/v0.9.37...v0.9.38) (2026-07-04)
+
+
+### Bug Fixes
+
+* **docker:** drop COPY of removed root data/ directory ([a4445c7](https://github.com/AlexsJones/llmfit/commit/a4445c70885ee399a5b8e39b4ded938a09230064))
+* **docker:** drop COPY of removed root data/ directory ([5bb514d](https://github.com/AlexsJones/llmfit/commit/5bb514d130964311617269b0cffd4663a31522e3))
+
+## [0.9.37](https://github.com/AlexsJones/llmfit/compare/v0.9.36...v0.9.37) (2026-07-03)
+
+
+### Features
+
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit ([#112](https://github.com/AlexsJones/llmfit/issues/112)/[#119](https://github.com/AlexsJones/llmfit/issues/119)) ([5548723](https://github.com/AlexsJones/llmfit/commit/55487236685fde60a2be09580fe892daeb6a9b8b))
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit against measured data ([6c40dcf](https://github.com/AlexsJones/llmfit/commit/6c40dcf3127ada85a47cb4023c41fee28d33ec3e))
+* **claim:** JSON output for programmatic consumers (llmfit-dra M0) ([f469c22](https://github.com/AlexsJones/llmfit/commit/f469c22cb48cc8e15b33119cd7cf166474ab50a7))
+* **claim:** machine-readable JSON output via the global --json flag ([1636e51](https://github.com/AlexsJones/llmfit/commit/1636e51bb8b452b6c9ab8e47f38e0ac764f25f2f))
+
+
+### Bug Fixes
+
+* **calibration:** exclude speculative-decoding/MTP runs from the accuracy audit ([1c058aa](https://github.com/AlexsJones/llmfit/commit/1c058aa22bd57456487a15aa618155fd1340ef26))
+
+## [0.9.36](https://github.com/AlexsJones/llmfit/compare/v0.9.35...v0.9.36) (2026-07-03)
+
+
+### Features
+
+* add 'llmfit doctor' hardware diagnostic report for bug reports ([53663bc](https://github.com/AlexsJones/llmfit/commit/53663bcb9935d79c6f959b357d99d622d6cbcef1))
+* add `llmfit doctor` hardware diagnostic report ([bcd7dc0](https://github.com/AlexsJones/llmfit/commit/bcd7dc0c89b48909cfdd0ce20813bd58a2e84aeb))
+* add issue templates for bug reports ([bab1fe9](https://github.com/AlexsJones/llmfit/commit/bab1fe9166a037aac1e3d4da10484e0f91812bc1))
+* request 'llmfit doctor' output in the bug report template ([b4069d9](https://github.com/AlexsJones/llmfit/commit/b4069d927b9f7d271664d9e24324b3fe5716fa29))
+* **scoring:** benchmark-informed task alignment per use case ([ce6d37e](https://github.com/AlexsJones/llmfit/commit/ce6d37e034b3978e687a00589ac7ce10e81ae7e9))
+* **scoring:** benchmark-informed task alignment per use case (issue [#150](https://github.com/AlexsJones/llmfit/issues/150)) ([c994615](https://github.com/AlexsJones/llmfit/commit/c994615357f1b2577ba5096d7d176cf928f27a56))
+* serve over a Unix domain socket (--unix-socket) ([de62c2b](https://github.com/AlexsJones/llmfit/commit/de62c2bc7e2af432771e0036b35e5fb76a50ed7e))
+* serve over a Unix domain socket (--unix-socket) ([03d6ca5](https://github.com/AlexsJones/llmfit/commit/03d6ca5170df4f924b3bf24e94f27035fa26bb6a))
+* show usable context per model (native→achievable) in TUI, CLI, and JSON ([e33a3a3](https://github.com/AlexsJones/llmfit/commit/e33a3a31be5a7a7b3953c4f33a02732c1790353c)), closes [#621](https://github.com/AlexsJones/llmfit/issues/621)
+* usable-context display — native→achievable (closes [#621](https://github.com/AlexsJones/llmfit/issues/621)) ([1706929](https://github.com/AlexsJones/llmfit/commit/1706929ea367fd137117173f56827640bc04404c))
+* user-local custom model overlay (closes [#451](https://github.com/AlexsJones/llmfit/issues/451)) ([decef82](https://github.com/AlexsJones/llmfit/commit/decef827b3785df9a5c785b49ed128f98d5c3aaa))
+* user-local custom model overlay (custom_models.json) ([e55c8de](https://github.com/AlexsJones/llmfit/commit/e55c8dec388a1788b6093e0ef4c1091149cfe3d9)), closes [#451](https://github.com/AlexsJones/llmfit/issues/451)
+
+
+### Bug Fixes
+
+* guard optional attribute lookups in generated claim CEL ([c6f481f](https://github.com/AlexsJones/llmfit/commit/c6f481f27557d3e0fd6fc584fd1b1fa008ff95a4))
+* guard optional attribute lookups in generated claim CEL ([a6f3c6a](https://github.com/AlexsJones/llmfit/commit/a6f3c6a6bc11e3a4c141dc7e0c3891263958a712))
+* **hardware:** correct Intel GPU detection — iGPUs get the unified RAM pool, dGPUs get Vulkan VRAM ([4834767](https://github.com/AlexsJones/llmfit/commit/4834767462a7ac939ddb0306796e9661913f8310))
+* **hardware:** detect generic-named MI50-class accelerators (issue [#638](https://github.com/AlexsJones/llmfit/issues/638)) ([180f484](https://github.com/AlexsJones/llmfit/commit/180f4844630e4ca08e8971482a615564d5be64f8))
+* **hardware:** don't drop large-VRAM AMD accelerators with generic ROCm names ([bf16eb8](https://github.com/AlexsJones/llmfit/commit/bf16eb8e87b31e1c0f5c6154e82f7b8967d54085))
+* **hardware:** Intel iGPU unified-memory pool + discrete Arc VRAM via Vulkan (issue [#609](https://github.com/AlexsJones/llmfit/issues/609)) ([a120aa3](https://github.com/AlexsJones/llmfit/commit/a120aa38d9410b2d874bbe7c70653b4f2c1920b7))
+* **schema:** add 'audio' to capability enum ([a812232](https://github.com/AlexsJones/llmfit/commit/a812232f0eb02dc66544e508fe6e5e587acbd1f0))
+
+## [0.9.35](https://github.com/AlexsJones/llmfit/compare/v0.9.34...v0.9.35) (2026-07-02)
+
+
+### Features
+
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([08547ef](https://github.com/AlexsJones/llmfit/commit/08547efa277dd3f733ecdf72312a3376fbc2a01b))
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([3369a49](https://github.com/AlexsJones/llmfit/commit/3369a492630f357c65e2344de18b5a2e35ed4950))
+* expose GPU memory bandwidth in system JSON and add Strix Halo entries ([3bfd334](https://github.com/AlexsJones/llmfit/commit/3bfd33406b071f48fddc7fb6e99fe62e55096511))
+
+
+### Bug Fixes
+
+* reset list cursor to top when the search query changes ([5e4dc7b](https://github.com/AlexsJones/llmfit/commit/5e4dc7b1e578c5a2366a8f7b94220d68178e2fae))
+* reset list cursor to top when the search query changes ([43884f5](https://github.com/AlexsJones/llmfit/commit/43884f500a9b392b03bc2d2bc539ba6430d954fd)), closes [#657](https://github.com/AlexsJones/llmfit/issues/657)
+
+## [0.9.34](https://github.com/AlexsJones/llmfit/compare/v0.9.33...v0.9.34) (2026-06-28)
+
+
+### Bug Fixes
+
+* pin Docker builder to bookworm to match runtime glibc ([f13a633](https://github.com/AlexsJones/llmfit/commit/f13a6332e62713b22bf96b7a26b551f43caed831))
+* pin Docker builder to bookworm to match runtime glibc ([48caf17](https://github.com/AlexsJones/llmfit/commit/48caf178baaf7e7c0f81bfd30f4972b404528cf7)), closes [#655](https://github.com/AlexsJones/llmfit/issues/655)
+
+## [0.9.33](https://github.com/AlexsJones/llmfit/compare/v0.9.32...v0.9.33) (2026-06-23)
+
+
+### Bug Fixes
+
+* **docker:** bump builder image to rust 1.95 (sysinfo MSRV) ([b63a142](https://github.com/AlexsJones/llmfit/commit/b63a14244d93fb1fdd50b2f49c96abaac872b977))
+* **docker:** bump builder image to rust 1.95 (sysinfo MSRV) ([b943f3a](https://github.com/AlexsJones/llmfit/commit/b943f3a84a63e77a740acacd38a09c69774dda8c))
+
+## [0.9.32](https://github.com/AlexsJones/llmfit/compare/v0.9.31...v0.9.32) (2026-06-23)
+
+
+### Features
+
+* add NCAI VAETKI models to curated model database ([b3c04a8](https://github.com/AlexsJones/llmfit/commit/b3c04a82055875b27a8808131df8f41e544ca759))
+* **analysis:** add InstalledIndex and build_model_fits to consolidate provider detection ([33dce8b](https://github.com/AlexsJones/llmfit/commit/33dce8bbb9f8a527c48fec07152fa2c3a0983784))
+* **data:** add Whisper/ASR model entries + audio support roadmap ([27bae48](https://github.com/AlexsJones/llmfit/commit/27bae4878f798c7069f936de6fa9ed5b1dcc3312))
+* **python:** add riscv64 wheel build ([e12bb85](https://github.com/AlexsJones/llmfit/commit/e12bb85abdd752e632930c3086a4afc935e9a4a6))
+* **python:** add riscv64 wheel build ([cb377f4](https://github.com/AlexsJones/llmfit/commit/cb377f45595b745d7bf0963ab1c86b807c210b01))
+
+
+### Bug Fixes
+
+* bundle WebView2 bootstrapper for Windows desktop app ([c72103b](https://github.com/AlexsJones/llmfit/commit/c72103b784134b8cc66725d4e8e9c36b0d01e64d))
+* **fit:** CPU-only models that fit with headroom reach Good, not Marginal ([aad4c37](https://github.com/AlexsJones/llmfit/commit/aad4c373285e328bcbab72577ee49d62cca1515d))
+* **fit:** CPU-only models that fit with headroom reach Good, not Marginal ([0ced1b7](https://github.com/AlexsJones/llmfit/commit/0ced1b775cb39f783cabf4411d25e1e1aa188015))
+* **hardware:** detect all GPUs across sysfs, ROCm tabular, and fit pool ([0989ca2](https://github.com/AlexsJones/llmfit/commit/0989ca2dc443f782cf34cec709e989c23f234178))
+* **hardware:** ROCm tabular multi-GPU parsing + summed fit VRAM pool ([4e27617](https://github.com/AlexsJones/llmfit/commit/4e27617baaeaf1902131f59c71763de360ef6837))
+* **scoring:** MoE active-param quality, recency bonus, smooth fit curve ([c499c00](https://github.com/AlexsJones/llmfit/commit/c499c000948cb620564d9c8433df5b8b5d36880d))
+* **scoring:** MoE active-param quality, recency bonus, smooth fit curve ([2db3e55](https://github.com/AlexsJones/llmfit/commit/2db3e552ad637437589e692bf91bc9ca69350925))
+* **scoring:** treat headroom as a perfect fit (one-sided fit curve) ([235be33](https://github.com/AlexsJones/llmfit/commit/235be33b1d8ada30693f72b48b48d50bd48df5a9))
+* **tui:** make provider filter input cursor-aware and ASCII-only ([933644e](https://github.com/AlexsJones/llmfit/commit/933644e4d1a80969cb7bfc1c5386423291a50132))
+
+
+### Performance Improvements
+
+* **analysis:** parallelize provider detection in detect_all with thread::scope ([d0660bc](https://github.com/AlexsJones/llmfit/commit/d0660bc72e601a7707caabb2f4e042a0701c491e))
+
 ## [0.9.31](https://github.com/AlexsJones/llmfit/compare/v0.9.30...v0.9.31) (2026-06-09)
 
 

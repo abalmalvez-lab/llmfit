@@ -12,13 +12,50 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::models::{LlmModel, ModelFormat};
+use crate::models::{Capability, LlmModel, ModelFormat};
 
 const HF_API: &str = "https://huggingface.co/api/models";
 
 /// Bump this when the `LlmModel` schema changes in a breaking way.
 /// A cache written by an older version will be discarded and re-fetched.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
+
+const ACCEPTED_PIPELINES: &[&str] = &[
+    "text-generation",
+    "image-text-to-text",
+    "any-to-any",
+    "text-to-speech",
+];
+const PRIMARY_UPDATE_PIPELINE: &str = "text-generation";
+
+/// Properties requested from the Hub's model-list endpoint.
+///
+/// `expand[]` switches that endpoint into projection mode: the response then
+/// carries `id`, `_id`, the sort key, and *only* the properties named here.
+/// Everything else is omitted rather than empty, so this list has to name
+/// every field `HfApiModel` reads or those fields silently deserialize as
+/// absent. Requesting `gguf` alone dropped `pipeline_tag` and `tags`, which
+/// made `is_accepted_pipeline()` reject every entry and cache nothing.
+///
+/// `license` is deliberately absent: it is not an expandable property (the
+/// API rejects it), and `map_to_llm_model()` already recovers it from the
+/// `license:` prefix in `tags`.
+const HF_LIST_EXPAND: &[&str] = &[
+    "pipeline_tag",
+    "tags",
+    "author",
+    "createdAt",
+    "safetensors",
+    "gguf",
+];
+
+fn pipeline_query_limit(limit: usize, pipeline: &str) -> usize {
+    if pipeline == PRIMARY_UPDATE_PIPELINE {
+        limit
+    } else {
+        (limit / ACCEPTED_PIPELINES.len()).max(1)
+    }
+}
 
 // ── Cache helpers ─────────────────────────────────────────────────────────────
 
@@ -235,7 +272,9 @@ fn infer_use_case(model_id: &str, tags: &[String]) -> String {
         model_id.to_lowercase(),
         tags.join(" ").to_lowercase()
     );
-    if lower.contains("embed") || lower.contains("bge") || lower.contains("-e5-") {
+    if lower.contains("text-to-speech") {
+        "Text-to-speech".to_string()
+    } else if lower.contains("embed") || lower.contains("bge") || lower.contains("-e5-") {
         "Embedding".to_string()
     } else if lower.contains("code") || lower.contains("starcoder") || lower.contains("coder") {
         "Code generation".to_string()
@@ -256,6 +295,59 @@ fn infer_use_case(model_id: &str, tags: &[String]) -> String {
     } else {
         "General text generation".to_string()
     }
+}
+
+fn infer_capabilities(pipeline_tag: Option<&str>, use_case: &str) -> Vec<Capability> {
+    if pipeline_tag == Some("text-to-speech") || use_case.eq_ignore_ascii_case("text-to-speech") {
+        vec![Capability::Audio, Capability::Tts]
+    } else {
+        vec![]
+    }
+}
+
+fn normalize_language(value: &str) -> Option<String> {
+    let mut lang = value.trim().to_lowercase().replace('_', "-");
+    let mut prefixed = false;
+    for prefix in ["language:", "languages:", "lang:"] {
+        if let Some(stripped) = lang.strip_prefix(prefix) {
+            lang = stripped.to_string();
+            prefixed = true;
+            break;
+        }
+    }
+
+    let mut parts = lang.split('-');
+    let Some(primary) = parts.next() else {
+        return None;
+    };
+    if !primary.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if primary.len() == 3 && !prefixed {
+        return None;
+    }
+    if primary.len() != 2 && primary.len() != 3 {
+        return None;
+    }
+    if parts.all(|part| {
+        (2..=8).contains(&part.len()) && part.chars().all(|c| c.is_ascii_alphanumeric())
+    }) {
+        Some(lang)
+    } else {
+        None
+    }
+}
+
+fn infer_languages(tags: &[String]) -> Vec<String> {
+    let mut languages = Vec::new();
+    for tag in tags {
+        if let Some(lang) = normalize_language(tag)
+            && !languages.contains(&lang)
+        {
+            languages.push(lang);
+        }
+    }
+    languages
 }
 
 // ── Context-length inference ──────────────────────────────────────────────────
@@ -346,6 +438,25 @@ struct HfConfig {
     n_routed_experts: Option<u32>,
     #[serde(default)]
     num_local_experts: Option<u32>,
+    // Untyped: some configs give one count per modality (`[64, 64]`).
+    #[serde(default)]
+    num_experts: Option<serde_json::Value>,
+    #[serde(default)]
+    moe_num_experts: Option<serde_json::Value>,
+    #[serde(default)]
+    num_experts_per_tok: Option<serde_json::Value>,
+    #[serde(default)]
+    num_experts_per_token: Option<serde_json::Value>,
+    #[serde(default)]
+    top_k_experts: Option<serde_json::Value>,
+    #[serde(default)]
+    moe_top_k: Option<serde_json::Value>,
+    // Context window. `rope_scaling` stays untyped because its shape varies
+    // by rope type and a mismatch must not fail the whole config parse.
+    #[serde(default)]
+    max_position_embeddings: Option<u64>,
+    #[serde(default)]
+    rope_scaling: Option<serde_json::Value>,
     // Nested config (Qwen3.5 vision+text models store LLM params under text_config)
     #[serde(default)]
     text_config: Option<Box<HfConfig>>,
@@ -375,6 +486,108 @@ fn fetch_hf_config(repo_id: &str, token: Option<&str>) -> Option<HfConfig> {
     resp.into_body().read_json::<HfConfig>().ok()
 }
 
+/// Resolve the context window from a config, checking the top level and then
+/// `text_config`. Mirrors `infer_context_length()` in
+/// `scripts/scrape_hf_models.py`: when `rope_scaling` names
+/// `original_max_position_embeddings`, `max_position_embeddings` is already
+/// the scaled window; otherwise a `factor` scales the stated window. `llama3`
+/// scaling never changes it: the stated window is the trained context.
+fn resolve_context_length(cfg: &HfConfig) -> Option<u32> {
+    let sources = [Some(cfg), cfg.text_config.as_deref()];
+    for src in sources.into_iter().flatten() {
+        let Some(stated) = src.max_position_embeddings.filter(|v| *v > 0) else {
+            continue;
+        };
+        let rope = src.rope_scaling.as_ref();
+        let factor = rope
+            .and_then(|r| r.get("factor"))
+            .and_then(|f| f.as_f64())
+            .filter(|f| *f > 1.0);
+        let original = rope
+            .and_then(|r| r.get("original_max_position_embeddings"))
+            .and_then(|o| o.as_u64())
+            .filter(|o| *o > 0);
+        let llama3 = rope
+            .and_then(|r| r.get("rope_type").or_else(|| r.get("type")))
+            .and_then(|t| t.as_str())
+            == Some("llama3");
+        let effective = match (factor, original) {
+            _ if llama3 => stated,
+            (Some(f), Some(o)) => stated.max((o as f64 * f) as u64),
+            (Some(f), None) => (stated as f64 * f) as u64,
+            _ => stated,
+        };
+        return Some(u32::try_from(effective).unwrap_or(u32::MAX));
+    }
+    None
+}
+
+/// A positive count, or the first entry of a per-modality list of counts.
+fn positive_count(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = value?;
+    let value = value.as_array().map_or(Some(value), |list| list.first())?;
+    value
+        .as_u64()
+        .filter(|n| *n > 0)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+impl HfConfig {
+    fn expert_count(&self) -> Option<u32> {
+        self.num_local_experts
+            .filter(|n| *n > 0)
+            .or_else(|| positive_count(self.num_experts.as_ref()))
+            .or(self.n_routed_experts.filter(|n| *n > 0))
+            .or_else(|| positive_count(self.moe_num_experts.as_ref()))
+    }
+
+    fn active_expert_count(&self) -> Option<u32> {
+        [
+            &self.num_experts_per_tok,
+            &self.num_experts_per_token,
+            &self.top_k_experts,
+            &self.moe_top_k,
+        ]
+        .into_iter()
+        .find_map(|v| positive_count(v.as_ref()))
+    }
+}
+
+/// MoE fields for a model, from config.json's expert counts (top level, then
+/// `text_config`), falling back to what the name says when the config does
+/// not declare them. Same detection and active-parameter estimate as
+/// `scripts/scrape_hf_models.py`, which reads the config first too.
+///
+/// The config wins even when the name already marks the model as MoE: a name
+/// like `Llama-4-Scout-17B-16E` gives the expert count but not how many
+/// experts run per token (one for Llama 4, not the name rule's two).
+fn moe_from_config(
+    from_name: (bool, Option<u32>, Option<u32>, Option<u64>),
+    cfg: Option<&HfConfig>,
+    total_params: Option<u64>,
+) -> (bool, Option<u32>, Option<u32>, Option<u64>) {
+    let Some(cfg) = cfg else {
+        return from_name;
+    };
+    let sources = [Some(cfg), cfg.text_config.as_deref()];
+    let experts = sources.iter().flatten().find_map(|c| c.expert_count());
+    let active = sources
+        .iter()
+        .flatten()
+        .find_map(|c| c.active_expert_count());
+    let (Some(experts), Some(active)) = (experts, active) else {
+        return from_name;
+    };
+    // Expert MLPs are taken as ~95% of the weights.
+    let active_params = total_params
+        .map(|total| {
+            let shared = total / 20;
+            shared + (total - shared) / u64::from(experts) * u64::from(active)
+        })
+        .or(from_name.3);
+    (true, Some(experts), Some(active), active_params)
+}
+
 /// Resolve a `head_dim` value from a config. Prefers the explicit field,
 /// otherwise computes `hidden_size / num_attention_heads` when both are
 /// available.
@@ -392,11 +605,24 @@ fn resolve_head_dim(cfg: &HfConfig) -> Option<u32> {
 
 // ── HF API fetching ───────────────────────────────────────────────────────────
 
-fn hf_get_list(sort: &str, limit: usize, token: Option<&str>) -> Result<Vec<HfApiModel>, String> {
-    let url = format!(
-        "{}?pipeline_tag=text-generation&sort={}&limit={}&expand[]=gguf",
-        HF_API, sort, limit
-    );
+/// Build the Hub model-list URL for one pipeline, requesting every property
+/// in `HF_LIST_EXPAND`.
+fn hf_list_url(pipeline: &str, sort: &str, limit: usize) -> String {
+    let mut url = format!("{HF_API}?pipeline_tag={pipeline}&sort={sort}&limit={limit}");
+    for field in HF_LIST_EXPAND {
+        url.push_str("&expand[]=");
+        url.push_str(field);
+    }
+    url
+}
+
+fn hf_get_list_for_pipeline(
+    pipeline: &str,
+    sort: &str,
+    limit: usize,
+    token: Option<&str>,
+) -> Result<Vec<HfApiModel>, String> {
+    let url = hf_list_url(pipeline, sort, limit);
     let resp = if let Some(t) = token {
         ureq::get(&url)
             .header("Authorization", &format!("Bearer {}", t))
@@ -431,6 +657,22 @@ fn hf_get_list(sort: &str, limit: usize, token: Option<&str>) -> Result<Vec<HfAp
     }
 }
 
+/// True when a list entry can be characterised as one of the model kinds
+/// llmfit catalogues.
+///
+/// Both fields come straight from the list response, so an entry fetched
+/// without `pipeline_tag` and `tags` is always rejected here — see
+/// `HF_LIST_EXPAND`.
+fn is_accepted_pipeline(hf: &HfApiModel) -> bool {
+    hf.pipeline_tag
+        .as_deref()
+        .is_some_and(|p| ACCEPTED_PIPELINES.contains(&p))
+        || hf
+            .tags
+            .iter()
+            .any(|t| ACCEPTED_PIPELINES.contains(&t.as_str()))
+}
+
 /// Convert a raw HF API entry into an `LlmModel`.
 /// Returns `None` for models that cannot be characterised as text-generation.
 ///
@@ -439,16 +681,7 @@ fn hf_get_list(sort: &str, limit: usize, token: Option<&str>) -> Result<Vec<HfAp
 /// (`num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`,
 /// `head_dim`). The fetch is best-effort and silently degrades to `None`.
 fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
-    let accepted_pipelines = ["text-generation", "image-text-to-text", "any-to-any"];
-    let is_tg = hf
-        .pipeline_tag
-        .as_deref()
-        .is_some_and(|p| accepted_pipelines.contains(&p))
-        || hf
-            .tags
-            .iter()
-            .any(|t| accepted_pipelines.contains(&t.as_str()));
-    if !is_tg {
+    if !is_accepted_pipeline(&hf) {
         return None;
     }
 
@@ -492,12 +725,9 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
 
     let raw = params_raw.unwrap_or(7_000_000_000);
     let use_case = infer_use_case(&hf.id, &hf.tags);
-    // Prefer GGUF-reported context length (authoritative), fall back to heuristic.
-    let context_length = hf
-        .gguf
-        .as_ref()
-        .and_then(|g| g.context_length)
-        .unwrap_or_else(|| infer_context_length(&hf.id, params_raw));
+    let capabilities = infer_capabilities(hf.pipeline_tag.as_deref(), &use_case);
+    let languages = infer_languages(&hf.tags);
+    let is_tts = capabilities.contains(&Capability::Tts);
     let (min_ram, rec_ram, min_vram) = estimate_ram(raw, is_moe, active_params);
 
     let provider = hf
@@ -523,6 +753,14 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
     // the fetch returns None on failure and the precise KV formula falls
     // back to the linear approximation in that case.
     let cfg = fetch_hf_config(&hf.id, token);
+    // Prefer GGUF-reported context length (authoritative), then the window
+    // config.json declares, and only then the name-based heuristic.
+    let context_length = hf
+        .gguf
+        .as_ref()
+        .and_then(|g| g.context_length)
+        .or_else(|| cfg.as_ref().and_then(resolve_context_length))
+        .unwrap_or_else(|| infer_context_length(&hf.id, params_raw));
     let (
         num_hidden_layers,
         num_attention_heads,
@@ -571,6 +809,11 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
     };
 
     let architecture = cfg.as_ref().and_then(|c| c.model_type.clone());
+    let (is_moe, num_experts, active_experts, active_params) = moe_from_config(
+        (is_moe, num_experts, active_experts, active_params),
+        cfg.as_ref(),
+        params_raw,
+    );
 
     Some(LlmModel {
         name: hf.id.clone(),
@@ -580,10 +823,9 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
         min_ram_gb: min_ram,
         recommended_ram_gb: rec_ram,
         min_vram_gb: min_vram,
-        // Q4_K_M is used as a conservative approximation for all fetched models.
-        // Actual available quantizations depend on the GGUF files published for
-        // each model.  RAM/VRAM estimates downstream reflect this assumption.
-        quantization: "Q4_K_M".to_string(),
+        // Q4_K_M is used as a conservative approximation for LLMs. TTS models
+        // are not GGUF/llama.cpp-compatible here, so keep their HF format.
+        quantization: if is_tts { "F16" } else { "Q4_K_M" }.to_string(),
         context_length,
         use_case,
         is_moe,
@@ -592,13 +834,20 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
         active_parameters: active_params,
         release_date,
         gguf_sources: vec![],
-        capabilities: vec![],
-        format: ModelFormat::default(),
+        capabilities,
+        languages,
+        format: if is_tts {
+            ModelFormat::Safetensors
+        } else {
+            ModelFormat::default()
+        },
         num_attention_heads,
         num_key_value_heads,
         num_hidden_layers,
         head_dim,
-        attention_layout: crate::models::infer_attention_layout_from_name(&hf.id),
+        // Resolve name-based layout heuristics at use time so architecture and
+        // attention-head metadata can reject contradictory zero-KV matches.
+        attention_layout: None,
         license,
         hidden_size,
         moe_intermediate_size,
@@ -668,12 +917,22 @@ pub fn update_model_cache(
             "Fetching {} trending models from HuggingFace...",
             opts.trending_limit
         ));
-        match hf_get_list("trendingScore", opts.trending_limit, token) {
-            Ok(list) => {
-                progress(&format!("  Received {} trending models", list.len()));
-                all_hf.extend(list);
+        for pipeline in ACCEPTED_PIPELINES {
+            let limit = pipeline_query_limit(opts.trending_limit, pipeline);
+            match hf_get_list_for_pipeline(pipeline, "trendingScore", limit, token) {
+                Ok(list) => {
+                    progress(&format!(
+                        "  Received {} trending {} models",
+                        list.len(),
+                        pipeline
+                    ));
+                    all_hf.extend(list);
+                }
+                Err(e) => progress(&format!(
+                    "  Warning: trending {} fetch failed — {e}",
+                    pipeline
+                )),
             }
-            Err(e) => progress(&format!("  Warning: trending fetch failed — {e}")),
         }
     }
 
@@ -682,12 +941,22 @@ pub fn update_model_cache(
             "Fetching {} top-downloaded models...",
             opts.downloads_limit
         ));
-        match hf_get_list("downloads", opts.downloads_limit, token) {
-            Ok(list) => {
-                progress(&format!("  Received {} download-ranked models", list.len()));
-                all_hf.extend(list);
+        for pipeline in ACCEPTED_PIPELINES {
+            let limit = pipeline_query_limit(opts.downloads_limit, pipeline);
+            match hf_get_list_for_pipeline(pipeline, "downloads", limit, token) {
+                Ok(list) => {
+                    progress(&format!(
+                        "  Received {} download-ranked {} models",
+                        list.len(),
+                        pipeline
+                    ));
+                    all_hf.extend(list);
+                }
+                Err(e) => progress(&format!(
+                    "  Warning: downloads {} fetch failed — {e}",
+                    pipeline
+                )),
             }
-            Err(e) => progress(&format!("  Warning: downloads fetch failed — {e}")),
         }
     }
 
@@ -792,6 +1061,39 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_use_case_tts() {
+        let uc = infer_use_case("hexgrad/Kokoro-82M", &["text-to-speech".to_string()]);
+        assert_eq!(uc, "Text-to-speech");
+    }
+
+    #[test]
+    fn test_infer_capabilities_tts() {
+        let caps = infer_capabilities(Some("text-to-speech"), "Text-to-speech");
+        assert!(caps.contains(&Capability::Audio));
+        assert!(caps.contains(&Capability::Tts));
+    }
+
+    #[test]
+    fn test_pipeline_query_limit_preserves_primary_budget() {
+        assert_eq!(pipeline_query_limit(100, "text-generation"), 100);
+        assert_eq!(pipeline_query_limit(100, "text-to-speech"), 25);
+        assert_eq!(pipeline_query_limit(2, "text-to-speech"), 1);
+    }
+
+    #[test]
+    fn test_infer_languages_from_explicit_tags_only() {
+        let tags = vec![
+            "text-to-speech".to_string(),
+            "language:en".to_string(),
+            "language:tir".to_string(),
+            "fr".to_string(),
+            "tts".to_string(),
+            "not-a-language".to_string(),
+        ];
+        assert_eq!(infer_languages(&tags), vec!["en", "tir", "fr"]);
+    }
+
+    #[test]
     fn test_infer_context_length_keywords() {
         assert_eq!(infer_context_length("model-128k", None), 131_072);
         assert_eq!(infer_context_length("model-32k", None), 32_768);
@@ -826,6 +1128,159 @@ mod tests {
             vram_moe.unwrap(),
             vram_dense.unwrap()
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Hub list-query tests — an `expand[]` projection must still carry the
+    // fields the entry mapping reads, or every model is discarded
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hf_list_url_requests_every_expanded_field() {
+        let url = hf_list_url("text-generation", "trendingScore", 100);
+        assert!(
+            url.starts_with(HF_API),
+            "unexpected endpoint in list query: {url}"
+        );
+        assert!(url.contains("?pipeline_tag=text-generation"), "{url}");
+        assert!(url.contains("&sort=trendingScore"), "{url}");
+        assert!(url.contains("&limit=100"), "{url}");
+        for field in HF_LIST_EXPAND {
+            assert!(
+                url.contains(&format!("&expand[]={field}")),
+                "list query must request `{field}`: expand[] omits every property it does not name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hf_list_url_requests_the_classification_fields() {
+        // These two are what is_accepted_pipeline() reads. Dropping either
+        // sends every fetched model down the `return None` path.
+        assert!(HF_LIST_EXPAND.contains(&"pipeline_tag"));
+        assert!(HF_LIST_EXPAND.contains(&"tags"));
+    }
+
+    #[test]
+    fn test_expand_projection_without_pipeline_fields_is_rejected() {
+        // Exactly what the Hub returns for `expand[]=gguf` on its own: id,
+        // _id and the sort key, with no pipeline_tag and no tags.
+        let json = r#"[{"_id":"1","id":"meta-llama/Llama-3.1-8B-Instruct","trendingScore":42}]"#;
+        let list: Vec<HfApiModel> = serde_json::from_str(json).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].pipeline_tag.is_none());
+        assert!(list[0].tags.is_empty());
+        assert!(
+            !is_accepted_pipeline(&list[0]),
+            "an entry with neither pipeline_tag nor tags classifies as non-text-generation, \
+             which is how `llmfit update` fetched 237 models and cached 0 of them"
+        );
+    }
+
+    #[test]
+    fn test_full_list_entry_is_accepted_and_keeps_its_metadata() {
+        let json = r#"[{
+            "_id": "1",
+            "id": "meta-llama/Llama-3.1-8B-Instruct",
+            "author": "meta-llama",
+            "pipeline_tag": "text-generation",
+            "tags": ["transformers", "safetensors", "text-generation", "license:llama3.1"],
+            "createdAt": "2026-07-18T16:00:00.000Z",
+            "safetensors": {"total": 8030261248}
+        }]"#;
+        let list: Vec<HfApiModel> = serde_json::from_str(json).unwrap();
+        assert!(is_accepted_pipeline(&list[0]));
+        assert_eq!(list[0].author.as_deref(), Some("meta-llama"));
+        assert_eq!(
+            list[0].created_at.as_deref(),
+            Some("2026-07-18T16:00:00.000Z")
+        );
+        assert_eq!(
+            list[0].safetensors.as_ref().and_then(|s| s.total),
+            Some(8_030_261_248)
+        );
+    }
+
+    #[test]
+    fn test_entry_tagged_without_a_pipeline_tag_is_accepted() {
+        // Some repos carry no pipeline_tag but do tag the pipeline; that
+        // fallback only works while `tags` is actually requested.
+        let json = r#"[{"_id":"1","id":"a/b","tags":["gguf","text-generation"]}]"#;
+        let list: Vec<HfApiModel> = serde_json::from_str(json).unwrap();
+        assert!(list[0].pipeline_tag.is_none());
+        assert!(is_accepted_pipeline(&list[0]));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Context window from config.json — the declared window beats the
+    // name-based guess
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_context_length_reads_max_position_embeddings() {
+        // openbmb/MiniCPM5-2B: no context keyword in the name, so the
+        // heuristic said 4096 for a 131072-token model.
+        let cfg: HfConfig = serde_json::from_str(r#"{"max_position_embeddings": 131072}"#).unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(131_072));
+    }
+
+    #[test]
+    fn test_context_length_falls_through_to_text_config() {
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":262144}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(262_144));
+    }
+
+    #[test]
+    fn test_context_length_does_not_scale_yarn_twice() {
+        // DeepSeek-V4: 65536 * 16 is already the stated 1048576.
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"max_position_embeddings":1048576,
+                "rope_scaling":{"type":"yarn","factor":16,
+                                "original_max_position_embeddings":65536}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(1_048_576));
+    }
+
+    #[test]
+    fn test_context_length_keeps_the_llama3_window() {
+        // Llama-3.2: 128K context, not 32 * 8192.
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"max_position_embeddings":131072,
+                "rope_scaling":{"rope_type":"llama3","factor":32.0,
+                                "original_max_position_embeddings":8192}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(131_072));
+    }
+
+    #[test]
+    fn test_context_length_scales_a_pre_scaling_window() {
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"max_position_embeddings":4096,"rope_scaling":{"type":"linear","factor":4.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(16_384));
+    }
+
+    #[test]
+    fn test_context_length_tolerates_odd_rope_scaling_shapes() {
+        // longrope carries factor lists and no scalar `factor`; null is common.
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"max_position_embeddings":131072,
+                "rope_scaling":{"type":"longrope","long_factor":[1.0,1.2],"short_factor":[1.0]}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(131_072));
+        let cfg: HfConfig =
+            serde_json::from_str(r#"{"max_position_embeddings":8192,"rope_scaling":null}"#)
+                .unwrap();
+        assert_eq!(resolve_context_length(&cfg), Some(8_192));
+        let cfg: HfConfig = serde_json::from_str(r#"{"hidden_size":4096}"#).unwrap();
+        assert_eq!(resolve_context_length(&cfg), None);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -929,5 +1384,82 @@ mod tests {
         assert_eq!(tc.vocab_size, Some(248320));
         assert_eq!(tc.num_hidden_layers, Some(40));
         assert_eq!(tc.num_key_value_heads, Some(2));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // MoE from config.json: the "12B-A2.5B" naming has no name rule
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_moe_from_config_classifies_a_named_dense_model() {
+        // JetBrains/Mellum2.1-12B-A2.5B-Thinking: 12.1B total, 64 experts, 8 active.
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"model_type":"mellum","num_experts":64,"num_experts_per_tok":8}"#,
+        )
+        .unwrap();
+        let (_, _, moe, ne, ae, ap) =
+            extract_model_params("JetBrains/Mellum2.1-12B-A2.5B-Thinking");
+        let (moe, ne, ae, ap) =
+            moe_from_config((moe, ne, ae, ap), Some(&cfg), Some(12_149_923_072));
+        assert!(moe, "config.json declares 64 experts");
+        assert_eq!(ne, Some(64));
+        assert_eq!(ae, Some(8));
+        let active = ap.expect("active parameters");
+        assert!(
+            (1_500_000_000..3_000_000_000).contains(&active),
+            "active {active}"
+        );
+    }
+
+    #[test]
+    fn test_moe_from_config_overrides_the_name_rule_active_experts() {
+        // Llama 4 Scout: 108.6B total, 16 experts, 1 routed expert per token.
+        // The "17B-16E" name rule assumes 2 active experts of 17B each.
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"model_type":"llama4","text_config":{"num_local_experts":16,"num_experts_per_tok":1}}"#,
+        )
+        .unwrap();
+        let (_, _, moe, ne, ae, ap) =
+            extract_model_params("meta-llama/Llama-4-Scout-17B-16E-Instruct");
+        assert!(moe);
+        let (moe, ne, ae, ap) =
+            moe_from_config((moe, ne, ae, ap), Some(&cfg), Some(108_641_793_536));
+        assert!(moe);
+        assert_eq!(ne, Some(16));
+        assert_eq!(ae, Some(1));
+        // Same estimate the bundled catalog has for this model's mirrors.
+        assert_eq!(ap, Some(11_882_696_167));
+    }
+
+    #[test]
+    fn test_moe_from_config_keeps_the_name_without_config_experts() {
+        let from_name = extract_model_params("mistralai/Mixtral-8x7B-Instruct-v0.1");
+        let from_name = (from_name.2, from_name.3, from_name.4, from_name.5);
+        let dense: HfConfig = serde_json::from_str(r#"{"model_type":"mixtral"}"#).unwrap();
+        assert_eq!(
+            moe_from_config(from_name, Some(&dense), Some(46_702_792_704)),
+            from_name
+        );
+        assert_eq!(moe_from_config(from_name, None, None), from_name);
+    }
+
+    #[test]
+    fn test_moe_from_config_reads_every_expert_key_and_text_config() {
+        let cases = [
+            r#"{"n_routed_experts":64,"num_experts_per_tok":4}"#,
+            r#"{"num_local_experts":8,"num_experts_per_tok":2}"#,
+            r#"{"moe_num_experts":[64,64],"moe_top_k":8}"#,
+            r#"{"model_type":"qwen3_5_moe","text_config":{"num_experts":256,"num_experts_per_tok":8}}"#,
+        ];
+        for json in cases {
+            let cfg: HfConfig = serde_json::from_str(json).unwrap();
+            let (moe, ..) =
+                moe_from_config((false, None, None, None), Some(&cfg), Some(30_000_000_000));
+            assert!(moe, "{json}");
+        }
+
+        let dense: HfConfig = serde_json::from_str(r#"{"model_type":"qwen3"}"#).unwrap();
+        let fields = moe_from_config((false, None, None, None), Some(&dense), Some(8_000_000_000));
+        assert_eq!(fields, (false, None, None, None));
     }
 }

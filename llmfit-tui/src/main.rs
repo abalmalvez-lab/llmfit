@@ -1,3 +1,4 @@
+mod cluster_cli;
 mod display;
 mod download_history;
 #[cfg(feature = "nats")]
@@ -13,16 +14,23 @@ mod tui_ui;
 
 use clap::{Parser, Subcommand};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
 use llmfit_core::bench;
-use llmfit_core::fit::{ModelFit, SortColumn, backend_compatible};
+use llmfit_core::cluster::ClusterConfig;
+use llmfit_core::fit::{CalcConfig, ModelFit, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
-use llmfit_core::models::ModelDatabase;
-use llmfit_core::plan::{PlanRequest, estimate_model_plan, resolve_model_selector};
+use llmfit_core::hwprofile::HardwareProfile;
+use llmfit_core::models::{ModelDatabase, matches_provider_filter};
+use llmfit_core::plan::{PlanRequest, estimate_model_plan_with_config, resolve_model_selector};
 use llmfit_core::quality;
+use llmfit_core::share;
+use llmfit_core::storage::{
+    ScratchPolicy, StorageRequest, StorageSelection, estimate_storage, parse_storage_size,
+};
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
@@ -30,6 +38,22 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid positive integer: {value}"))?;
     if parsed == 0 {
         return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_memory_arg(value: &str) -> Result<String, String> {
+    llmfit_core::hardware::parse_memory_size(value)
+        .map(|_| value.to_string())
+        .ok_or_else(|| "expected a size like 32G, 32000M or 1.5T".to_string())
+}
+
+fn parse_percent(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid percentage: {value}"))?;
+    if !(parsed > 0.0 && parsed <= 100.0) {
+        return Err("percentage must be greater than 0 and at most 100".to_string());
     }
     Ok(parsed)
 }
@@ -88,6 +112,38 @@ enum FitArg {
     Runnable,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum StorageSelectionArg {
+    /// Highest-ranked runnable models, using the existing fit score
+    Score,
+    /// Largest runnable models by estimated weight storage
+    Largest,
+}
+
+#[derive(clap::Args)]
+struct StorageArgs {
+    /// Number of distinct runnable models to keep
+    #[arg(long, default_value_t = 3, value_parser = parse_positive_usize)]
+    keep: usize,
+    #[arg(long, value_enum, default_value_t = StorageSelectionArg::Score)]
+    selection: StorageSelectionArg,
+    /// Space for OS, apps, and other files (decimal GB; GiB/TiB explicitly binary)
+    #[arg(long, default_value = "100G", value_name = "SIZE")]
+    os_reserve: String,
+    /// Extra download space: auto uses the largest selected model; 0 disables it
+    #[arg(long, default_value = "auto", value_name = "auto|SIZE")]
+    scratch: String,
+    /// Percentage of suggested SSD capacity to keep free (0-99)
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u8).range(..=99))]
+    headroom: u8,
+    /// Select only Perfect fits (otherwise Perfect, Good, and Marginal)
+    #[arg(long)]
+    perfect: bool,
+    /// Filter by model name, provider, or parameter size (case-insensitive)
+    #[arg(long, value_name = "QUERY")]
+    search: Option<String>,
+}
+
 #[derive(Parser)]
 #[command(name = "llmfit")]
 #[command(about = "Right-size LLM models to your system's hardware")]
@@ -103,8 +159,21 @@ GLOBAL FLAGS:
   --json             Output structured JSON on every subcommand (for tool/agent
                      integration). Always exits 0 on success, 1 on error.
   --memory <SIZE>    Override GPU VRAM (e.g. \"32G\", \"32000M\", \"1.5T\").
+  --memory-percent <PERCENT>
+                     Use this percentage of detected GPU VRAM (e.g. 90, 87.5).
   --ram <SIZE>       Override system RAM (e.g. \"64G\", \"128000M\").
+  --ram-percent <PERCENT>
+                     Use this percentage of detected system RAM.
   --cpu-cores <N>    Override detected CPU core count.
+  --profile <NAME>   Score against a whole hardware profile (name or path to a
+                     profile JSON) instead of this machine. Sets capacity,
+                     unified memory, and the bandwidth/compute figures the
+                     throughput estimate needs. Conflicts with --memory,
+                     --memory-percent, --ram, --ram-percent, and --cpu-cores.
+                     See `llmfit hardware list`.
+  --llama-cpp-path <PATH>
+                     Directory containing llama.cpp binaries. Overrides
+                     LLAMA_CPP_PATH for this invocation when the directory exists.
   --max-context N    Cap context length for memory estimation (tokens).
                      Falls back to OLLAMA_CONTEXT_LENGTH env var if unset.
 
@@ -123,6 +192,10 @@ struct Cli {
     /// Show only models that perfectly match recommended specs
     #[arg(short, long)]
     perfect: bool,
+
+    /// Default fit view: append a concurrent-session estimate per model (issue #140)
+    #[arg(long)]
+    concurrency: bool,
 
     /// Show only models with tool/function-call capability
     #[arg(long)]
@@ -150,23 +223,54 @@ struct Cli {
 
     /// Override GPU VRAM size (e.g. "32G", "32000M", "1.5T").
     /// Useful when GPU memory autodetection fails.
-    #[arg(long, value_name = "SIZE")]
+    #[arg(long, value_name = "SIZE", value_parser = parse_memory_arg, global = true)]
     memory: Option<String>,
+
+    /// Use this percentage of detected GPU VRAM (e.g. "90", "87.5").
+    /// Applies to every detected GPU. Requires detected VRAM.
+    #[arg(long, value_name = "PERCENT", value_parser = parse_percent, conflicts_with = "memory", global = true)]
+    memory_percent: Option<f64>,
 
     /// Override system RAM (e.g. "64G", "128000M", "1T").
     /// Useful for evaluating model fit against target hardware.
-    #[arg(long, value_name = "SIZE")]
+    #[arg(long, value_name = "SIZE", value_parser = parse_memory_arg, global = true)]
     ram: Option<String>,
+
+    /// Use this percentage of detected system RAM (e.g. "80", "87.5").
+    /// On unified-memory systems this also caps GPU VRAM.
+    #[arg(long, value_name = "PERCENT", value_parser = parse_percent, conflicts_with = "ram", global = true)]
+    ram_percent: Option<f64>,
 
     /// Override detected CPU core count.
     /// Useful for evaluating model fit against target hardware.
-    #[arg(long, value_name = "CORES", value_parser = parse_positive_usize)]
+    #[arg(long, value_name = "CORES", value_parser = parse_positive_usize, global = true)]
     cpu_cores: Option<usize>,
+
+    /// Score models against a hardware profile instead of this machine:
+    /// a profile name (see `llmfit hardware list`) or a path to a profile
+    /// JSON file. A profile describes a whole machine — capacity, unified
+    /// memory, memory bandwidth, fp16 throughput — so it replaces the
+    /// single-field overrides rather than combining with them.
+    /// Rejected by `doctor`, which reports this machine's own detection.
+    /// Also rejected with `--cluster`: a single-machine profile applied to
+    /// aggregate cluster specs describes hardware that does not exist.
+    #[arg(long, value_name = "NAME|PATH", conflicts_with_all = ["memory", "memory_percent", "ram", "ram_percent", "cpu_cores", "cluster"], global = true)]
+    profile: Option<String>,
+    /// Directory containing llama.cpp binaries (`llama-cli`, `llama-server`).
+    /// Overrides LLAMA_CPP_PATH for this invocation when the directory exists.
+    #[arg(long, value_name = "PATH", global = true)]
+    llama_cpp_path: Option<std::path::PathBuf>,
 
     /// Cap context length used for memory estimation (tokens).
     /// Falls back to OLLAMA_CONTEXT_LENGTH if not set.
-    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..), global = true)]
     max_context: Option<u32>,
+
+    /// Force the interactive TUI, ignoring any subcommand or output flags.
+    /// Useful in Docker where a baked-in CMD would otherwise run a subcommand:
+    /// docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    #[arg(long, global = true)]
+    tui: bool,
 
     /// Do not auto-start the background dashboard server
     #[arg(long, global = true)]
@@ -176,6 +280,16 @@ struct Cli {
     /// Falls back to LOCALMAXXING_API_KEY env var.
     #[arg(long, value_name = "KEY", env = "LOCALMAXXING_API_KEY")]
     api_key: Option<String>,
+
+    /// Use cluster configuration for memory/GPU detection.
+    /// Overrides local hardware detection with aggregated cluster resources.
+    #[arg(long, global = true, conflicts_with = "no_cluster")]
+    cluster: bool,
+
+    /// Skip cluster detection even if a cluster config exists.
+    /// Suppresses the "cluster config detected" hint message.
+    #[arg(long, global = true, conflicts_with = "cluster")]
+    no_cluster: bool,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +317,114 @@ AGENT USAGE:
   JSON output fields: { system: { cpu, ram_gb, gpu_name, gpu_vram_gb,
   gpu_backend, unified_memory, os } }")]
     System,
+
+    /// List, inspect, and validate hardware profiles
+    #[command(long_about = "\
+List, inspect, and validate hardware profiles.
+
+A hardware profile names a whole machine — memory capacity, unified-memory
+topology, memory bandwidth, and fp16 matmul throughput — so `--profile` can
+score models against hardware you don't have without a pile of single-field
+overrides. Bundled profiles are embedded in the binary; user profiles live in
+the directory printed by `llmfit hardware path` and shadow a bundled profile
+of the same name.
+
+PRECONDITIONS:
+  None. `show` also reports what the profile would change on this machine,
+  which runs hardware detection.
+
+SIDE EFFECTS:
+  None — read-only. No directory is created.
+
+EXIT CODES:
+  0  Success
+  1  Unknown profile, unreadable file, or a validation failure
+
+AGENT USAGE:
+  llmfit hardware list --json
+  llmfit hardware show ryzen-ai-max-plus-395 --json
+  llmfit hardware validate ./my-box.json --json
+  llmfit hardware path --json
+
+  `list --json` fields: { profiles: [{ name, origin, total_ram_gb,
+  unified_memory, gpu_memory_bandwidth_gbps, ddr_bandwidth_gbps,
+  gpu_compute_tflops_fp16, calibration_entries }], errors: [{ path, error }] }")]
+    Hardware {
+        #[command(subcommand)]
+        action: HardwareAction,
+    },
+
+    /// Print a hardware diagnostic report for bug reports
+    #[command(long_about = "\
+Print a hardware diagnostic report for GitHub bug reports.
+
+Captures the raw output of every external tool GPU detection shells out to
+(nvidia-smi, rocm-smi, sysfs, lspci, system_profiler, WMI, vulkaninfo,
+npu-smi) alongside what llmfit actually detected, so detection bugs can be
+reproduced — and turned into regression tests — from the report alone.
+
+PRECONDITIONS:
+  None. Missing tools are reported as unavailable, which is itself useful.
+  --profile is rejected: this report describes the machine it runs on. Use
+  `llmfit hardware show <NAME>` to inspect a profile.
+
+SIDE EFFECTS:
+  None — read-only. Output contains hardware model names and driver info
+  only; no hostnames, usernames, or serial numbers.
+
+EXIT CODES:
+  0  Success
+
+AGENT USAGE:
+  llmfit doctor > llmfit-doctor.md
+
+  Output is Markdown; attach or paste it into a GitHub issue.")]
+    Doctor,
+
+    /// Generate a Kubernetes DRA ResourceClaim encoding the model's fit
+    #[command(long_about = "\
+Generate a Kubernetes DRA ResourceClaim (or ResourceClaimTemplate) whose CEL
+selector encodes the model's fit inequality against attributes published by
+the llmfit.ai DRA driver (llmfit-dra). Constants (weights size, memory floor,
+bandwidth floor) are resolved from the model database and inlined; the YAML
+is printed on stdout with provenance comments.
+
+PRECONDITIONS:
+  None locally. Applying the output requires a cluster running llmfit-dra
+  (Kubernetes >= 1.34) with its shipped DeviceClasses.
+
+SIDE EFFECTS:
+  None — prints YAML; pipe to kubectl to apply.
+
+EXIT CODES:
+  0  Success
+  1  Unknown/ambiguous model, or invalid bounds
+
+AGENT USAGE:
+  llmfit claim qwen2.5-32b --min-tps 20 | kubectl apply -f -
+  llmfit claim mistral-7b --template > claim-template.yaml")]
+    Claim {
+        /// Model name (exact or unambiguous partial match)
+        model: String,
+        /// Minimum acceptable decode speed, tokens/second
+        #[arg(long, default_value_t = 20.0)]
+        min_tps: f64,
+        /// Override the database entry's quantization (e.g. Q4_K_M, Q8_0)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Backend efficiency percentage used in the fit inequality
+        #[arg(long, default_value_t = 55)]
+        efficiency: u32,
+        /// DeviceClass the claim requests against
+        #[arg(long, default_value = "llmfit.ai")]
+        device_class: String,
+        /// Emit a ResourceClaimTemplate (for pod templates) instead of a ResourceClaim
+        #[arg(long)]
+        template: bool,
+        /// metadata.name for the generated object (default: derived from the model name)
+        #[arg(long)]
+        name: Option<String>,
+    },
 
     /// List all available LLM models
     #[command(long_about = "\
@@ -237,7 +459,8 @@ AGENT USAGE:
 Find models that fit your system (classic table output).
 
 Detects hardware, scores every model for fit/speed/quality, and prints a
-ranked table. Models incompatible with the detected backend are hidden.
+ranked table. Models incompatible with the detected backend are hidden
+unless --show-incompatible is set; those rows are marked as non-runnable.
 
 PRECONDITIONS:
   Requires hardware detection (GPU via nvidia-smi/rocm-smi/system_profiler).
@@ -253,6 +476,7 @@ EXIT CODES:
 AGENT USAGE:
   llmfit fit --json
   llmfit fit --json --perfect -n 5
+  llmfit fit --json --providers unsloth,bartowski
   llmfit fit --json --sort tps
 
   JSON output fields: { system: {...}, models: [{ name, provider,
@@ -261,6 +485,10 @@ AGENT USAGE:
   memory_available_gb, utilization_pct, best_quant, use_case,
   runtime }] }")]
     Fit {
+        /// Include backend-incompatible models, marked as non-runnable
+        #[arg(long)]
+        show_incompatible: bool,
+
         /// Show only models that perfectly match recommended specs
         #[arg(short, long)]
         perfect: bool,
@@ -269,6 +497,10 @@ AGENT USAGE:
         #[arg(long)]
         tool_use: bool,
 
+        /// Filter by canonical or GGUF providers (comma-separated, case-insensitive)
+        #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
+        providers: Vec<String>,
+
         /// Limit number of results
         #[arg(short = 'n', long)]
         limit: Option<usize>,
@@ -276,6 +508,10 @@ AGENT USAGE:
         /// Sort column for fit output
         #[arg(long, value_enum, default_value_t = SortArg::Score)]
         sort: SortArg,
+
+        /// Append a concurrent-session estimate per model at its usable context (issue #140)
+        #[arg(long)]
+        concurrency: bool,
     },
 
     /// Search for specific models
@@ -295,8 +531,11 @@ EXIT CODES:
   0  Success (even if no matches found)
 
 AGENT USAGE:
-  No --json support for this command. Use 'llmfit list --json' and filter
-  client-side, or use 'llmfit info <model> --json' for a specific model.")]
+  llmfit search \"qwen\" --json
+
+  JSON output: array of matching model objects, same fields as
+  'llmfit list --json'. An empty array when nothing matches locally; the
+  HuggingFace fallback is skipped.")]
     Search {
         /// Search query (model name, provider, or size)
         query: String,
@@ -377,6 +616,48 @@ AGENT USAGE:
         limit: usize,
     },
 
+    /// Estimate concurrent-session capacity for a model (issue #140)
+    #[command(long_about = "\
+Estimate how many concurrent inference sessions of a model fit in the memory
+pool at a range of context lengths.
+
+Model weights and fixed runtime overhead are resident once; each concurrent
+session adds one KV cache at the chosen context, so:
+  sessions(ctx) = floor((pool - weights_resident) / kv_cache(ctx))
+The KV term is GQA- and layout-aware. This is a memory-capacity ceiling
+(sessions resident), not a throughput figure under concurrent load.
+
+PRECONDITIONS:
+  Requires hardware detection. Use --memory / --profile to model other hardware.
+
+SIDE EFFECTS:
+  None -- read-only.
+
+EXIT CODES:
+  0  Success
+  1  Unknown/ambiguous model or bad argument
+
+AGENT USAGE:
+  llmfit concurrency qwen2.5-32b --json
+  llmfit concurrency llama-3.1-8b --context 32768
+  llmfit concurrency mistral-7b --users 16")]
+    Concurrency {
+        /// Model selector (name or unique partial name)
+        model: String,
+        /// Weight quantization override (e.g. Q4_K_M, Q8_0). Defaults to the best fit.
+        #[arg(long)]
+        quant: Option<String>,
+        /// KV cache element representation (fp16, fp8, q8_0, q4_0, tq). Defaults to fp16.
+        #[arg(long, value_name = "KV")]
+        kv_quant: Option<String>,
+        /// Report a single context instead of the 4k-256k ladder (tokens).
+        #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+        context: Option<u32>,
+        /// Also report the largest context that fits this many concurrent sessions.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        users: Option<u32>,
+    },
+
     /// Plan hardware requirements for a specific model configuration
     #[command(long_about = "\
 Plan hardware requirements for a specific model configuration.
@@ -399,9 +680,11 @@ AGENT USAGE:
   llmfit plan \"llama-3.1-70b\" --context 8192 --json
   llmfit plan \"qwen-72b\" --context 4096 --quant Q4_K_M --target-tps 15 --json
 
-  JSON output: PlanEstimate object with fields: model_name, context_length,
-  quantization, weight_gb, kv_cache_gb, total_vram_gb, fits_in_vram,
-  estimated_tps, recommended_gpu, notes.")]
+  JSON output: PlanEstimate object with fields: model_name, provider, context,
+  quantization, disk_size_gb, kv_quant, target_tps, minimum, recommended,
+  run_paths, current, upgrade_deltas, kv_alternatives, estimate_notice.
+  disk_size_gb estimates weight storage at the planned quant; it excludes
+  KV cache, runtime buffers, and download scratch.")]
     Plan {
         /// Model selector (name or unique partial name)
         model: String,
@@ -424,6 +707,38 @@ AGENT USAGE:
         #[arg(long, value_name = "TOK_S")]
         target_tps: Option<f64>,
     },
+
+    /// Estimate SSD capacity for a library of runnable models
+    #[command(long_about = "\
+Estimate SSD capacity for a library of models used sequentially.
+
+Select up to --keep runnable models, then add their estimated weight sizes,
+an OS/apps reserve, and download scratch. Suggest a decimal SSD capacity
+with the requested free headroom. Models already installed still count.
+Use --selection largest for conservative sizing within the matching models.
+
+SIZE UNITS:
+  G/GB, M/MB and T/TB are decimal; GiB/MiB/TiB are explicitly binary.
+  Bare numbers are GB. These differ from the legacy hardware memory parser.
+
+SIDE EFFECTS:
+  None — reads the catalog and hardware; no downloads or disk-usage scan.
+
+EXIT CODES:
+  0  Report produced (warnings explain empty/partial results or no SSD tier)
+  1  Invalid configuration or data; --csv is not supported
+  2  Invalid command-line syntax
+
+AGENT USAGE:
+  llmfit --memory 128G --ram 128G --cpu-cores 18 storage --keep 3 --json
+  llmfit --profile ryzen-ai-max-plus-395 storage --selection largest --json
+
+  JSON: { system: {...}, storage: { models, selection, keep_requested,
+  selected_count, eligible_count, library_gb, os_reserve_gb,
+  download_scratch_gb, scratch_policy, headroom_percent, need_gb,
+  target_capacity_gb, minimum_ssd_gb, suggested_ssd_gb, warnings, ... } }
+  SSD recommendations are null if no models match or no tier is large enough.")]
+    Storage(StorageArgs),
 
     /// Recommend top models for your hardware (JSON-friendly)
     #[command(long_about = "\
@@ -470,7 +785,7 @@ AGENT USAGE:
         #[arg(long, default_value = "marginal")]
         min_fit: String,
 
-        /// Filter by inference runtime: mlx, llamacpp, any
+        /// Filter by inference runtime: mlx, llamacpp, vllm, bitnetcpp, any
         #[arg(long, default_value = "any")]
         runtime: String,
 
@@ -479,7 +794,7 @@ AGENT USAGE:
         #[arg(long, value_name = "RUNTIME")]
         force_runtime: Option<String>,
 
-        /// Filter by capability: vision, tool_use (comma-separated for multiple)
+        /// Filter by capability: vision, tool_use, audio, tts (comma-separated)
         #[arg(long, value_name = "CAPS")]
         capability: Option<String>,
 
@@ -682,6 +997,14 @@ AGENT USAGE:
         #[arg(long, default_value = "8787")]
         port: u16,
 
+        /// Listen on a Unix domain socket instead of TCP (unix platforms
+        /// only). Any stale socket file is replaced; the socket is created
+        /// with mode 0660. Intended for same-host/same-pod consumers (e.g.
+        /// the llmfit-dra DRA driver sidecar) where a TCP port on the host
+        /// network is undesirable.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["host", "port"])]
+        unix_socket: Option<std::path::PathBuf>,
+
         /// Run as MCP server on stdio instead of HTTP
         #[arg(long)]
         mcp: bool,
@@ -700,7 +1023,7 @@ AGENT USAGE:
         /// Model name to benchmark (auto-detects provider if omitted)
         model: Option<String>,
 
-        /// Provider to benchmark (auto, ollama, vllm, mlx)
+        /// Provider to benchmark (auto, ollama, vllm, ferrum, lmstudio, mlx, llamacpp)
         #[arg(long, default_value = "auto")]
         provider: String,
 
@@ -728,6 +1051,12 @@ AGENT USAGE:
         #[arg(long)]
         routing: bool,
 
+        /// Probe whether the model really returns OpenAI-style tool calls
+        /// (one `write` tool, --runs attempts): ok, flaky or broken.
+        /// Probes one model, so it cannot be combined with --all.
+        #[arg(long, conflicts_with = "all")]
+        tool_calls: bool,
+
         /// Only test specific roles (comma-separated)
         #[arg(long)]
         roles: Option<String>,
@@ -739,44 +1068,409 @@ AGENT USAGE:
         /// Skip specific models by name substring (comma-separated)
         #[arg(long)]
         skip: Option<String>,
+
+        /// Contribute results back to the project as a GitHub pull request
+        /// (no `gh` CLI required; authenticates via the GitHub device flow).
+        /// Shares all locally stored benchmarks; alone (no model, no --all)
+        /// it uploads the stored backlog without benchmarking
+        #[arg(long)]
+        share: bool,
+
+        /// With --share, print the submission payload and exit without contacting GitHub
+        #[arg(long)]
+        dry_run: bool,
+
+        /// With --share, skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
+
+    /// Manage remote GPU cluster configuration
+    Cluster {
+        #[command(subcommand)]
+        action: cluster_cli::ClusterAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HardwareAction {
+    /// List every selectable profile (bundled and user)
+    List,
+
+    /// Show one profile's fields and what it would change on this machine
+    Show {
+        /// Profile name or path to a profile JSON file
+        #[arg(id = "profile_name", value_name = "NAME|PATH")]
+        profile: String,
+    },
+
+    /// Strictly validate profile files (unknown keys are errors)
+    Validate {
+        /// Profile JSON files to check
+        #[arg(value_name = "PATH", required = true, num_args = 1..)]
+        paths: Vec<std::path::PathBuf>,
+    },
+
+    /// Print the directory scanned for user profiles
+    Path,
 }
 
 /// Bundled hardware override options from CLI flags.
 pub(crate) struct HardwareOverrides {
     pub memory: Option<String>,
+    pub memory_percent: Option<f64>,
     pub ram: Option<String>,
+    pub ram_percent: Option<f64>,
     pub cpu_cores: Option<usize>,
+    /// Raw `--profile` selector (name or path), resolved by [`detect_specs`].
+    pub profile: Option<String>,
+    /// `--cluster`: load and use the saved cluster config instead of local hardware detection.
+    pub use_cluster: bool,
+    /// `--no-cluster`: skip cluster detection entirely, even if a config exists.
+    pub no_cluster: bool,
+    /// `--json`: report a refused `--cluster` config as a JSON error document.
+    pub json: bool,
+}
+
+impl HardwareOverrides {
+    /// No overrides — hardware exactly as detected.
+    pub(crate) fn none() -> Self {
+        Self {
+            memory: None,
+            memory_percent: None,
+            ram: None,
+            ram_percent: None,
+            cpu_cores: None,
+            profile: None,
+            use_cluster: false,
+            no_cluster: false,
+            json: false,
+        }
+    }
+}
+
+/// Result of deciding whether to use the saved cluster config for detection.
+#[derive(Debug)]
+enum ClusterBase {
+    /// Cluster config loaded successfully; derive the base specs from it.
+    Use(ClusterConfig),
+    /// `--cluster` was passed but no config is saved.
+    Missing,
+    /// `--cluster` was passed but the saved config could not be read or parsed.
+    Invalid(String),
+    /// Not requested; fall back to local single-node detection.
+    Local,
+}
+
+/// Decide the base specs source from the `--cluster` flag.
+///
+/// Pure decision with no I/O, so it can be unit-tested with a stub loader: the
+/// caller passes `ClusterConfig::load` and performs the side effects (printing,
+/// exiting, probing) implied by the returned variant. The config is only read
+/// when `--cluster` asks for it; a forced `--cluster` that cannot be loaded
+/// must hard-fail rather than silently fall back to local detection.
+fn decide_cluster_base(
+    use_cluster: bool,
+    load: impl FnOnce() -> Result<Option<ClusterConfig>, String>,
+) -> ClusterBase {
+    if !use_cluster {
+        return ClusterBase::Local;
+    }
+    match load() {
+        Ok(Some(cfg)) => ClusterBase::Use(cfg),
+        Ok(None) => ClusterBase::Missing,
+        Err(e) => ClusterBase::Invalid(e),
+    }
+}
+
+/// What the "Using cluster config" banner reports, captured from the saved
+/// config so it can be printed once the hardware overrides are applied.
+#[derive(Debug, Clone, Copy)]
+struct ClusterBanner {
+    node_count: usize,
+    /// Sum of every GPU's VRAM as the config states it.
+    config_vram_gb: f64,
+}
+
+/// The "Using cluster config" line, describing the VRAM pool the fit
+/// actually uses: `usable_vram_gb` is the tensor-parallel pool after
+/// `--memory` / `--memory-percent` (smallest card × GPU count).
+fn cluster_banner_line(
+    banner: ClusterBanner,
+    usable_vram_gb: f64,
+    vram_overridden: bool,
+) -> String {
+    let nodes = llmfit_core::cluster::nodes_label(banner.node_count);
+    if vram_overridden {
+        let stated = if banner.config_vram_gb > 0.0 {
+            format!("config says {:.0} GB", banner.config_vram_gb)
+        } else {
+            "config has no VRAM".to_string()
+        };
+        format!(
+            "📡 Using cluster config: {}, {:.0} GB usable VRAM (VRAM override; {})",
+            nodes, usable_vram_gb, stated
+        )
+    } else if usable_vram_gb + 0.05 < banner.config_vram_gb {
+        format!(
+            "📡 Using cluster config: {}, {:.0} GB total VRAM ({:.0} GB usable: tensor parallelism is bounded by the smallest GPU)",
+            nodes, banner.config_vram_gb, usable_vram_gb
+        )
+    } else {
+        format!(
+            "📡 Using cluster config: {}, {:.0} GB total VRAM",
+            nodes, banner.config_vram_gb
+        )
+    }
+}
+
+/// Refuse a `--cluster` run: a JSON error document on stdout under
+/// `--json`, otherwise the `❌` line and its hint on stderr. Exits 1.
+/// One sentence-separated message for the JSON error document.
+fn join_problem_and_hint(problem: &str, hint: &str) -> String {
+    let problem = problem.trim_end();
+    if hint.is_empty() {
+        return problem.to_string();
+    }
+    let sep = if problem.ends_with(['.', '!', '?', ':']) {
+        " "
+    } else {
+        ". "
+    };
+    format!("{problem}{sep}{hint}")
+}
+
+fn refuse_cluster(json: bool, kind: &str, problem: &str, hint: &str) -> ! {
+    if json {
+        let message = join_problem_and_hint(problem, hint);
+        display::display_json_error(kind, &message);
+    } else {
+        eprintln!("❌ {}", problem);
+        if !hint.is_empty() {
+            eprintln!("   {}", hint);
+        }
+    }
+    std::process::exit(1);
+}
+
+/// Determine the BASE system specs (before `--ram` / `--memory` /
+/// `--cpu-cores` overrides and before `--profile`), honoring `--cluster` /
+/// `--no-cluster`.
+///
+/// Returns the banner facts when the base came from a cluster config, so
+/// [`detect_specs_and_config`] can print the banner against the pool the
+/// overrides leave, and decide whether to print the "overrides applied to
+/// cluster profile" notice.
+fn detect_base_specs(overrides: &HardwareOverrides) -> (SystemSpecs, Option<ClusterBanner>) {
+    if overrides.no_cluster {
+        return (SystemSpecs::detect(), None);
+    }
+
+    let cluster_path = ClusterConfig::config_path();
+    let shown_path = cluster_path.as_deref().map_or_else(
+        || "the cluster config".to_string(),
+        |p| p.display().to_string(),
+    );
+    let json = overrides.json;
+
+    match decide_cluster_base(overrides.use_cluster, ClusterConfig::load) {
+        ClusterBase::Use(cfg) => {
+            if cfg.total_gpu_count() == 0 {
+                refuse_cluster(
+                    json,
+                    "cluster_no_gpus",
+                    "Cluster config reports no GPUs on any node; cluster mode models tensor-parallel GPU inference only.",
+                    &format!(
+                        "Set gpu_count and gpu_vram_gb per node in {}, or drop --cluster to fit against this machine.",
+                        shown_path
+                    ),
+                );
+            }
+            let backends = cfg.conflicting_backends();
+            if !backends.is_empty() {
+                refuse_cluster(
+                    json,
+                    "cluster_mixed_backends",
+                    &format!(
+                        "Cluster GPU nodes name different backends ({}); tensor parallelism cannot span them.",
+                        backends.join(", ")
+                    ),
+                    &format!(
+                        "Use one backend per cluster in {}, or drop --cluster to fit against this machine.",
+                        shown_path
+                    ),
+                );
+            }
+            let unset_vram = unresolved_cluster_vram(&cfg, overrides);
+            if !unset_vram.is_empty() {
+                refuse_cluster(
+                    json,
+                    "cluster_vram_unset",
+                    &format!(
+                        "Cluster config declares GPUs on {} node(s) but gpu_vram_gb is unset (0.0); fit analysis would be meaningless.",
+                        unset_vram.len()
+                    ),
+                    &format!(
+                        "Pass --memory <per-GPU VRAM>, set gpu_vram_gb per node in {} (Ray reported no VRAM for these nodes), or re-run `llmfit cluster init` interactively.",
+                        shown_path
+                    ),
+                );
+            }
+            if let Some(warning) = cfg.backend_warning() {
+                eprintln!("⚠️  {}", warning);
+            }
+            let banner = ClusterBanner {
+                node_count: cfg.node_count(),
+                config_vram_gb: cfg.total_vram_gb(),
+            };
+            (cfg.to_system_specs(), Some(banner))
+        }
+        ClusterBase::Missing => refuse_cluster(
+            json,
+            "cluster_not_configured",
+            &format!(
+                "--cluster specified but no cluster config found at {}",
+                shown_path
+            ),
+            "Run `llmfit cluster init` to create one.",
+        ),
+        ClusterBase::Invalid(e) => refuse_cluster(
+            json,
+            "cluster_config_invalid",
+            &format!(
+                "Failed to load cluster config requested by --cluster: {}",
+                e
+            ),
+            "",
+        ),
+        ClusterBase::Local => {
+            // Friendly hint: config exists but flag wasn't passed. `exists()`
+            // is a cheap stat; the TOML is only parsed under --cluster.
+            if cluster_path.as_ref().is_some_and(|p| p.exists()) {
+                eprintln!(
+                    "ℹ️  Cluster config detected. Pass --cluster to use it, or --no-cluster to suppress this message."
+                );
+            }
+            (SystemSpecs::detect(), None)
+        }
+    }
 }
 
 /// Detect system specs with optional hardware overrides.
-/// RAM override is applied before GPU VRAM so that `--memory` takes precedence
-/// on unified-memory systems where `--ram` would also update VRAM.
+///
+/// See [`detect_specs_and_config`] when the caller runs fit analysis: a
+/// hardware profile also carries the bandwidth and efficiency figures the
+/// throughput estimate needs, and those live on `CalcConfig`, not on specs.
 pub(crate) fn detect_specs(overrides: &HardwareOverrides) -> SystemSpecs {
-    let mut specs = SystemSpecs::detect();
+    detect_specs_and_config(overrides).0
+}
 
-    if let Some(ram_str) = &overrides.ram {
-        match llmfit_core::hardware::parse_memory_size(ram_str) {
-            Some(gb) => specs = specs.with_ram_override(gb),
-            None => {
-                eprintln!(
-                    "Warning: could not parse --ram value '{}'. Expected format: 64G, 128000M, 1T",
-                    ram_str
-                );
-            }
+/// Detect system specs, plus the calculation parameters `--profile` implies.
+///
+/// Cluster detection is checked first (before local hardware probing or a
+/// `--profile` selector) so that `--cluster` short-circuits local hardware
+/// probing; the cluster/local BASE spec then has `--ram` / `--memory` /
+/// `--cpu-cores` overrides applied uniformly on top of it.
+///
+/// The config is `None` unless a profile was given (and no cluster config was
+/// used), so callers without one keep the estimator defaults.
+///
+/// RAM override is applied before GPU VRAM so that `--memory` takes precedence
+/// on unified-memory systems where `--ram` would also update VRAM. Percentage
+/// overrides follow, VRAM first, so `--ram-percent` can cap VRAM to the shared
+/// pool on unified-memory systems. A profile is
+/// applied last; it conflicts with the single-field overrides, so it never
+/// competes with them.
+///
+/// An unresolvable `--profile` exits, like an unparseable size override: a
+/// profile that quietly failed to load would score every model against the
+/// wrong machine, and the numbers would look perfectly plausible.
+pub(crate) fn detect_specs_and_config(
+    overrides: &HardwareOverrides,
+) -> (SystemSpecs, Option<CalcConfig>) {
+    let (base, cluster_banner) = detect_base_specs(overrides);
+
+    let has_cli_overrides = overrides.ram.is_some()
+        || overrides.memory.is_some()
+        || overrides.memory_percent.is_some()
+        || overrides.ram_percent.is_some()
+        || overrides.cpu_cores.is_some();
+
+    let mut specs = apply_hardware_overrides(base, overrides);
+
+    if let Some(banner) = cluster_banner {
+        // Printed after the overrides so it states the pool the fit uses,
+        // not the config's raw total (which is 0 for a Ray config Ray gave
+        // no VRAM for).
+        let vram_overridden = overrides.memory.is_some() || overrides.memory_percent.is_some();
+        eprintln!(
+            "{}",
+            cluster_banner_line(
+                banner,
+                specs.total_gpu_vram_gb.unwrap_or(0.0),
+                vram_overridden
+            )
+        );
+        if has_cli_overrides {
+            eprintln!("ℹ️  Hardware overrides applied to cluster profile.");
         }
     }
 
-    if let Some(mem_str) = &overrides.memory {
-        match llmfit_core::hardware::parse_memory_size(mem_str) {
-            Some(gb) => specs = specs.with_gpu_memory_override(gb),
-            None => {
-                eprintln!(
-                    "Warning: could not parse --memory value '{}'. Expected format: 32G, 32000M, 1.5T",
-                    mem_str
-                );
-            }
+    let Some(selector) = overrides.profile.as_deref() else {
+        return (specs, None);
+    };
+
+    let loaded = match llmfit_core::hwprofile::resolve(selector) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            std::process::exit(1);
         }
+    };
+    let mut config = CalcConfig::default();
+    specs = loaded.profile.apply(specs, &mut config);
+    (specs, Some(config))
+}
+
+/// Apply the explicit `--ram` / `--memory` / `--memory-percent` / `--ram-percent`
+/// / `--cpu-cores` overrides on top of a base `SystemSpecs` (local or
+/// cluster-derived).
+fn apply_hardware_overrides(mut specs: SystemSpecs, overrides: &HardwareOverrides) -> SystemSpecs {
+    // clap's value_parser has already rejected sizes that do not parse.
+    if let Some(gb) = overrides
+        .ram
+        .as_deref()
+        .and_then(llmfit_core::hardware::parse_memory_size)
+    {
+        specs = specs.with_ram_override(gb);
+    }
+
+    if let Some(gb) = overrides
+        .memory
+        .as_deref()
+        .and_then(llmfit_core::hardware::parse_memory_size)
+    {
+        specs = specs.with_gpu_memory_override(gb);
+    }
+
+    if let Some(percent) = overrides.memory_percent {
+        if specs.total_gpu_vram_gb.or(specs.gpu_vram_gb).is_none() {
+            eprintln!(
+                "Error: --memory-percent requires detected GPU VRAM; use --memory <SIZE> when VRAM detection is unavailable"
+            );
+            std::process::exit(1);
+        }
+        specs = specs.with_gpu_memory_percent(percent);
+    }
+
+    if let Some(percent) = overrides.ram_percent {
+        if specs.total_ram_gb <= 0.0 {
+            eprintln!(
+                "Error: --ram-percent requires detected system RAM; use --ram <SIZE> when RAM detection is unavailable"
+            );
+            std::process::exit(1);
+        }
+        specs = specs.with_ram_percent(percent);
     }
 
     if let Some(cores) = overrides.cpu_cores {
@@ -784,6 +1478,22 @@ pub(crate) fn detect_specs(overrides: &HardwareOverrides) -> SystemSpecs {
     }
 
     specs
+}
+
+/// Zero-VRAM GPU nodes that the CLI overrides do not resolve. A parseable
+/// `--memory` supplies per-GPU VRAM for the whole cluster (it is applied after
+/// this check), so it makes a Ray-discovered config usable.
+fn unresolved_cluster_vram(cfg: &ClusterConfig, overrides: &HardwareOverrides) -> Vec<usize> {
+    let memory_supplied = overrides
+        .memory
+        .as_deref()
+        .and_then(llmfit_core::hardware::parse_memory_size)
+        .is_some_and(|gb| gb > 0.0);
+    if memory_supplied {
+        Vec::new()
+    } else {
+        cfg.zero_vram_gpu_nodes()
+    }
 }
 
 fn resolve_context_limit(max_context: Option<u32>) -> Option<u32> {
@@ -804,6 +1514,50 @@ fn resolve_context_limit(max_context: Option<u32>) -> Option<u32> {
             None
         }
     }
+}
+
+fn configure_llama_cpp_path(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+
+    if path.is_dir() {
+        // Set an explicit override rather than mutating the process
+        // environment: `set_var` is `unsafe` and the repo forbids `unsafe`.
+        llmfit_core::providers::set_llama_cpp_path_override(path.to_path_buf());
+        return;
+    }
+
+    eprintln!(
+        "Error: --llama-cpp-path '{}' does not exist or is not a directory.",
+        path.display()
+    );
+    std::process::exit(1);
+}
+
+/// `llmfit system --json`: the `system` object every other JSON output
+/// reports, plus the `providers` block that only this command adds.
+fn display_json_system_with_providers(specs: &SystemSpecs) {
+    use llmfit_core::providers::{LlamaCppProvider, ModelProvider};
+
+    let llama_cpp = LlamaCppProvider::new();
+    let output = serde_json::json!({
+        "system": serve_shared::system_json(specs),
+        "providers": {
+            "llama.cpp": {
+                "available": llama_cpp.is_available(),
+                "llama_cli_path": llama_cpp.llama_cli_path(),
+                "llama_server_path": llama_cpp.llama_server_path(),
+                "server_running": llama_cpp.server_running(),
+                "binary_style": llama_cpp.binary_style().label(),
+                "detection_hint": llama_cpp.detection_hint(),
+            }
+        }
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
 }
 
 fn dashboard_pid_path() -> Option<std::path::PathBuf> {
@@ -831,6 +1585,39 @@ impl Drop for DashboardGuard {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Rust ignores SIGPIPE, so `llmfit list | head` panics with "failed printing
+/// to stdout" once `head` exits. The read-only commands only print, so let
+/// them die quietly like other command-line tools. `serve` and the TUI keep
+/// the Rust default.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called at the start of main, before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+fn is_readonly_subcommand(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::System
+            | Commands::Doctor
+            | Commands::Hardware { .. }
+            | Commands::Info { .. }
+            | Commands::Diff { .. }
+            | Commands::Plan { .. }
+            | Commands::Storage(..)
+            | Commands::Recommend { .. }
+            | Commands::Fit { .. }
+            | Commands::Concurrency { .. }
+            | Commands::Search { .. }
+            | Commands::HfSearch { .. }
+            | Commands::List { .. }
+            | Commands::Claim { .. }
+            | Commands::Bench { .. }
+    )
 }
 
 fn dashboard_target_from_env() -> (String, u16) {
@@ -891,11 +1678,26 @@ fn ensure_dashboard_available(
     if let Some(memory) = &overrides.memory {
         command.arg("--memory").arg(memory);
     }
+    if let Some(percent) = overrides.memory_percent {
+        command.arg("--memory-percent").arg(percent.to_string());
+    }
     if let Some(ram) = &overrides.ram {
         command.arg("--ram").arg(ram);
     }
+    if let Some(percent) = overrides.ram_percent {
+        command.arg("--ram-percent").arg(percent.to_string());
+    }
     if let Some(cores) = overrides.cpu_cores {
         command.arg("--cpu-cores").arg(cores.to_string());
+    }
+    if let Some(profile) = &overrides.profile {
+        command.arg("--profile").arg(profile);
+    }
+    if overrides.use_cluster {
+        command.arg("--cluster");
+    }
+    if overrides.no_cluster {
+        command.arg("--no-cluster");
     }
     if let Some(ctx) = context_limit {
         command.arg("--max-context").arg(ctx.to_string());
@@ -947,56 +1749,356 @@ fn ensure_dashboard_available(
     Some(DashboardGuard { child })
 }
 
+// ── hardware profiles ──────────────────────────────────────────────────────
+
+/// Validate one profile file the way `llmfit hardware validate` should:
+/// strictly. Loading tolerates unknown keys so a profile written for a newer
+/// llmfit still works, which means a typo'd key silently does nothing — this is
+/// where the user finds out.
+fn validate_profile_file(path: &std::path::Path) -> Result<HardwareProfile, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let profile = HardwareProfile::parse(&text)?;
+    profile.validate_strict()?;
+    profile.check_name_matches_stem(path)?;
+    Ok(profile)
+}
+
+fn format_gb(value: f64) -> String {
+    format!("{:.0} GB", value)
+}
+
+fn profile_row_json(loaded: &llmfit_core::hwprofile::LoadedProfile) -> serde_json::Value {
+    let hw = &loaded.profile.hardware;
+    serde_json::json!({
+        "name": loaded.profile.name,
+        "origin": loaded.origin.label(),
+        "total_ram_gb": hw.total_ram_gb,
+        "unified_memory": hw.unified_memory,
+        "gpu_memory_bandwidth_gbps": hw.gpu_memory_bandwidth_gbps,
+        "ddr_bandwidth_gbps": hw.ddr_bandwidth_gbps,
+        "gpu_compute_tflops_fp16": hw.gpu_compute_tflops_fp16,
+        "calibration_entries": loaded.profile.calibration.len(),
+    })
+}
+
+fn run_hardware(action: HardwareAction, json: bool) -> Result<(), String> {
+    match action {
+        HardwareAction::List => {
+            let catalog = llmfit_core::hwprofile::catalog();
+            if json {
+                let payload = serde_json::json!({
+                    "profiles": catalog.profiles.iter().map(profile_row_json).collect::<Vec<_>>(),
+                    "errors": catalog
+                        .errors
+                        .iter()
+                        .map(|(path, error)| serde_json::json!({
+                            "path": path.display().to_string(),
+                            "error": error,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("JSON serialization failed: {e}"))?
+                );
+                return Ok(());
+            }
+
+            println!("\n=== Hardware profiles ===");
+            println!(
+                "{:<26} {:>9} {:>8} {:>11} {:>13}  {}",
+                "NAME", "RAM", "UNIFIED", "GPU BW", "FP16 TFLOP/S", "SOURCE"
+            );
+            for loaded in &catalog.profiles {
+                let hw = &loaded.profile.hardware;
+                println!(
+                    "{:<26} {:>9} {:>8} {:>11} {:>13}  {}",
+                    loaded.profile.name,
+                    format_gb(hw.total_ram_gb),
+                    if hw.unified_memory { "yes" } else { "no" },
+                    hw.gpu_memory_bandwidth_gbps
+                        .map(|b| format!("{b:.0} GB/s"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    hw.gpu_compute_tflops_fp16
+                        .map(|t| format!("{t:.1}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    loaded.origin.label(),
+                );
+            }
+            if catalog.profiles.is_empty() {
+                println!("(none)");
+            }
+            for (path, error) in &catalog.errors {
+                eprintln!("Warning: ignoring {}: {}", path.display(), error);
+            }
+            println!("\nScore models against one with: llmfit --profile <NAME> fit");
+            Ok(())
+        }
+
+        HardwareAction::Show { profile } => {
+            let loaded = llmfit_core::hwprofile::resolve(&profile)?;
+            let hw = &loaded.profile.hardware;
+
+            // What the profile means for *this* host: capacity is absolute, but
+            // the bandwidth actually used still goes through the same
+            // resolution order the estimator uses, so an unset profile field
+            // falls back to the detected GPU rather than reading as zero.
+            let mut config = CalcConfig::default();
+            let specs = loaded
+                .profile
+                .apply(detect_specs(&HardwareOverrides::none()), &mut config);
+            let effective_bandwidth = llmfit_core::fit::resolve_gpu_bandwidth(&specs, &config);
+
+            if json {
+                let payload = serde_json::json!({
+                    "profile": loaded.profile,
+                    "origin": loaded.origin.label(),
+                    "effective": {
+                        "total_ram_gb": specs.total_ram_gb,
+                        "unified_memory": specs.unified_memory,
+                        "gpu_vram_gb": specs.total_gpu_vram_gb,
+                        "gpu_bandwidth_gbps": effective_bandwidth,
+                        "efficiency": config.efficiency,
+                    },
+                    "calibration_applied": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("JSON serialization failed: {e}"))?
+                );
+                return Ok(());
+            }
+
+            println!("\n=== Hardware profile: {} ===", loaded.profile.name);
+            println!("Source:                {}", loaded.origin.label());
+            println!("Schema version:        {}", loaded.profile.schema_version);
+            if let Some(matcher) = &loaded.profile.matcher {
+                println!(
+                    "Describes GPU:         {} (provenance only — profiles are never auto-selected)",
+                    matcher.gpu_name_contains
+                );
+            }
+
+            println!("\nHardware");
+            println!("  Total RAM:           {:.2} GB", hw.total_ram_gb);
+            println!(
+                "  Unified memory:      {}",
+                if hw.unified_memory { "yes" } else { "no" }
+            );
+            match hw.gpu_memory_bandwidth_gbps {
+                Some(bw) => println!("  GPU bandwidth:       {bw:.0} GB/s"),
+                None => println!("  GPU bandwidth:       not set (detected GPU is used)"),
+            }
+            match hw.ddr_bandwidth_gbps {
+                Some(bw) => println!("  DDR bandwidth:       {bw:.0} GB/s"),
+                None => println!("  DDR bandwidth:       not set (measured or 50 GB/s fallback)"),
+            }
+            match hw.gpu_compute_tflops_fp16 {
+                Some(tflops) => println!("  GPU fp16 throughput: {tflops:.1} TFLOP/s"),
+                None => {
+                    println!("  GPU fp16 throughput: not set (prefill and TTFT report null)")
+                }
+            }
+
+            if let Some(est) = &loaded.profile.estimation {
+                println!("\nEstimation");
+                if let Some(efficiency) = est.efficiency {
+                    println!("  Bandwidth efficiency: {efficiency:.2}");
+                }
+                if let Some(factors) = &est.run_mode_factors {
+                    for (label, value) in [
+                        ("gpu", factors.gpu),
+                        ("tensor_parallel", factors.tensor_parallel),
+                        ("moe_offload", factors.moe_offload),
+                        ("cpu_offload", factors.cpu_offload),
+                        ("cpu_only", factors.cpu_only),
+                    ] {
+                        if let Some(value) = value {
+                            println!("  Run mode {label:<16} x{value:.2}");
+                        }
+                    }
+                }
+            }
+
+            if !loaded.profile.calibration.is_empty() {
+                println!(
+                    "\nCalibration ({} entr{}, recorded but not applied in schema version {})",
+                    loaded.profile.calibration.len(),
+                    if loaded.profile.calibration.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    llmfit_core::hwprofile::SCHEMA_VERSION
+                );
+                for entry in &loaded.profile.calibration {
+                    println!(
+                        "  {} {} {} — {:.1} tok/s{}",
+                        entry.model,
+                        entry.quant.as_deref().unwrap_or("-"),
+                        entry.run_mode.as_deref().unwrap_or("-"),
+                        entry.measured_tps,
+                        entry
+                            .source
+                            .as_deref()
+                            .map(|s| format!(" ({s})"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+
+            println!("\nOn this machine");
+            println!("  RAM:                 {:.2} GB", specs.total_ram_gb);
+            match specs.total_gpu_vram_gb {
+                Some(vram) => println!("  VRAM pool:           {vram:.2} GB"),
+                None => println!("  VRAM pool:           none detected"),
+            }
+            match effective_bandwidth {
+                Some(bw) => println!("  GPU bandwidth used:  {bw:.0} GB/s"),
+                None => println!("  GPU bandwidth used:  unknown (per-backend fallback)"),
+            }
+            if !hw.unified_memory {
+                println!("  Note: profiles carry no VRAM figure, so VRAM stays as detected here.");
+            }
+            println!();
+            Ok(())
+        }
+
+        HardwareAction::Validate { paths } => {
+            let results: Vec<(std::path::PathBuf, Result<HardwareProfile, String>)> = paths
+                .into_iter()
+                .map(|path| {
+                    let result = validate_profile_file(&path);
+                    (path, result)
+                })
+                .collect();
+            let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+
+            if json {
+                let payload = serde_json::json!({
+                    "ok": failed == 0,
+                    "results": results
+                        .iter()
+                        .map(|(path, result)| match result {
+                            Ok(profile) => serde_json::json!({
+                                "path": path.display().to_string(),
+                                "ok": true,
+                                "name": profile.name,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "path": path.display().to_string(),
+                                "ok": false,
+                                "error": error,
+                            }),
+                        })
+                        .collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("JSON serialization failed: {e}"))?
+                );
+            } else {
+                for (path, result) in &results {
+                    match result {
+                        Ok(profile) => println!("ok    {} ({})", path.display(), profile.name),
+                        Err(error) => println!("FAIL  {}: {}", path.display(), error),
+                    }
+                }
+            }
+
+            if failed > 0 {
+                return Err(format!(
+                    "{failed} of {} profile file(s) failed validation",
+                    results.len()
+                ));
+            }
+            Ok(())
+        }
+
+        HardwareAction::Path => {
+            let dir = llmfit_core::hwprofile::user_profile_dir()
+                .ok_or_else(|| "cannot determine the user profile directory".to_string())?;
+            let exists = dir.is_dir();
+            if json {
+                let payload = serde_json::json!({
+                    "path": dir.display().to_string(),
+                    "exists": exists,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("JSON serialization failed: {e}"))?
+                );
+            } else {
+                println!("{}", dir.display());
+                if !exists {
+                    eprintln!(
+                        "(directory does not exist yet — create it and drop <name>.json profiles in)"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run_fit(
     perfect: bool,
+    show_incompatible: bool,
     tool_use: bool,
+    providers: &[String],
     limit: Option<usize>,
     sort: SortColumn,
     json: bool,
     csv: bool,
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
+    concurrency: bool,
 ) {
-    use llmfit_core::providers::{
-        self as provs, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-        ModelProvider, OllamaProvider,
-    };
-
-    let specs = detect_specs(overrides);
+    let (specs, config) = detect_specs_and_config(overrides);
     let db = ModelDatabase::new();
 
     if !json && !csv {
         specs.display();
     }
 
-    // Query installed models across local providers so that `fit.installed`
-    // is populated in both text and JSON output — same behaviour as `recommend`.
-    let ollama_installed = OllamaProvider::new().installed_models();
-    let mlx_installed = MlxProvider::new().installed_models();
-    let llamacpp_installed = LlamaCppProvider::new().installed_models();
-    let docker_mr_installed = DockerModelRunnerProvider::new().installed_models();
-    let lmstudio_installed = LmStudioProvider::new().installed_models();
+    let installed = llmfit_core::analysis::InstalledIndex::detect_all();
 
-    let hidden: usize = db
-        .get_all_models()
-        .iter()
-        .filter(|m| !backend_compatible(m, &specs))
-        .count();
+    let hidden = llmfit_core::analysis::backend_hidden_count(db.get_all_models(), &specs);
+    let incompatible_context = context_limit.or(config.as_ref().and_then(|c| c.context_cap));
 
-    let mut fits: Vec<ModelFit> = db
-        .get_all_models()
-        .iter()
-        .filter(|m| backend_compatible(m, &specs))
-        .map(|m| {
-            let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
-            fit.installed = provs::is_model_installed(&m.name, &ollama_installed)
-                || provs::is_model_installed_mlx(&m.name, &mlx_installed)
-                || provs::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                || provs::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                || provs::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
-            fit
-        })
-        .collect();
+    let mut fits = match config {
+        Some(config) => llmfit_core::analysis::build_model_fits_with_config(
+            &db,
+            &specs,
+            &installed,
+            context_limit,
+            config,
+        ),
+        None => {
+            llmfit_core::analysis::build_model_fits(&db, &specs, &installed, context_limit, None)
+        }
+    };
+
+    if show_incompatible {
+        fits.extend(
+            db.get_all_models()
+                .iter()
+                .filter(|model| {
+                    !model.is_sanitization_demoted()
+                        && !llmfit_core::fit::backend_compatible(model, &specs)
+                })
+                .map(|model| {
+                    let mut fit = backend_incompatible_fit(model, &specs, incompatible_context);
+                    fit.installed = installed.is_installed(model);
+                    fit
+                }),
+        );
+    }
 
     if perfect {
         fits.retain(|f| f.fit_level == llmfit_core::fit::FitLevel::Perfect);
@@ -1007,6 +2109,16 @@ fn run_fit(
             f.model
                 .capabilities
                 .contains(&llmfit_core::models::Capability::ToolUse)
+        });
+    }
+
+    if !providers.is_empty() {
+        fits.retain(|fit| {
+            matches_provider_filter(&fit.model, |candidate| {
+                providers
+                    .iter()
+                    .any(|provider| candidate.eq_ignore_ascii_case(provider.trim()))
+            })
         });
     }
 
@@ -1021,7 +2133,7 @@ fn run_fit(
     } else if json {
         display::display_json_fits(&specs, &fits);
     } else {
-        if hidden > 0 {
+        if hidden > 0 && !show_incompatible {
             eprintln!(
                 "({} model{} hidden — incompatible backend)",
                 hidden,
@@ -1029,7 +2141,65 @@ fn run_fit(
             );
         }
         display::display_model_fits(&fits);
+        if concurrency {
+            print_concurrency_section(&fits, context_limit);
+        }
     }
+}
+
+/// Catalog information for an incompatible backend, without hypothetical
+/// execution paths or throughput being presented as runnable results.
+fn backend_incompatible_fit(
+    model: &llmfit_core::models::LlmModel,
+    specs: &SystemSpecs,
+    context_limit: Option<u32>,
+) -> ModelFit {
+    use llmfit_core::fit::{
+        EstimateBasis, EstimateConfidence, FitLevel, InferenceRuntime, RunMode, ScoreComponents,
+        UNSUPPORTED_METHOD,
+    };
+
+    let mut fit = ModelFit::analyze_with_context_limit(model, specs, context_limit);
+    let reason = if model.requires_specialized_runtime() {
+        "Requires a specialized TTS runtime; llama.cpp/MLX/vLLM fit is not supported yet"
+            .to_string()
+    } else if model.is_mlx_model() {
+        "Requires MLX on Apple Silicon with Metal and unified memory".to_string()
+    } else {
+        format!(
+            "{} requires a supported CUDA/ROCm quantization kernel",
+            model.quantization
+        )
+    };
+    fit.notes = vec![format!("Not runnable on this hardware: {reason}")];
+    fit.fit_level = FitLevel::TooTight;
+    fit.runtime = InferenceRuntime::Unsupported;
+    fit.run_mode = RunMode::CpuOnly;
+    fit.memory_required_gb =
+        model.estimate_memory_gb(&model.quantization, fit.effective_context_length);
+    fit.memory_available_gb = 0.0;
+    fit.utilization_pct = 0.0;
+    fit.moe_offloaded_gb = None;
+    fit.score = 0.0;
+    fit.score_components = ScoreComponents {
+        quality: 0.0,
+        speed: 0.0,
+        fit: 0.0,
+        context: 0.0,
+    };
+    fit.estimated_tps = 0.0;
+    fit.best_quant = model.quantization.clone();
+    fit.usable_context = 0;
+    fit.fits_with_turboquant = false;
+    fit.estimate_basis = EstimateBasis {
+        method: UNSUPPORTED_METHOD.to_string(),
+        ..EstimateBasis::default()
+    };
+    fit.measured_tps = None;
+    fit.estimate_confidence = EstimateConfidence::Unsupported;
+    fit.prefill_tps = None;
+    fit.ttft_ms = None;
+    fit
 }
 
 fn fit_matches_filter(fit: &ModelFit, filter: FitArg) -> bool {
@@ -1096,6 +2266,24 @@ fn find_fit_index_by_selector(fits: &[ModelFit], selector: &str) -> Result<usize
     find_name_index_by_selector(fits, selector, |fit| fit.model.name.as_str())
 }
 
+fn selector_error_kind(message: &str) -> &'static str {
+    if message.starts_with("No model found") {
+        "model_not_found"
+    } else {
+        "invalid_selector"
+    }
+}
+
+/// JSON error kind for a command that resolves one model: selector errors keep
+/// their own kinds, anything else is reported under the command's name.
+fn command_error_kind(command: &'static str, message: &str) -> &'static str {
+    if message.starts_with("No model found") || message.starts_with("Model selector") {
+        selector_error_kind(message)
+    } else {
+        command
+    }
+}
+
 fn run_diff(
     model_a: Option<String>,
     model_b: Option<String>,
@@ -1116,17 +2304,26 @@ fn run_diff(
         std::process::exit(1);
     }
 
-    let specs = detect_specs(overrides);
+    let (specs, config) = detect_specs_and_config(overrides);
     let db = ModelDatabase::new();
 
-    let mut fits: Vec<ModelFit> = db
-        .get_all_models()
-        .iter()
-        .filter(|m| backend_compatible(m, &specs))
-        .map(|m| ModelFit::analyze_with_context_limit(m, &specs, context_limit))
-        .collect();
+    let mut fits: Vec<ModelFit> =
+        llmfit_core::analysis::rankable_models(db.get_all_models(), &specs)
+            .map(|m| {
+                llmfit_core::analysis::analyze_with_optional_config(
+                    m,
+                    &specs,
+                    context_limit,
+                    config.as_ref(),
+                )
+            })
+            .collect();
 
-    fits.retain(|f| fit_matches_filter(f, fit_filter));
+    // The fit filter only picks candidates for auto-compare; named models are
+    // compared whatever their fit, like `info` shows them.
+    if model_a.is_none() {
+        fits.retain(|f| fit_matches_filter(f, fit_filter));
+    }
     fits = llmfit_core::fit::rank_models_by_fit_opts_col(fits, false, sort);
 
     let selected: Vec<ModelFit> =
@@ -1134,14 +2331,22 @@ fn run_diff(
             let a_idx = match find_fit_index_by_selector(&fits, a) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    if json {
+                        display::display_json_error(selector_error_kind(&e), &e);
+                    } else {
+                        eprintln!("Error: {}", e);
+                    }
                     std::process::exit(1);
                 }
             };
             let b_idx = match find_fit_index_by_selector(&fits, b) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    if json {
+                        display::display_json_error(selector_error_kind(&e), &e);
+                    } else {
+                        eprintln!("Error: {}", e);
+                    }
                     std::process::exit(1);
                 }
             };
@@ -1151,7 +2356,7 @@ fn run_diff(
                 std::process::exit(1);
             }
 
-            vec![fits[a_idx].clone(), fits[b_idx].clone()]
+            named_pair_for_diff(&fits, a_idx, b_idx)
         } else {
             if fits.len() < 2 {
                 eprintln!("Error: need at least 2 models after filtering to compare");
@@ -1164,8 +2369,23 @@ fn run_diff(
         display::display_json_diff_fits(&specs, &selected);
     } else {
         specs.display();
-        display::display_model_diff(&selected, sort.label());
+        let named = model_a.is_some() && model_b.is_some();
+        display::display_model_diff(&selected, &display::diff_order_label(named, sort.label()));
     }
+}
+
+/// The two named `diff` models, in the order they were named, except that a
+/// model that cannot run (Too Tight, including refused cluster layouts) never
+/// heads the table over one that can: the first column is the baseline the
+/// other model's deltas are measured against.
+fn named_pair_for_diff(fits: &[ModelFit], a_idx: usize, b_idx: usize) -> Vec<ModelFit> {
+    let runs = |i: usize| fits[i].fit_level != llmfit_core::fit::FitLevel::TooTight;
+    let (first, second) = if !runs(a_idx) && runs(b_idx) {
+        (b_idx, a_idx)
+    } else {
+        (a_idx, b_idx)
+    };
+    vec![fits[first].clone(), fits[second].clone()]
 }
 
 fn run_tui(
@@ -1202,11 +2422,12 @@ fn run_tui_inner(
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+
     draw_boot_screen(&mut terminal, "Detecting system hardware...")?;
 
     // Create app state (provider detection runs in background threads)
-    let specs = detect_specs(overrides);
-    let mut app = tui_app::App::with_specs_and_context(specs, context_limit);
+    let (specs, config) = detect_specs_and_config(overrides);
+    let mut app = tui_app::App::with_specs_context_and_config(specs, context_limit, config);
     if api_key.is_some() {
         app.bench_api_key = api_key;
     }
@@ -1214,6 +2435,19 @@ fn run_tui_inner(
     if open_bench {
         app.open_bench();
     }
+
+    // Force a full clear AFTER the first drawn frame (the boot screen), not
+    // before it: on some terminals (notably Windows Terminal, #732) a clear
+    // issued before any draw is a no-op, so clearing here — after the backend
+    // has drawn once — is what actually removes the previous shell content
+    // that EnterAlternateScreen leaves visible under sparse frames.
+    clear_tui_after_boot(&mut terminal)?;
+
+    let size = terminal.size()?;
+    tui_events::update_model_viewport(
+        &mut app,
+        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+    );
 
     // Main loop
     loop {
@@ -1238,6 +2472,20 @@ fn run_tui_inner(
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+/// Clear the fullscreen TUI after the boot frame without querying the cursor.
+///
+/// `Terminal::clear` snapshots the cursor first, which makes crossterm issue a
+/// device-status request (`ESC[6n`). Some headless PTY emulators do not relay
+/// the terminal's response. Resizing to the backend's current size uses
+/// Ratatui's cursor-independent fullscreen clear path and resets its comparison
+/// buffer, so the next draw still repaints the entire screen.
+fn clear_tui_after_boot<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
 }
 
 fn draw_boot_screen(
@@ -1288,7 +2536,7 @@ fn run_recommend(
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
 ) {
-    let specs = detect_specs(overrides);
+    let (specs, config) = detect_specs_and_config(overrides);
     let db = ModelDatabase::new();
 
     // Parse --force-runtime into an InferenceRuntime if provided
@@ -1298,51 +2546,55 @@ fn run_recommend(
             "mlx" => llmfit_core::fit::InferenceRuntime::Mlx,
             "llamacpp" | "llama.cpp" | "llama_cpp" => llmfit_core::fit::InferenceRuntime::LlamaCpp,
             "vllm" => llmfit_core::fit::InferenceRuntime::Vllm,
+            "bitnetcpp" | "bitnet.cpp" | "bitnet" => llmfit_core::fit::InferenceRuntime::BitNet,
             other => {
                 eprintln!(
-                    "Unknown runtime '{}'. Valid options: mlx, llamacpp, vllm",
+                    "Unknown runtime '{}'. Valid options: mlx, llamacpp, vllm, bitnetcpp",
                     other
                 );
                 std::process::exit(1);
             }
         });
 
-    // Query installed models across local providers so that `fit.installed`
-    // is populated for CLI output (same behavior as the TUI). This also causes
-    // backends like Docker Model Runner to receive a probe request when
-    // DOCKER_MODEL_RUNNER_HOST is set.
-    use llmfit_core::providers::{
-        self as provs, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-        ModelProvider, OllamaProvider,
-    };
-    let ollama_installed = OllamaProvider::new().installed_models();
-    let mlx_installed = MlxProvider::new().installed_models();
-    let llamacpp_installed = LlamaCppProvider::new().installed_models();
-    let docker_mr_installed = DockerModelRunnerProvider::new().installed_models();
-    let lmstudio_installed = LmStudioProvider::new().installed_models();
+    let installed = llmfit_core::analysis::InstalledIndex::detect_all();
 
-    let mut fits: Vec<ModelFit> = db
-        .get_all_models()
-        .iter()
-        .filter(|m| backend_compatible(m, &specs))
-        .map(|m| {
-            let mut fit =
-                ModelFit::analyze_with_forced_runtime(m, &specs, context_limit, forced_rt);
-            fit.installed = provs::is_model_installed(&m.name, &ollama_installed)
-                || provs::is_model_installed_mlx(&m.name, &mlx_installed)
-                || provs::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                || provs::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                || provs::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
-            fit
-        })
-        .collect();
+    // A forced runtime and a profile's `CalcConfig` cannot both reach
+    // `ModelFit` today, so refuse the combination rather than silently
+    // dropping one of them (see `build_model_fits_with_config`).
+    if config.is_some() && forced_rt.is_some() {
+        eprintln!("Error: --profile cannot be combined with --force-runtime yet");
+        std::process::exit(1);
+    }
+
+    let mut fits = match config {
+        Some(config) => llmfit_core::analysis::build_model_fits_with_config(
+            &db,
+            &specs,
+            &installed,
+            context_limit,
+            config,
+        ),
+        None => llmfit_core::analysis::build_model_fits(
+            &db,
+            &specs,
+            &installed,
+            context_limit,
+            forced_rt,
+        ),
+    };
 
     // Filter by minimum fit level
     let min_level = match min_fit.to_lowercase().as_str() {
         "perfect" => llmfit_core::fit::FitLevel::Perfect,
         "good" => llmfit_core::fit::FitLevel::Good,
         "marginal" => llmfit_core::fit::FitLevel::Marginal,
-        _ => llmfit_core::fit::FitLevel::Marginal,
+        other => {
+            eprintln!(
+                "Unknown --min-fit '{}'. Valid options: perfect, good, marginal",
+                other
+            );
+            std::process::exit(1);
+        }
     };
     fits.retain(|f| match (min_level, f.fit_level) {
         (llmfit_core::fit::FitLevel::Marginal, llmfit_core::fit::FitLevel::TooTight) => false,
@@ -1369,32 +2621,49 @@ fn run_recommend(
             fits.retain(|f| f.runtime == llmfit_core::fit::InferenceRuntime::LlamaCpp)
         }
         "vllm" => fits.retain(|f| f.runtime == llmfit_core::fit::InferenceRuntime::Vllm),
-        _ => {} // "any" or unrecognized — keep all
+        "bitnetcpp" | "bitnet.cpp" | "bitnet" => {
+            fits.retain(|f| f.runtime == llmfit_core::fit::InferenceRuntime::BitNet)
+        }
+        "any" => {}
+        other => {
+            eprintln!(
+                "Unknown --runtime '{}'. Valid options: mlx, llamacpp, vllm, bitnetcpp, any",
+                other
+            );
+            std::process::exit(1);
+        }
     }
 
     // Filter by use case if specified
     if let Some(ref uc) = use_case {
         let target = match uc.to_lowercase().as_str() {
-            "coding" | "code" => Some(llmfit_core::models::UseCase::Coding),
-            "reasoning" | "reason" => Some(llmfit_core::models::UseCase::Reasoning),
-            "chat" => Some(llmfit_core::models::UseCase::Chat),
-            "multimodal" | "vision" => Some(llmfit_core::models::UseCase::Multimodal),
-            "embedding" | "embed" => Some(llmfit_core::models::UseCase::Embedding),
-            "general" => Some(llmfit_core::models::UseCase::General),
-            _ => None,
+            "coding" | "code" => llmfit_core::models::UseCase::Coding,
+            "reasoning" | "reason" => llmfit_core::models::UseCase::Reasoning,
+            "chat" => llmfit_core::models::UseCase::Chat,
+            "multimodal" | "vision" => llmfit_core::models::UseCase::Multimodal,
+            "embedding" | "embed" => llmfit_core::models::UseCase::Embedding,
+            "general" => llmfit_core::models::UseCase::General,
+            other => {
+                eprintln!(
+                    "Unknown --use-case '{}'. Valid options: general, coding, reasoning, chat, multimodal, embedding",
+                    other
+                );
+                std::process::exit(1);
+            }
         };
-        if let Some(target_uc) = target {
-            fits.retain(|f| f.use_case == target_uc);
-        }
+        fits.retain(|f| f.use_case == target);
     }
 
     // Filter by capability if specified
     if let Some(ref caps_str) = capability {
-        let requested: Vec<&str> = caps_str.split(',').map(|s| s.trim()).collect();
-        fits.retain(|f| {
-            requested
-                .iter()
-                .all(|req| match req.to_lowercase().as_str() {
+        let requested: Vec<String> = caps_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !requested.is_empty() {
+            fits.retain(|f| {
+                requested.iter().all(|req| match req.as_str() {
                     "vision" => f
                         .model
                         .capabilities
@@ -1403,9 +2672,18 @@ fn run_recommend(
                         .model
                         .capabilities
                         .contains(&llmfit_core::models::Capability::ToolUse),
-                    _ => true,
+                    "audio" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Audio),
+                    "tts" | "text-to-speech" | "text_to_speech" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Tts),
+                    _ => false,
                 })
-        });
+            });
+        }
     }
 
     // Filter by license if specified
@@ -1653,7 +2931,11 @@ fn run_download(
                                 "\n  Run with: llmfit run {}",
                                 local_name.trim_end_matches(".gguf")
                             );
-                            println!("  Or directly: llama-cli -m {} -cnv", dest.display());
+                            println!(
+                                "  Or directly: {} -m {} -cnv",
+                                provider.binary_style().cli_command(),
+                                dest.display()
+                            );
                         } else {
                             println!("\n  Install llama.cpp to run this model:");
                             println!("    brew install llama.cpp");
@@ -1842,6 +3124,7 @@ fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
             model_path.display()
         );
         let status = std::process::Command::new(bin)
+            .args(provider.binary_style().server_args())
             .args([
                 "-m",
                 model_path.to_str().unwrap_or(""),
@@ -1874,6 +3157,7 @@ fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
 
         println!("Running {} with llama-cli...\n", model_path.display());
         let status = std::process::Command::new(bin)
+            .args(provider.binary_style().cli_args())
             .args([
                 "-m",
                 model_path.to_str().unwrap_or(""),
@@ -1898,6 +3182,67 @@ fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
     }
 }
 
+fn run_storage(
+    args: StorageArgs,
+    json: bool,
+    csv: bool,
+    overrides: &HardwareOverrides,
+    context_limit: Option<u32>,
+) -> Result<(), String> {
+    if csv {
+        return Err("storage supports text or --json output; --csv is not supported".to_string());
+    }
+    let search = args.search.as_deref().map(str::trim);
+    if search == Some("") {
+        return Err("--search must not be empty".to_string());
+    }
+    let request = StorageRequest {
+        keep: args.keep,
+        selection: match args.selection {
+            StorageSelectionArg::Score => StorageSelection::Score,
+            StorageSelectionArg::Largest => StorageSelection::Largest,
+        },
+        os_reserve_gb: parse_storage_size(&args.os_reserve)?,
+        scratch: if args.scratch.trim().eq_ignore_ascii_case("auto") {
+            ScratchPolicy::Auto
+        } else {
+            ScratchPolicy::Fixed(parse_storage_size(&args.scratch)?)
+        },
+        headroom_percent: args.headroom,
+        perfect: args.perfect,
+    };
+    let db = ModelDatabase::new();
+    let (specs, config) = detect_specs_and_config(overrides);
+    let installed = llmfit_core::analysis::InstalledIndex::empty();
+    let mut fits = match config {
+        Some(config) => llmfit_core::analysis::build_model_fits_with_config(
+            &db,
+            &specs,
+            &installed,
+            context_limit,
+            config,
+        ),
+        None => {
+            llmfit_core::analysis::build_model_fits(&db, &specs, &installed, context_limit, None)
+        }
+    };
+    if let Some(search) = search {
+        let names: std::collections::HashSet<&str> = db
+            .find_model(search)
+            .into_iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        fits.retain(|fit| names.contains(fit.model.name.as_str()));
+    }
+    let estimate = estimate_storage(fits, &request)?;
+    if json {
+        display::display_json_storage(&specs, &estimate)?;
+    } else {
+        display::display_storage(&estimate);
+    }
+    Ok(())
+}
+
 fn run_plan(
     model_selector: &str,
     context: u32,
@@ -1908,7 +3253,7 @@ fn run_plan(
     overrides: &HardwareOverrides,
 ) -> Result<(), String> {
     let db = ModelDatabase::new();
-    let specs = detect_specs(overrides);
+    let (specs, config) = detect_specs_and_config(overrides);
     let model = resolve_model_selector(db.get_all_models(), model_selector)?;
 
     let kv_quant = match kv_quant {
@@ -1936,7 +3281,15 @@ fn run_plan(
         target_tps,
         kv_quant,
     };
-    let plan = estimate_model_plan(model, &request, &specs)?;
+    // A profile's bandwidth and efficiency are what separate one machine's
+    // plan from another's; the default config would report this host's
+    // numbers under the profile's name (issue #969).
+    let plan = estimate_model_plan_with_config(
+        model,
+        &request,
+        &specs,
+        &config.unwrap_or_else(CalcConfig::default),
+    )?;
 
     if json {
         display::display_json_plan(&plan);
@@ -1948,13 +3301,197 @@ fn run_plan(
     Ok(())
 }
 
+fn fmt_context_short(tokens: u32) -> String {
+    if tokens % 1024 == 0 {
+        format!("{}k", tokens / 1024)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Format a per-session memory figure for the capacity tables. Uses GB at two
+/// decimals at or above 0.01 GB, and MiB below that, so a sub-10-MiB KV cache
+/// (tiny models or short contexts) does not render as "0.00 GB" beside a large
+/// session count.
+fn fmt_gb_per_session(gb: f64) -> String {
+    if gb >= 0.01 {
+        format!("{gb:.2} GB")
+    } else {
+        format!("{:.1} MiB", gb * 1024.0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_concurrency(
+    model_selector: &str,
+    quant: Option<String>,
+    kv_quant: Option<String>,
+    context: Option<u32>,
+    users: Option<u32>,
+    json: bool,
+    overrides: &HardwareOverrides,
+    context_limit: Option<u32>,
+) -> Result<(), String> {
+    if let Some(q) = quant.as_deref()
+        && !llmfit_core::models::quant_is_recognized(q)
+    {
+        return Err(format!(
+            "Unrecognized --quant '{q}'. Expected a known label such as Q4_K_M, Q6_K, Q8_0, or mlx-4bit (case-sensitive)."
+        ));
+    }
+    let db = ModelDatabase::new();
+    let (specs, _config) = detect_specs_and_config(overrides);
+    let model = resolve_model_selector(db.get_all_models(), model_selector)?;
+
+    let kv = match kv_quant {
+        Some(s) => llmfit_core::models::KvQuant::parse(&s).ok_or_else(|| {
+            format!(
+                "Unsupported --kv-quant '{}'. Valid: fp16, fp8, q8_0, q4_0, tq",
+                s
+            )
+        })?,
+        None => llmfit_core::models::KvQuant::Fp16,
+    };
+
+    let fit = ModelFit::analyze_with_context_limit(model, &specs, context_limit);
+    let quant = quant.unwrap_or_else(|| fit.best_quant.clone());
+    let pool = fit.memory_available_gb;
+
+    // Requested contexts stay as asked; estimate_concurrency clamps each to the
+    // effective ceiling (native window, and context_limit if set) while keeping
+    // the requested value and marking clamped rungs, so a global cap does not
+    // corrupt the structured requested-vs-effective metadata.
+    let contexts: Vec<u32> = match context {
+        Some(c) => vec![c],
+        None => llmfit_core::concurrency::DEFAULT_CONTEXT_LADDER.to_vec(),
+    };
+
+    let est = llmfit_core::concurrency::estimate_concurrency(
+        &fit.model,
+        pool,
+        &quant,
+        kv,
+        &contexts,
+        fit.run_mode,
+        context_limit,
+    );
+
+    if json {
+        let payload = serde_json::json!({
+            "model": fit.model.name,
+            "run_mode": format!("{:?}", fit.run_mode),
+            "fit_level": format!("{:?}", fit.fit_level),
+            "target_users": users,
+            "max_context_for_target": users.and_then(|u| est.max_context_for(u)),
+            "estimate": est,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    specs.display();
+    println!();
+    println!("Concurrent-session capacity - {}", fit.model.name);
+    println!(
+        "  pool {:.1} GB | weights+overhead {:.1} GB resident | {:.1} GB for KV | quant {} | KV {}",
+        est.pool_gb,
+        est.weights_resident_gb,
+        est.kv_budget_gb,
+        est.quant,
+        est.kv_quant.label()
+    );
+    println!("  native context {}", fmt_context_short(est.native_context));
+    println!();
+    println!(
+        "  {:>9}  {:>5}  {:>13}  {:>8}",
+        "context", "clamp", "KV/session", "sessions"
+    );
+    let mut last_shown: Option<(u32, u32)> = None;
+    for slot in &est.ladder {
+        // Rungs above the native window all clamp to it and repeat the same
+        // row; print each distinct (context, sessions) pair once.
+        let key = (slot.effective_context, slot.max_sessions);
+        if last_shown == Some(key) {
+            continue;
+        }
+        last_shown = Some(key);
+        println!(
+            "  {:>9}  {:>5}  {:>13}  {:>8}",
+            fmt_context_short(slot.effective_context),
+            if slot.clamped { "clamp" } else { "" },
+            fmt_gb_per_session(slot.per_session_kv_gb),
+            slot.max_sessions
+        );
+    }
+    if let Some(u) = users {
+        println!();
+        match est.max_context_for(u) {
+            Some(c) => println!(
+                "  {} concurrent sessions fit up to a {} context.",
+                u,
+                fmt_context_short(c)
+            ),
+            None => println!(
+                "  {} concurrent sessions do not fit at any listed context.",
+                u
+            ),
+        }
+    }
+    println!();
+    println!("  Memory-capacity ceiling (sessions resident), not a throughput figure under load.");
+
+    Ok(())
+}
+
+fn print_concurrency_section(fits: &[ModelFit], context_limit: Option<u32>) {
+    if fits.is_empty() {
+        return;
+    }
+    println!();
+    // Clamp the reference context to a global cap so the density view never
+    // reports a context above --max-context / OLLAMA_CONTEXT_LENGTH.
+    let ref_ctx = context_limit.map_or(llmfit_core::fit::DEFAULT_ESTIMATION_CTX, |c| {
+        c.min(llmfit_core::fit::DEFAULT_ESTIMATION_CTX)
+    });
+    println!(
+        "Concurrent sessions at a {} context (fp16 KV, memory ceiling):",
+        fmt_context_short(ref_ctx)
+    );
+    for f in fits {
+        let est = llmfit_core::concurrency::estimate_concurrency(
+            &f.model,
+            f.memory_available_gb,
+            &f.best_quant,
+            llmfit_core::models::KvQuant::Fp16,
+            &[ref_ctx],
+            f.run_mode,
+            None,
+        );
+        let slot = &est.ladder[0];
+        println!(
+            "  {:<40} {:>4} @ {:>7}  ({}, {}/session)",
+            truncate_str(&f.model.name, 40),
+            slot.max_sessions,
+            fmt_context_short(slot.effective_context),
+            f.best_quant,
+            fmt_gb_per_session(slot.per_session_kv_gb)
+        );
+    }
+}
+
 // ── bench helpers ──────────────────────────────────────────────────────────
 
 fn target_info(target: &bench::BenchTarget) -> (&str, &str, &str) {
     match target {
         bench::BenchTarget::Ollama { url, model } => ("Ollama", url.as_str(), model.as_str()),
         bench::BenchTarget::VLlm { url, model } => ("vLLM", url.as_str(), model.as_str()),
+        bench::BenchTarget::Ferrum { url, model } => ("Ferrum", url.as_str(), model.as_str()),
         bench::BenchTarget::Mlx { url, model } => ("MLX", url.as_str(), model.as_str()),
+        bench::BenchTarget::LlamaCpp { url, model } => ("llama.cpp", url.as_str(), model.as_str()),
+        bench::BenchTarget::LmStudio { url, model } => ("LM Studio", url.as_str(), model.as_str()),
     }
 }
 
@@ -1970,6 +3507,7 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench(
     model: Option<String>,
     provider: &str,
@@ -1977,14 +3515,31 @@ fn run_bench(
     runs: u32,
     all: bool,
     json: bool,
+    share_opts: Option<share::ShareOptions>,
+    overrides: &HardwareOverrides,
 ) {
     let runs = runs as usize;
+
+    // With --share, resolve and verify GitHub credentials up front so a
+    // missing or expired token surfaces before minutes of benchmarking.
+    let share_token = match &share_opts {
+        Some(opts) if !opts.dry_run => match share::preflight_auth() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("Error: --share: {e}");
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
 
     // --all mode: discover and bench every available model
     if all {
         let targets = bench::discover_all_targets();
         if targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!(
+                "No providers or models found. Start Ollama, vLLM, Ferrum, LM Studio, MLX, or llama-server first."
+            );
             std::process::exit(1);
         }
 
@@ -2014,17 +3569,7 @@ fn run_bench(
                 }
             };
 
-            let result = match target {
-                bench::BenchTarget::Ollama { url, model } => {
-                    bench::bench_ollama(url, model, runs, &progress)
-                }
-                bench::BenchTarget::VLlm { url, model } => {
-                    bench::bench_openai_compat(url, model, "vllm", runs, &progress)
-                }
-                bench::BenchTarget::Mlx { url, model } => {
-                    bench::bench_openai_compat(url, model, "mlx", runs, &progress)
-                }
-            };
+            let result = bench::benchmark_target(target, runs, &progress);
 
             if !json {
                 eprintln!();
@@ -2051,71 +3596,20 @@ fn run_bench(
             });
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
         }
+        store_bench_results(&results, overrides, share_opts.is_none());
+        if let Some(opts) = share_opts {
+            share_pending_cli(&opts, share_token);
+        }
         return;
     }
 
     // Single-target mode
-    let target = match provider.to_lowercase().as_str() {
-        "ollama" => {
-            let url = url_override.clone().unwrap_or_else(|| {
-                std::env::var("OLLAMA_HOST")
-                    .unwrap_or_else(|_| "http://localhost:11434".to_string())
-            });
-            let model_name = model.unwrap_or_else(|| {
-                eprintln!("Error: model name required for ollama bench");
-                std::process::exit(1);
-            });
-            bench::BenchTarget::Ollama {
-                url,
-                model: model_name,
-            }
-        }
-        "vllm" => {
-            let url = url_override.clone().unwrap_or_else(|| {
-                let port = std::env::var("VLLM_PORT").unwrap_or_else(|_| "8000".to_string());
-                format!("http://localhost:{}", port)
-            });
-            match bench::detect_model_from_url(&url, model.as_deref()) {
-                Ok(model_name) => bench::BenchTarget::VLlm {
-                    url,
-                    model: model_name,
-                },
-                Err(_) => {
-                    let model_name = model.unwrap_or_else(|| {
-                        eprintln!(
-                            "Error: could not detect model from vLLM at {}. Use --model",
-                            url
-                        );
-                        std::process::exit(1);
-                    });
-                    bench::BenchTarget::VLlm {
-                        url,
-                        model: model_name,
-                    }
-                }
-            }
-        }
-        "mlx" => {
-            let url = url_override.clone().unwrap_or_else(|| {
-                std::env::var("MLX_LM_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string())
-            });
-            let model_name = model.unwrap_or_else(|| {
-                eprintln!("Error: model name required for mlx bench");
-                std::process::exit(1);
-            });
-            bench::BenchTarget::Mlx {
-                url,
-                model: model_name,
-            }
-        }
-        _ => match bench::auto_detect_target(model.as_deref()) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        },
-    };
+    let target = resolve_bench_target(
+        model,
+        provider,
+        url_override,
+        &format!("{} bench", provider.to_lowercase()),
+    );
 
     if !json {
         println!();
@@ -2131,17 +3625,7 @@ fn run_bench(
         }
     };
 
-    let result = match &target {
-        bench::BenchTarget::Ollama { url, model } => {
-            bench::bench_ollama(url, model, runs, &progress)
-        }
-        bench::BenchTarget::VLlm { url, model } => {
-            bench::bench_openai_compat(url, model, "vllm", runs, &progress)
-        }
-        bench::BenchTarget::Mlx { url, model } => {
-            bench::bench_openai_compat(url, model, "mlx", runs, &progress)
-        }
-    };
+    let result = bench::benchmark_target(&target, runs, &progress);
 
     if !json {
         eprintln!();
@@ -2155,6 +3639,10 @@ fn run_bench(
             } else {
                 r.display();
             }
+            store_bench_results(std::slice::from_ref(&r), overrides, share_opts.is_none());
+            if let Some(opts) = share_opts {
+                share_pending_cli(&opts, share_token);
+            }
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -2163,7 +3651,220 @@ fn run_bench(
     }
 }
 
+/// Record successful benchmark results in the local store. With `hint`, tells
+/// the user where they went and how to contribute them later.
+fn store_bench_results(results: &[bench::BenchResult], overrides: &HardwareOverrides, hint: bool) {
+    if results.is_empty() {
+        return;
+    }
+    let specs = detect_specs(overrides);
+    match share::store_local(results, &specs) {
+        Ok(_) => {
+            if hint {
+                let pending = share::pending_benchmarks().len();
+                eprintln!(
+                    "\n  Results saved locally ({pending} submission(s) pending). \
+                     Contribute them any time with `llmfit bench --share`."
+                );
+            }
+        }
+        Err(e) => eprintln!("  Warning: could not save results locally: {e}"),
+    }
+}
+
+/// Contribute everything in the local pending store as a single PR.
+fn share_pending_cli(opts: &share::ShareOptions, token: Option<String>) {
+    match share::share_all_pending(opts, token) {
+        Ok(Some(outcome)) => {
+            if outcome.skipped > 0 {
+                eprintln!(
+                    "\n  {} previously submitted result(s) were skipped.",
+                    outcome.skipped
+                );
+            }
+            match (&outcome.pr_url, outcome.reused_existing_pr) {
+                (Some(url), true) => println!(
+                    "\n  Added {} submission(s) to your open pull request: {url}",
+                    outcome.uploaded
+                ),
+                (Some(url), false) => println!("\n  Pull request opened: {url}"),
+                (None, _) => println!(
+                    "\n  All stored results were already contributed upstream — nothing new to submit."
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("  Share failed: {e}");
+            if !share::pending_benchmarks().is_empty() {
+                eprintln!(
+                    "  Your results remain stored locally; retry with `llmfit bench --share`."
+                );
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+/// `llmfit bench <model> --tool-calls`: does the served model return tool
+/// calls? Exits 1 when the endpoint cannot be probed.
+fn run_tool_probe(
+    model: Option<String>,
+    provider: &str,
+    url_override: Option<String>,
+    runs: u32,
+    json_output: bool,
+) {
+    let target = resolve_bench_target(model, provider, url_override, "this bench");
+    let (provider_name, url, model_name) = target_info(&target);
+    let api_key = match target {
+        bench::BenchTarget::LmStudio { .. } => llmfit_core::providers::lmstudio_api_key(),
+        _ => None,
+    };
+    let result = match llmfit_core::tool_probe::probe_openai_compat(
+        url,
+        api_key.as_deref(),
+        model_name,
+        provider_name,
+        runs as usize,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("probe result serializes")
+        );
+    } else {
+        let verdict = serde_json::to_value(result.verdict).expect("verdict serializes");
+        println!(
+            "  {} ({}): tool calls {} — {}/{} attempts returned a usable call",
+            result.model,
+            result.provider,
+            verdict.as_str().unwrap_or_default(),
+            result.passed,
+            result.attempts.len()
+        );
+    }
+}
+
+/// The one target a bench names: an explicit provider, or auto-detection.
+///
+/// `bench` names the bench in the error raised when the provider needs a model
+/// and none was given.
+fn resolve_bench_target(
+    model: Option<String>,
+    provider: &str,
+    url_override: Option<String>,
+    bench: &str,
+) -> bench::BenchTarget {
+    match provider.to_lowercase().as_str() {
+        "ollama" => {
+            let url = url_override
+                .clone()
+                .unwrap_or_else(llmfit_core::providers::ollama_bench_url);
+            let model_name = model.unwrap_or_else(|| {
+                eprintln!("Error: model name required for {bench}");
+                std::process::exit(1);
+            });
+            bench::BenchTarget::Ollama {
+                url,
+                model: model_name,
+            }
+        }
+        "vllm" => {
+            let url = url_override.clone().unwrap_or_else(|| {
+                let port = std::env::var("VLLM_PORT").unwrap_or_else(|_| "8000".to_string());
+                format!("http://localhost:{}", port)
+            });
+            match bench::detect_vllm_model(&url, model.as_deref()) {
+                Ok(model_name) => bench::BenchTarget::VLlm {
+                    url,
+                    model: model_name,
+                },
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "ferrum" => {
+            let url = url_override.clone().unwrap_or_else(bench::ferrum_url);
+            match bench::detect_ferrum_model(&url, model.as_deref()) {
+                Ok(model_name) => bench::BenchTarget::Ferrum {
+                    url,
+                    model: model_name,
+                },
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "lmstudio" | "lm-studio" => {
+            let url = url_override
+                .clone()
+                .unwrap_or_else(llmfit_core::providers::lmstudio_url);
+            let model_name =
+                bench::detect_lmstudio_model(&url, model.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                });
+            bench::BenchTarget::LmStudio {
+                url,
+                model: model_name,
+            }
+        }
+        "mlx" => {
+            let url = url_override.clone().unwrap_or_else(|| {
+                std::env::var("MLX_LM_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string())
+            });
+            let model_name = model.unwrap_or_else(|| {
+                eprintln!("Error: model name required for {bench}");
+                std::process::exit(1);
+            });
+            bench::BenchTarget::Mlx {
+                url,
+                model: model_name,
+            }
+        }
+        "llamacpp" | "llama.cpp" | "llama-server" => {
+            let url = url_override.clone().unwrap_or_else(bench::llamacpp_url);
+            match bench::detect_model_from_url(&url, model.as_deref()) {
+                Ok(model_name) => bench::BenchTarget::LlamaCpp {
+                    url,
+                    model: model_name,
+                },
+                Err(_) => {
+                    let model_name = model.unwrap_or_else(|| {
+                        eprintln!(
+                            "Error: could not detect model from llama-server at {}. Use --model",
+                            url
+                        );
+                        std::process::exit(1);
+                    });
+                    bench::BenchTarget::LlamaCpp {
+                        url,
+                        model: model_name,
+                    }
+                }
+            }
+        }
+        _ => match bench::auto_detect_target(model.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
 fn run_quality_bench(
     model: Option<String>,
     provider: &str,
@@ -2234,7 +3935,9 @@ fn run_quality_bench(
     let targets: Vec<bench::BenchTarget> = if all {
         let all_targets = bench::discover_all_targets();
         if all_targets.is_empty() {
-            eprintln!("No providers or models found. Start Ollama, vLLM, or MLX first.");
+            eprintln!(
+                "No providers or models found. Start Ollama, vLLM, Ferrum, LM Studio, MLX, or llama-server first."
+            );
             std::process::exit(1);
         }
         if skip_patterns.is_empty() {
@@ -2250,68 +3953,7 @@ fn run_quality_bench(
                 .collect()
         }
     } else {
-        let target = match provider.to_lowercase().as_str() {
-            "ollama" => {
-                let url = url_override.clone().unwrap_or_else(|| {
-                    std::env::var("OLLAMA_HOST")
-                        .unwrap_or_else(|_| "http://localhost:11434".to_string())
-                });
-                let model_name = model.unwrap_or_else(|| {
-                    eprintln!("Error: model name required for quality bench");
-                    std::process::exit(1);
-                });
-                bench::BenchTarget::Ollama {
-                    url,
-                    model: model_name,
-                }
-            }
-            "vllm" => {
-                let url = url_override.clone().unwrap_or_else(|| {
-                    let port = std::env::var("VLLM_PORT").unwrap_or_else(|_| "8000".to_string());
-                    format!("http://localhost:{}", port)
-                });
-                match bench::detect_model_from_url(&url, model.as_deref()) {
-                    Ok(model_name) => bench::BenchTarget::VLlm {
-                        url,
-                        model: model_name,
-                    },
-                    Err(_) => {
-                        let model_name = model.unwrap_or_else(|| {
-                            eprintln!(
-                                "Error: could not detect model from vLLM at {}. Use --model",
-                                url
-                            );
-                            std::process::exit(1);
-                        });
-                        bench::BenchTarget::VLlm {
-                            url,
-                            model: model_name,
-                        }
-                    }
-                }
-            }
-            "mlx" => {
-                let url = url_override.clone().unwrap_or_else(|| {
-                    std::env::var("MLX_LM_HOST")
-                        .unwrap_or_else(|_| "http://localhost:8080".to_string())
-                });
-                let model_name = model.unwrap_or_else(|| {
-                    eprintln!("Error: model name required for quality bench");
-                    std::process::exit(1);
-                });
-                bench::BenchTarget::Mlx {
-                    url,
-                    model: model_name,
-                }
-            }
-            _ => match bench::auto_detect_target(model.as_deref()) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            },
-        };
+        let target = resolve_bench_target(model, provider, url_override, "this bench");
         vec![target]
     };
 
@@ -2342,8 +3984,22 @@ fn run_quality_bench(
             bench::BenchTarget::Ollama { url, model } => {
                 quality::bench_quality_ollama(url, model, &config, rf)
             }
-            bench::BenchTarget::VLlm { url, model } | bench::BenchTarget::Mlx { url, model } => {
-                quality::bench_quality_openai_compat(url, model, provider_name, &config, rf)
+            bench::BenchTarget::VLlm { url, model }
+            | bench::BenchTarget::Ferrum { url, model }
+            | bench::BenchTarget::Mlx { url, model }
+            | bench::BenchTarget::LlamaCpp { url, model } => {
+                quality::bench_quality_openai_compat(url, None, model, provider_name, &config, rf)
+            }
+            bench::BenchTarget::LmStudio { url, model } => {
+                let api_key = llmfit_core::providers::lmstudio_api_key();
+                quality::bench_quality_openai_compat(
+                    url,
+                    api_key.as_deref(),
+                    model,
+                    provider_name,
+                    &config,
+                    rf,
+                )
             }
         };
 
@@ -2384,7 +4040,7 @@ fn run_quality_bench(
             });
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
         } else {
-            display_routing_matrix_full(&all_results, &routing, &runner_ups);
+            display_routing_matrix_full(&all_results, &routing, &runner_ups, config.rubric_version);
         }
     } else if json_output {
         let json_out = serde_json::json!({
@@ -2422,6 +4078,7 @@ fn display_routing_matrix_full(
     results: &[quality::ModelQualityResult],
     routing: &[quality::RoutingRecommendation],
     _runner_ups: &[quality::RoutingRecommendation],
+    rubric_version: u32,
 ) {
     let provider_label = if !results.is_empty() {
         &results[0].provider
@@ -2434,18 +4091,9 @@ fn display_routing_matrix_full(
     let total_tests: usize = results.iter().map(|r| r.roles.len()).sum();
 
     println!();
-    println!(
-        "{}",
-        "╔══════════════════════════════════════════════════════╗"
-    );
-    println!(
-        "{}",
-        "║                MODEL ROUTING MATRIX                  ║"
-    );
-    println!(
-        "{}",
-        "╚══════════════════════════════════════════════════════╝"
-    );
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║                MODEL ROUTING MATRIX                  ║");
+    println!("╚══════════════════════════════════════════════════════╝");
     println!();
     println!(
         "Provider: {} • Models: {} • Roles: {} • Tests: {}",
@@ -2483,7 +4131,7 @@ fn display_routing_matrix_full(
         println!("    {}: {}", rec.role, rec.model);
     }
 
-    let baselines = quality::load_baselines();
+    let baselines = quality::load_baselines(rubric_version);
     if !baselines.is_empty() && !results.is_empty() {
         println!();
         println!("── vs Frontier Models ──");
@@ -2535,17 +4183,70 @@ fn display_routing_matrix_full(
 
 // ── main ───────────────────────────────────────────────────────────────────
 
+/// clap checks `conflicts_with` within one level only. With the sizing flags
+/// global, a pair split across the subcommand (`--memory 8G system
+/// --memory-percent 50`) would pass, so the same rules are checked again on
+/// the merged values.
+fn sizing_conflict(cli: &Cli) -> Option<(&'static str, &'static str)> {
+    let given = [
+        ("--memory", cli.memory.is_some()),
+        ("--memory-percent", cli.memory_percent.is_some()),
+        ("--ram", cli.ram.is_some()),
+        ("--ram-percent", cli.ram_percent.is_some()),
+        ("--cpu-cores", cli.cpu_cores.is_some()),
+    ];
+    for (a, b) in [(1, 0), (3, 2)] {
+        if given[a].1 && given[b].1 {
+            return Some((given[a].0, given[b].0));
+        }
+    }
+    if cli.profile.is_some()
+        && let Some((name, _)) = given.iter().find(|(_, set)| *set)
+    {
+        return Some(("--profile", name));
+    }
+    None
+}
+
 fn main() {
     let cli = Cli::parse();
+    if let Some((a, b)) = sizing_conflict(&cli) {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("the argument '{a}' cannot be used with '{b}'"),
+            )
+            .exit();
+    }
+    if !cli.tui && cli.command.as_ref().is_some_and(is_readonly_subcommand) {
+        restore_default_sigpipe();
+    }
+    configure_llama_cpp_path(cli.llama_cpp_path.as_deref());
+
     let context_limit = resolve_context_limit(cli.max_context);
     let overrides = HardwareOverrides {
         memory: cli.memory,
+        memory_percent: cli.memory_percent,
         ram: cli.ram,
+        ram_percent: cli.ram_percent,
         cpu_cores: cli.cpu_cores,
+        profile: cli.profile,
+        use_cluster: cli.cluster,
+        no_cluster: cli.no_cluster,
+        // `recommend` prints JSON unless told otherwise, so its `--cluster`
+        // refusals must be JSON too.
+        json: cli.json
+            || matches!(
+                cli.command.as_ref(),
+                Some(Commands::Recommend { json: true, .. })
+            ),
     };
     let auto_dashboard = !cli.no_dashboard
-        && !cli.json
-        && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }));
+        && (cli.tui
+            || (!cli.json
+                && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }))
+                && !cli.command.as_ref().is_some_and(is_readonly_subcommand)))
+        && !matches!(cli.command.as_ref(), Some(Commands::Cluster { .. }));
 
     let _dashboard_guard = if auto_dashboard {
         ensure_dashboard_available(&overrides, context_limit)
@@ -2553,15 +4254,95 @@ fn main() {
         None
     };
 
+    // --tui forces the interactive TUI regardless of any subcommand or
+    // output flags, so a Docker image with a baked-in CMD can still launch
+    // the TUI: docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    if cli.tui {
+        if let Err(e) = run_tui(&overrides, context_limit, cli.api_key) {
+            eprintln!("Error running TUI: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // If a subcommand is given, use classic CLI mode
     if let Some(command) = cli.command {
         match command {
             Commands::System => {
                 let specs = detect_specs(&overrides);
                 if cli.json {
-                    display::display_json_system(&specs);
+                    display_json_system_with_providers(&specs);
                 } else {
                     specs.display();
+                }
+            }
+
+            Commands::Doctor => {
+                // A diagnostic report is only useful if it describes the
+                // machine it was collected on, so a profile can't be honoured
+                // here — refuse instead of printing this host's detection under
+                // the profile's name (issue #969).
+                if overrides.profile.is_some() {
+                    eprintln!(
+                        "Error: --profile cannot be used with `doctor`; it reports what this \
+                         machine detects. Use `llmfit hardware show <NAME>` to inspect a profile."
+                    );
+                    std::process::exit(1);
+                }
+                print!(
+                    "{}",
+                    llmfit_core::doctor::collect_diagnostics(env!("CARGO_PKG_VERSION"))
+                );
+            }
+
+            Commands::Hardware { action } => {
+                if let Err(err) = run_hardware(action, cli.json) {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
+            }
+
+            Commands::Claim {
+                model,
+                min_tps,
+                quant,
+                efficiency,
+                device_class,
+                template,
+                name,
+            } => {
+                let db = ModelDatabase::new();
+                let target = llmfit_core::claim::ClaimTarget {
+                    min_tps,
+                    efficiency_pct: efficiency,
+                    device_class,
+                    template,
+                    quant,
+                    name,
+                };
+                let rendered = resolve_model_selector(db.get_all_models(), &model).and_then(|m| {
+                    if cli.json {
+                        llmfit_core::claim::render_json(m, &target, env!("CARGO_PKG_VERSION"))
+                    } else {
+                        llmfit_core::claim::render(m, &target)
+                    }
+                });
+                match rendered {
+                    Ok(out) => {
+                        if cli.json {
+                            println!("{}", out)
+                        } else {
+                            print!("{}", out)
+                        }
+                    }
+                    Err(err) => {
+                        if cli.json {
+                            display::display_json_error(command_error_kind("claim", &err), &err);
+                        } else {
+                            eprintln!("Error: {}", err);
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
 
@@ -2580,26 +4361,37 @@ fn main() {
 
             Commands::Fit {
                 perfect,
+                show_incompatible,
                 tool_use,
+                providers,
                 limit,
                 sort,
+                concurrency,
             } => {
                 run_fit(
                     perfect,
+                    show_incompatible,
                     tool_use,
+                    &providers,
                     limit,
                     sort.into(),
                     cli.json,
                     cli.csv,
                     &overrides,
                     context_limit,
+                    concurrency,
                 );
             }
 
             Commands::Search { query } => {
                 let db = ModelDatabase::new();
                 let results = db.find_model(&query);
-                if results.is_empty() {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&results).expect("JSON serialization failed")
+                    );
+                } else if results.is_empty() {
                     // Fallback: search HuggingFace directly for GGUF models
                     use llmfit_core::providers::LlamaCppProvider;
                     println!(
@@ -2627,18 +4419,33 @@ fn main() {
 
             Commands::Info { model } => {
                 let db = ModelDatabase::new();
-                let specs = detect_specs(&overrides);
+                let (specs, config) = detect_specs_and_config(&overrides);
                 let models = db.get_all_models();
 
                 let idx = match find_name_index_by_selector(models, &model, |m| m.name.as_str()) {
                     Ok(i) => i,
                     Err(err) => {
-                        println!("\n{}", err);
-                        return;
+                        if cli.json {
+                            display::display_json_error(selector_error_kind(&err), &err);
+                        } else {
+                            println!("\n{}", err);
+                        }
+                        std::process::exit(1);
                     }
                 };
 
-                let fit = ModelFit::analyze_with_context_limit(&models[idx], &specs, context_limit);
+                let mut fit = llmfit_core::analysis::analyze_with_optional_config(
+                    &models[idx],
+                    &specs,
+                    context_limit,
+                    config.as_ref(),
+                );
+                let measured = llmfit_core::benchmarks::measured_tps_for(
+                    &specs,
+                    &fit.model.name,
+                    &fit.best_quant,
+                );
+                fit.set_measured_tps(measured);
                 if cli.json {
                     display::display_json_fits(&specs, &[fit]);
                 } else {
@@ -2665,6 +4472,32 @@ fn main() {
                 );
             }
 
+            Commands::Concurrency {
+                model,
+                quant,
+                kv_quant,
+                context,
+                users,
+            } => {
+                if let Err(err) = run_concurrency(
+                    &model,
+                    quant,
+                    kv_quant,
+                    context,
+                    users,
+                    cli.json,
+                    &overrides,
+                    context_limit,
+                ) {
+                    if cli.json {
+                        display::display_json_error(command_error_kind("concurrency", &err), &err);
+                    } else {
+                        eprintln!("Error: {}", err);
+                    }
+                    std::process::exit(1);
+                }
+            }
+
             Commands::Plan {
                 model,
                 context,
@@ -2675,7 +4508,22 @@ fn main() {
                 if let Err(err) = run_plan(
                     &model, context, quant, kv_quant, target_tps, cli.json, &overrides,
                 ) {
-                    eprintln!("Error: {}", err);
+                    if cli.json {
+                        display::display_json_error(command_error_kind("plan", &err), &err);
+                    } else {
+                        eprintln!("Error: {}", err);
+                    }
+                    std::process::exit(1);
+                }
+            }
+
+            Commands::Storage(args) => {
+                if let Err(err) = run_storage(args, cli.json, cli.csv, &overrides, context_limit) {
+                    if cli.json {
+                        display::display_json_error("storage", &err);
+                    } else {
+                        eprintln!("Error: {err}");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -2751,6 +4599,7 @@ fn main() {
             Commands::Serve {
                 host,
                 port,
+                unix_socket,
                 mcp,
                 send_events,
                 nats_url,
@@ -2776,7 +4625,13 @@ fn main() {
                         eprintln!("NATS events enabled, publishing to {}", nats_url);
                     }
 
-                    if let Err(err) = serve_api::run_serve(&host, port, &overrides, context_limit) {
+                    if let Err(err) = serve_api::run_serve(
+                        &host,
+                        port,
+                        unix_socket.as_deref(),
+                        &overrides,
+                        context_limit,
+                    ) {
                         eprintln!("Error: {}", err);
                         std::process::exit(1);
                     }
@@ -2792,17 +4647,29 @@ fn main() {
                 json,
                 quality,
                 routing,
+                tool_calls,
                 roles,
                 quality_config,
                 skip,
+                share,
+                dry_run,
+                yes,
             } => {
                 // No model/flags → launch bench TUI view
-                let is_bare = model.is_none() && !all && !json && !quality && !routing;
+                let is_bare = model.is_none()
+                    && !all
+                    && !json
+                    && !quality
+                    && !routing
+                    && !tool_calls
+                    && !share;
                 if is_bare {
                     if let Err(e) = run_tui_bench(&overrides, context_limit, cli.api_key) {
                         eprintln!("Error running bench TUI: {}", e);
                         std::process::exit(1);
                     }
+                } else if tool_calls {
+                    run_tool_probe(model, &provider, url, runs, json);
                 } else if quality || routing {
                     run_quality_bench(
                         model,
@@ -2815,10 +4682,28 @@ fn main() {
                         quality_config,
                         skip,
                     );
+                } else if share && model.is_none() && !all && provider == "auto" && url.is_none() {
+                    // `llmfit bench --share` with nothing to bench: contribute
+                    // previously stored local benchmarks.
+                    share_pending_cli(
+                        &share::ShareOptions {
+                            dry_run,
+                            assume_yes: yes,
+                        },
+                        None,
+                    );
                 } else {
-                    run_bench(model, &provider, url, runs, all, json);
+                    let share_opts = share.then_some(share::ShareOptions {
+                        dry_run,
+                        assume_yes: yes,
+                    });
+                    run_bench(
+                        model, &provider, url, runs, all, json, share_opts, &overrides,
+                    );
                 }
             }
+
+            Commands::Cluster { action } => cluster_cli::run(action, cli.json),
         }
         return;
     }
@@ -2827,13 +4712,16 @@ fn main() {
     if cli.cli || cli.json || cli.csv {
         run_fit(
             cli.perfect,
+            false,
             cli.tool_use,
+            &[],
             cli.limit,
             cli.sort.into(),
             cli.json,
             cli.csv,
             &overrides,
             context_limit,
+            cli.concurrency,
         );
         return;
     }
@@ -2850,6 +4738,394 @@ mod tests {
     use super::*;
     use llmfit_core::fit::{FitLevel, InferenceRuntime, RunMode, ScoreComponents};
     use llmfit_core::models::LlmModel;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
+
+    /// Test backend that treats any cursor-position query as a regression.
+    struct NoCursorPositionBackend {
+        inner: TestBackend,
+        full_clears: usize,
+    }
+
+    impl NoCursorPositionBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                full_clears: 0,
+            }
+        }
+    }
+
+    impl Backend for NoCursorPositionBackend {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.inner.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            panic!("startup clear must not query the terminal cursor position")
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.full_clears += 1;
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            if clear_type == ClearType::All {
+                self.full_clears += 1;
+            }
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn startup_clear_avoids_cursor_query_and_forces_full_redraw() {
+        let backend = NoCursorPositionBackend::new(5, 2);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal should initialize");
+
+        terminal
+            .draw(|frame| frame.render_widget("xxxxx", frame.area()))
+            .expect("boot frame should draw");
+        clear_tui_after_boot(&mut terminal).expect("startup clear should succeed without CPR");
+
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["     ", "     "]);
+        assert_eq!(terminal.backend().full_clears, 1);
+
+        // Drawing identical content proves the startup clear also reset
+        // Ratatui's previous buffer; otherwise the diff would be empty and the
+        // cleared backend would stay blank.
+        terminal
+            .draw(|frame| frame.render_widget("xxxxx", frame.area()))
+            .expect("main frame should redraw after startup clear");
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["xxxxx", "     "]);
+    }
+
+    // ── Cluster spec detection and overrides ────
+
+    fn make_test_cluster_config() -> ClusterConfig {
+        let make_node =
+            |hostname: &str, ip: &str, is_head: bool| llmfit_core::cluster::ClusterNode {
+                hostname: hostname.to_string(),
+                ip: ip.to_string(),
+                gpu_name: "A100-80GB".to_string(),
+                gpu_vram_gb: 80.0,
+                total_ram_gb: 512.0,
+                cpu_cores: 64,
+                gpu_count: 4,
+                unified_memory: false,
+                is_head,
+                backend: Some(llmfit_core::hardware::GpuBackend::Cuda),
+            };
+        ClusterConfig {
+            version: llmfit_core::cluster::CLUSTER_CONFIG_VERSION,
+            name: "test-cluster".to_string(),
+            nodes: vec![
+                make_node("node-1", "10.0.0.1", true),
+                make_node("node-2", "10.0.0.2", false),
+            ],
+            head_ip: "10.0.0.1".to_string(),
+            ray_port: 8265,
+        }
+    }
+
+    /// The v1.1.19 repro: `llmfit --cluster diff <refused> <fitting>` on
+    /// 3 x DGX Spark listed the refused Qwen3-Coder-480B first under
+    /// "sorted by Score". Named pairs follow the ranked order.
+    #[test]
+    fn named_diff_heading_does_not_claim_a_sort() {
+        assert_eq!(display::diff_order_label(false, "Score"), "sorted by Score");
+        let named = display::diff_order_label(true, "Score");
+        assert!(!named.contains("sorted"), "{named}");
+    }
+
+    #[test]
+    fn named_diff_never_puts_a_refused_model_first() {
+        let mut cfg = make_test_cluster_config();
+        cfg.nodes = (0..3)
+            .map(|i| llmfit_core::cluster::ClusterNode {
+                hostname: format!("spark-{i}"),
+                ip: format!("10.0.0.{i}"),
+                gpu_name: "NVIDIA GB10".to_string(),
+                gpu_vram_gb: 120.0,
+                total_ram_gb: 128.0,
+                cpu_cores: 20,
+                gpu_count: 1,
+                unified_memory: true,
+                is_head: i == 0,
+                backend: Some(llmfit_core::hardware::GpuBackend::Cuda),
+            })
+            .collect();
+        let specs = cfg.to_system_specs();
+        let db = ModelDatabase::new();
+        let fits: Vec<ModelFit> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| {
+                m.name == "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+                    || m.name == "Qwen/Qwen3-32B"
+                    || m.name == "Qwen/Qwen3-8B"
+            })
+            .map(|m| ModelFit::analyze(m, &specs))
+            .collect();
+        let fits = llmfit_core::fit::rank_models_by_fit_opts_col(fits, false, SortColumn::Score);
+        let refused = fits
+            .iter()
+            .position(|f| f.layout_refusal.is_some())
+            .expect("Qwen3-Coder-480B is refused on 3 GPUs");
+        let fitting = fits
+            .iter()
+            .position(|f| f.model.name == "Qwen/Qwen3-32B")
+            .expect("Qwen3-32B in catalog");
+        assert_ne!(fits[fitting].fit_level, FitLevel::TooTight);
+        // The refused model scores higher, but must not head the table.
+        assert!(fits[refused].score > fits[fitting].score);
+        for (a, b) in [(refused, fitting), (fitting, refused)] {
+            let pair = named_pair_for_diff(&fits, a, b);
+            assert_eq!(pair[0].model.name, "Qwen/Qwen3-32B");
+            assert!(pair[1].layout_refusal.is_some());
+        }
+        // Two runnable models keep the order they were named in.
+        let small = fits
+            .iter()
+            .position(|f| f.model.name == "Qwen/Qwen3-8B")
+            .expect("Qwen3-8B in catalog");
+        for (a, b) in [(small, fitting), (fitting, small)] {
+            let pair = named_pair_for_diff(&fits, a, b);
+            assert_eq!(pair[0].model.name, fits[a].model.name);
+            assert_eq!(pair[1].model.name, fits[b].model.name);
+        }
+    }
+
+    /// An explicit `--cluster` with no config on disk must hard-fail,
+    /// never silently fall back to local hardware detection.
+    #[test]
+    fn cluster_base_hard_fails_when_forced_and_missing() {
+        assert!(matches!(
+            decide_cluster_base(true, || Ok(None)),
+            ClusterBase::Missing
+        ));
+    }
+
+    /// An explicit `--cluster` with an unreadable/malformed config must
+    /// hard-fail as well, and keep the loader's reason for the user.
+    #[test]
+    fn cluster_base_hard_fails_when_forced_and_unparseable() {
+        match decide_cluster_base(true, || Err("line 3: expected `=`".to_string())) {
+            ClusterBase::Invalid(e) => assert!(e.contains("line 3")),
+            other => panic!("expected ClusterBase::Invalid, got {other:?}"),
+        }
+    }
+
+    /// Happy path: forced `--cluster` uses the loaded config as the base.
+    #[test]
+    fn cluster_base_uses_loaded_config_when_forced() {
+        match decide_cluster_base(true, || Ok(Some(make_test_cluster_config()))) {
+            ClusterBase::Use(cfg) => {
+                assert_eq!(cfg.node_count(), 2);
+                assert_eq!(cfg.total_vram_gb(), 640.0);
+            }
+            _ => panic!("expected ClusterBase::Use"),
+        }
+    }
+
+    /// Without `--cluster`, cluster config must not even be loaded: default
+    /// stays local single-node detection.
+    #[test]
+    fn cluster_base_stays_local_without_forced_flag() {
+        let loader_not_called: fn() -> Result<Option<ClusterConfig>, String> =
+            || unreachable!("loader must not run without --cluster");
+        assert!(matches!(
+            decide_cluster_base(false, loader_not_called),
+            ClusterBase::Local
+        ));
+    }
+
+    /// --memory / --ram / --cpu-cores must apply to cluster-derived
+    /// specs exactly as they do to locally detected specs, and must preserve
+    /// cluster provenance metadata.
+    #[test]
+    fn hardware_overrides_apply_to_cluster_derived_specs() {
+        let specs = make_test_cluster_config().to_system_specs();
+        assert_eq!(specs.total_gpu_vram_gb, Some(640.0));
+        assert_eq!(specs.total_ram_gb, 1024.0);
+        assert!(specs.cluster_mode);
+        assert_eq!(specs.cluster_node_count, 2);
+
+        let overrides = HardwareOverrides {
+            memory: Some("100G".to_string()),
+            memory_percent: None,
+            ram: Some("2048G".to_string()),
+            ram_percent: None,
+            cpu_cores: Some(128),
+            profile: None,
+            use_cluster: true,
+            no_cluster: false,
+            json: false,
+        };
+        let out = apply_hardware_overrides(specs, &overrides);
+
+        // --memory is per-GPU: 100G across the aggregate count (2 nodes x 4 GPUs).
+        assert_eq!(out.gpu_vram_gb, Some(100.0));
+        assert_eq!(out.total_gpu_vram_gb, Some(800.0));
+        // --ram replaces the cluster-wide totals (90% OS-reservation model).
+        assert_eq!(out.total_ram_gb, 2048.0);
+        assert_eq!(out.available_ram_gb, 2048.0 * 0.9);
+        // --cpu-cores replaces the aggregate core count.
+        assert_eq!(out.total_cpu_cores, 128);
+        // Cluster provenance survives the overrides.
+        assert!(out.cluster_mode);
+        assert_eq!(out.cluster_node_count, 2);
+    }
+
+    /// The banner states the pool the fit uses, after `--memory`, not the
+    /// config's raw total (issue: "253 GB" while 100 GB was used, and
+    /// "0 GB total VRAM" for a Ray config).
+    #[test]
+    fn cluster_json_errors_read_as_sentences() {
+        assert_eq!(
+            join_problem_and_hint(
+                "no cluster config found at /x/cluster.toml",
+                "Run `llmfit cluster init`."
+            ),
+            "no cluster config found at /x/cluster.toml. Run `llmfit cluster init`."
+        );
+        assert_eq!(join_problem_and_hint("Bad.", "Fix it."), "Bad. Fix it.");
+        assert_eq!(join_problem_and_hint("Bad", ""), "Bad");
+    }
+
+    #[test]
+    fn cluster_banner_reports_the_pool_after_overrides() {
+        let pair = ClusterBanner {
+            node_count: 2,
+            config_vram_gb: 253.14,
+        };
+        assert_eq!(
+            cluster_banner_line(pair, 253.14, false),
+            "📡 Using cluster config: 2 nodes, 253 GB total VRAM"
+        );
+        assert_eq!(
+            cluster_banner_line(pair, 100.0, true),
+            "📡 Using cluster config: 2 nodes, 100 GB usable VRAM (VRAM override; config says 253 GB)"
+        );
+        let ray = ClusterBanner {
+            node_count: 1,
+            config_vram_gb: 0.0,
+        };
+        assert_eq!(
+            cluster_banner_line(ray, 96.0, true),
+            "📡 Using cluster config: 1 node, 96 GB usable VRAM (VRAM override; config has no VRAM)"
+        );
+        // Mixed cards without an override keep the smallest-GPU note.
+        let mixed = ClusterBanner {
+            node_count: 2,
+            config_vram_gb: 208.0,
+        };
+        assert!(cluster_banner_line(mixed, 96.0, false).contains("96 GB usable"));
+    }
+
+    /// Configs saved via `cluster init --ray-url` when Ray reports no GPU
+    /// stats are flagged so `detect_specs` can refuse to analyze them
+    /// instead of producing meaningless zero-VRAM recommendations.
+    #[test]
+    fn zero_vram_gpu_nodes_flags_ray_discovered_configs() {
+        let mut cfg = make_test_cluster_config();
+        assert!(cfg.zero_vram_gpu_nodes().is_empty());
+
+        // Freshly discovered config: Ray reports GPU counts, never VRAM.
+        for node in &mut cfg.nodes {
+            node.gpu_vram_gb = 0.0;
+        }
+        assert_eq!(cfg.zero_vram_gpu_nodes(), vec![0, 1]);
+
+        // Head-only nodes without GPUs are not flagged.
+        cfg.nodes[1].gpu_count = 0;
+        assert_eq!(cfg.zero_vram_gpu_nodes(), vec![0]);
+
+        // Filling in per-GPU VRAM clears the flag.
+        cfg.nodes[0].gpu_vram_gb = 80.0;
+        assert!(cfg.zero_vram_gpu_nodes().is_empty());
+    }
+
+    /// `fit --cluster --memory 80G` must be able to rescue a Ray-discovered
+    /// (zero-VRAM) config: the check has to account for `--memory`.
+    #[test]
+    fn memory_override_resolves_zero_vram_cluster() {
+        let mut cfg = make_test_cluster_config();
+        for node in &mut cfg.nodes {
+            node.gpu_vram_gb = 0.0;
+        }
+        let mut overrides = HardwareOverrides {
+            memory: None,
+            memory_percent: None,
+            ram: None,
+            ram_percent: None,
+            cpu_cores: None,
+            profile: None,
+            use_cluster: true,
+            no_cluster: false,
+            json: false,
+        };
+        assert_eq!(unresolved_cluster_vram(&cfg, &overrides), vec![0, 1]);
+
+        overrides.memory = Some("not-a-size".to_string());
+        assert_eq!(unresolved_cluster_vram(&cfg, &overrides), vec![0, 1]);
+
+        overrides.memory = Some("80G".to_string());
+        assert!(unresolved_cluster_vram(&cfg, &overrides).is_empty());
+
+        // And the resulting specs carry real VRAM.
+        let out = apply_hardware_overrides(cfg.to_system_specs(), &overrides);
+        assert_eq!(out.gpu_vram_gb, Some(80.0));
+    }
+
+    /// A hardware profile is a whole single machine; combining it with
+    /// aggregate cluster specs yields a hybrid that exists nowhere.
+    #[test]
+    fn profile_conflicts_with_cluster() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["llmfit", "--profile", "x", "--cluster"]).is_err());
+        assert!(Cli::try_parse_from(["llmfit", "--profile", "x", "--no-cluster"]).is_ok());
+    }
 
     fn mock_fit(name: &str, fit_level: FitLevel) -> ModelFit {
         ModelFit {
@@ -2871,6 +5147,7 @@ mod tests {
                 release_date: Some("2025-01-01".to_string()),
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -2905,6 +5182,72 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8192,
+            usable_context: 8192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
+            tp_size: None,
+            layout_refusal: None,
+            tp_layout_invalid: false,
+            estimate_confidence: llmfit_core::fit::EstimateConfidence::Estimated,
+            prefill_tps: None,
+            ttft_ms: None,
+        }
+    }
+
+    #[test]
+    fn incompatible_backend_rows_have_no_execution_estimates() {
+        use llmfit_core::hardware::GpuBackend;
+        use llmfit_core::models::{Capability, ModelFormat};
+
+        let specs = SystemSpecs {
+            total_ram_gb: 64.0,
+            available_ram_gb: 64.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuX86,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+        let base = mock_fit("test/model", FitLevel::Good).model;
+        let mut mlx = base.clone();
+        mlx.name = "mlx-community/model-7B".to_string();
+        mlx.quantization = "mlx-4bit".to_string();
+        let mut awq = base.clone();
+        awq.format = ModelFormat::Awq;
+        awq.quantization = "AWQ-4bit".to_string();
+        let mut gptq = base.clone();
+        gptq.format = ModelFormat::Gptq;
+        gptq.quantization = "GPTQ-Int4".to_string();
+        let mut tts = base;
+        tts.capabilities.push(Capability::Tts);
+
+        for model in [mlx, awq, gptq, tts] {
+            assert!(!llmfit_core::fit::backend_compatible(&model, &specs));
+            let fit = backend_incompatible_fit(&model, &specs, Some(1024));
+            assert_eq!(fit.fit_level, FitLevel::TooTight);
+            assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+            assert_eq!(fit.estimated_tps, 0.0);
+            assert_eq!(fit.score, 0.0);
+            assert_eq!(fit.usable_context, 0);
+            assert_eq!(fit.effective_context_length, 1024);
+            assert!(fit.measured_tps.is_none());
+            assert!(fit.prefill_tps.is_none());
+            assert!(fit.ttft_ms.is_none());
+            assert!(fit.estimate_basis.local_calibration.is_none());
+            assert!(!fit.fits_with_turboquant);
+            assert_eq!(
+                fit.effective_estimate_confidence(),
+                llmfit_core::fit::EstimateConfidence::Unsupported
+            );
+            assert!(fit.notes.iter().any(|note| note.contains("Not runnable")));
         }
     }
 
@@ -2957,6 +5300,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -2988,6 +5332,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -3021,5 +5366,59 @@ mod tests {
         assert_eq!(truncate_str("🚀 hello", 4), "🚀 h…");
         // Exact max length — no truncation
         assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn fmt_gb_per_session_keeps_small_values_visible() {
+        assert_eq!(fmt_gb_per_session(1.5), "1.50 GB");
+        assert_eq!(fmt_gb_per_session(0.01), "0.01 GB");
+        // Sub-10-MiB values must stay visible, not collapse to "0.00 GB".
+        assert_eq!(fmt_gb_per_session(0.0006), "0.6 MiB");
+        assert_eq!(fmt_gb_per_session(0.0), "0.0 MiB");
+    }
+
+    #[test]
+    fn readonly_subcommands_never_autostart_dashboard() {
+        let storage = Cli::try_parse_from(["llmfit", "storage"]).expect("storage command");
+        assert!(is_readonly_subcommand(
+            storage.command.as_ref().expect("subcommand")
+        ));
+        // Read-only informational commands must not spawn the background
+        // dashboard server, so a failing run cannot orphan a `serve` child
+        // (regression for #837).
+        assert!(is_readonly_subcommand(&Commands::Plan {
+            model: "qwen".into(),
+            context: 32768,
+            quant: None,
+            kv_quant: None,
+            target_tps: None,
+        }));
+        assert!(is_readonly_subcommand(&Commands::System));
+        assert!(is_readonly_subcommand(&Commands::Info {
+            model: "qwen".into()
+        }));
+        // Commands that may meaningfully want a dashboard or mutate state.
+        assert!(!is_readonly_subcommand(&Commands::Serve {
+            host: "127.0.0.1".into(),
+            port: 8787,
+            unix_socket: None,
+            mcp: false,
+            send_events: false,
+            nats_url: "nats://localhost:4222".into(),
+        }));
+        assert!(!is_readonly_subcommand(&Commands::Download {
+            model: "qwen".into(),
+            quant: None,
+            budget: None,
+            list: false,
+            output_dir: None,
+        }));
+        assert!(!is_readonly_subcommand(&Commands::Run {
+            model: "qwen".into(),
+            server: false,
+            port: 8080,
+            ngl: -1,
+            ctx_size: 4096,
+        }));
     }
 }

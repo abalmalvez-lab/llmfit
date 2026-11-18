@@ -1,28 +1,146 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, Wrap,
+        ScrollbarState, Table, TableState, Wrap,
     },
 };
 
 use crate::download_history::DownloadResult;
 use crate::theme::ThemeColors;
 use crate::tui_app::{
-    AdvConfigField, App, AvailabilityFilter, BenchViewMode, DL_DOCKER, DL_LLAMACPP, DL_LMSTUDIO,
-    DL_OLLAMA, DL_VLLM, DownloadCapability, DownloadManagerFocus, DownloadProvider, FitFilter,
-    InputMode, PlanField, SimulationField,
+    AdvConfigField, App, AvailabilityFilter, BenchOfferState, BenchViewMode, DL_DOCKER,
+    DL_LLAMACPP, DL_LMSTUDIO, DL_OLLAMA, DL_VLLM, DownloadCapability, DownloadManagerFocus,
+    DownloadProvider, FitFilter, InputMode, PlanField, SimulationField, matched_gguf_provider,
+    provider_selected,
 };
-use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
+use llmfit_core::fit::{FitLevel, ModelFit};
 use llmfit_core::hardware::is_running_in_wsl;
-use llmfit_core::providers;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const DM_MODELS_DIR_LABEL: &str = "  Models dir:  ";
+
+pub(crate) fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(4));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Mouse bounds, list length and cursor, matching the existing popup layouts
+pub(crate) fn selection_popup(
+    app: &App,
+    mode: InputMode,
+    area: Rect,
+) -> Option<(Rect, usize, usize)> {
+    let (width, count, cursor) = match mode {
+        InputMode::ProviderPopup => {
+            let count = app.provider_filtered_indices().len();
+            let width = app.providers.iter().map(|s| s.len()).max().unwrap_or(10) + 10;
+            let height = (count.max(1) as u16).min(area.height.saturating_sub(6)) + 3;
+            return Some((
+                centered_popup(area, (width as u16).max(28), height),
+                count,
+                app.provider_cursor,
+            ));
+        }
+        InputMode::UseCasePopup => (
+            app.use_cases
+                .iter()
+                .map(|v| v.label().len())
+                .max()
+                .unwrap_or(10),
+            app.use_cases.len(),
+            app.use_case_cursor,
+        ),
+        InputMode::CapabilityPopup => (
+            app.capabilities
+                .iter()
+                .map(|v| v.label().len())
+                .max()
+                .unwrap_or(10),
+            app.capabilities.len(),
+            app.capability_cursor,
+        ),
+        InputMode::QuantPopup => (
+            app.quants.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.quants.len(),
+            app.quant_cursor,
+        ),
+        InputMode::RunModePopup => (
+            app.run_modes.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.run_modes.len(),
+            app.run_mode_cursor,
+        ),
+        InputMode::ParamsBucketPopup => (
+            app.params_buckets
+                .iter()
+                .map(|v| v.len())
+                .max()
+                .unwrap_or(10),
+            app.params_buckets.len(),
+            app.params_bucket_cursor,
+        ),
+        InputMode::LicensePopup => (
+            app.licenses.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.licenses.len(),
+            app.license_cursor,
+        ),
+        InputMode::RuntimePopup => (
+            app.runtimes.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.runtimes.len(),
+            app.runtime_cursor,
+        ),
+        _ => return None,
+    };
+    Some((
+        centered_popup(area, width as u16 + 10, count as u16 + 2),
+        count,
+        cursor,
+    ))
+}
+
+/// Shared geometry for drawing and event-driven viewport updates.
+pub(crate) fn main_layout(area: Rect) -> [Rect; 4] {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4), // system info bar (2 rows)
+            Constraint::Length(3), // search + filters
+            Constraint::Min(10),   // main table
+            Constraint::Length(2), // status bar (model name + keybindings)
+        ])
+        .areas(area)
+}
+
+/// Shared geometry for the inference-bench results table and detail pane.
+pub(crate) fn bench_results_layout(area: Rect, show_detail: bool) -> (Rect, Option<Rect>) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let progress_height = 1.min(inner.height);
+    let remaining = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(progress_height),
+        width: inner.width,
+        height: inner.height.saturating_sub(progress_height),
+    };
+    if show_detail {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(remaining);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (remaining, None)
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let tc = app.theme.colors();
@@ -33,15 +151,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(bg_block, frame.area());
     }
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4), // system info bar (2 rows)
-            Constraint::Length(3), // search + filters
-            Constraint::Min(10),   // main table
-            Constraint::Length(2), // status bar (model name + keybindings)
-        ])
-        .split(frame.area());
+    let outer = main_layout(frame.area());
 
     draw_system_bar(frame, app, outer[0], &tc);
     draw_search_and_filters(frame, app, outer[1], &tc);
@@ -93,22 +203,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_advanced_config_popup(frame, app, &tc);
     } else if app.input_mode == InputMode::FilterPopup {
         draw_filter_popup(frame, app, &tc);
+    } else if app.input_mode == InputMode::BenchOffer {
+        draw_bench_offer_popup(frame, app, &tc);
     }
 }
 
 fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let gpu_info = if app.specs.gpus.is_empty() {
+    // Browsing another card's leaderboard: temporarily stand in for the real
+    // GPU string so the bar can't be mistaken for the board being shown.
+    // Session-only state — never persisted, so it always resets on restart.
+    let gpu_info = if let Some(ref label) = app.bench_hw_label {
+        format!("GPU: [SIMULATED] {}", label)
+    } else if app.specs.gpus.is_empty() {
         format!("GPU: none ({})", app.specs.backend.label())
     } else {
         let primary = &app.specs.gpus[0];
         let backend = primary.backend.label();
         let primary_str = if primary.unified_memory {
-            format!(
-                "{} ({:.1} GB shared, {})",
-                primary.name,
-                primary.vram_gb.unwrap_or(0.0),
-                backend
-            )
+            let shared = primary.vram_gb.unwrap_or(0.0);
+            match app.specs.gpu_available_gb {
+                Some(available) => format!(
+                    "{} ({:.1} GB GPU-available / {:.1} GB shared, {})",
+                    primary.name, available, shared, backend
+                ),
+                None => format!("{} ({:.1} GB shared, {})", primary.name, shared, backend),
+            }
         } else {
             match primary.vram_gb {
                 Some(vram) if vram > 0.0 => {
@@ -135,26 +254,30 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     };
 
     let ollama_info = if app.ollama_available {
-        format!("Ollama: ✓ ({} installed)", app.ollama_installed_count)
+        format!("Ollama: ✓ ({} installed)", app.installed.ollama_count)
+    } else if app.ollama_binary_available {
+        "Ollama: installed (not running)".to_string()
     } else {
         "Ollama: ✗".to_string()
     };
     let ollama_color = if app.ollama_available {
         tc.good
+    } else if app.ollama_binary_available {
+        tc.warning
     } else {
         tc.muted
     };
 
     let mlx_info = if app.mlx_available {
-        format!("MLX: ✓ ({} installed)", app.mlx_installed.len())
-    } else if !app.mlx_installed.is_empty() {
-        format!("MLX: ({} cached)", app.mlx_installed.len())
+        format!("MLX: ✓ ({} installed)", app.installed.mlx.len())
+    } else if !app.installed.mlx.is_empty() {
+        format!("MLX: ({} cached)", app.installed.mlx.len())
     } else {
         "MLX: ✗".to_string()
     };
     let mlx_color = if app.mlx_available {
         tc.good
-    } else if !app.mlx_installed.is_empty() {
+    } else if !app.installed.mlx.is_empty() {
         tc.warning
     } else {
         tc.muted
@@ -162,51 +285,70 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     let llamacpp_info = if app.llamacpp_available {
         if app.llamacpp_detection_hint.is_empty() {
-            format!("llama.cpp: ✓ ({} models)", app.llamacpp_installed_count)
+            format!("llama.cpp: ✓ ({} models)", app.installed.llamacpp_count)
         } else {
             format!("llama.cpp: ✓ ({})", app.llamacpp_detection_hint)
         }
-    } else if !app.llamacpp_installed.is_empty() {
-        format!("llama.cpp: ({} cached)", app.llamacpp_installed_count)
+    } else if !app.installed.llamacpp.is_empty() {
+        format!("llama.cpp: ({} cached)", app.installed.llamacpp_count)
     } else {
         format!("llama.cpp: ✗ ({})", app.llamacpp_detection_hint)
     };
     let llamacpp_color = if app.llamacpp_available {
         tc.good
-    } else if !app.llamacpp_installed.is_empty() {
+    } else if !app.installed.llamacpp.is_empty() {
         tc.warning
     } else {
         tc.muted
     };
 
     let docker_mr_info = if app.docker_mr_available {
-        format!("Docker: ✓ ({} models)", app.docker_mr_installed_count)
+        format!("Docker: ✓ ({} models)", app.installed.docker_mr_count)
+    } else if app.docker_desktop_installed {
+        "Docker: installed (not running)".to_string()
     } else {
         "Docker: ✗".to_string()
     };
     let docker_mr_color = if app.docker_mr_available {
         tc.good
+    } else if app.docker_desktop_installed {
+        tc.warning
     } else {
         tc.muted
     };
 
     let lmstudio_info = if app.lmstudio_available {
-        format!("LM Studio: ✓ ({} models)", app.lmstudio_installed_count)
+        format!("LM Studio: ✓ ({} models)", app.installed.lmstudio_count)
+    } else if app.lmstudio_app_installed {
+        "LM Studio: installed (server off)".to_string()
     } else {
         "LM Studio: ✗".to_string()
     };
     let lmstudio_color = if app.lmstudio_available {
         tc.good
+    } else if app.lmstudio_app_installed {
+        tc.warning
     } else {
         tc.muted
     };
 
     let vllm_info = if app.vllm_available {
-        format!("vLLM: ✓ ({} models)", app.vllm_installed_count)
+        format!("vLLM: ✓ ({} models)", app.installed.vllm_count)
     } else {
         "vLLM: ✗".to_string()
     };
     let vllm_color = if app.vllm_available {
+        tc.good
+    } else {
+        tc.muted
+    };
+
+    let ramalama_info = if app.ramalama_available {
+        format!("RamaLama: ✓ ({} models)", app.installed.ramalama_count)
+    } else {
+        "RamaLama: ✗".to_string()
+    };
+    let ramalama_color = if app.ramalama_available {
         tc.good
     } else {
         tc.muted
@@ -240,7 +382,14 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             Style::default().fg(tc.accent),
         ),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
-        Span::styled(gpu_info, Style::default().fg(tc.accent_secondary)),
+        Span::styled(
+            gpu_info,
+            if app.bench_hw_label.is_some() {
+                Style::default().fg(tc.warning).bold()
+            } else {
+                Style::default().fg(tc.accent_secondary)
+            },
+        ),
     ]);
     let hardware_line = Line::from(hw_spans);
 
@@ -257,6 +406,8 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(lmstudio_info, Style::default().fg(lmstudio_color)),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
         Span::styled(vllm_info, Style::default().fg(vllm_color)),
+        Span::styled("  │  ", Style::default().fg(tc.muted)),
+        Span::styled(ramalama_info, Style::default().fg(ramalama_color)),
     ];
 
     if app.backend_hidden_count > 0 {
@@ -358,6 +509,22 @@ fn visible_dm_dir_input(input: &str, cursor: usize, inner_width: u16) -> (String
     visible_search_query(input, cursor, input_width)
 }
 
+pub(crate) fn search_cursor_at(query: &str, cursor: usize, width: usize, column: usize) -> usize {
+    let (visible, offset) = visible_search_query(query, cursor, width);
+    let byte_at = |cell: usize| {
+        let mut cells = 0;
+        for (byte, grapheme) in visible.grapheme_indices(true) {
+            cells += UnicodeWidthStr::width(grapheme);
+            if cells > cell {
+                return byte;
+            }
+        }
+        visible.len()
+    };
+    let start = floor_grapheme_boundary(query, cursor).saturating_sub(byte_at(usize::from(offset)));
+    start + byte_at(column)
+}
+
 fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
     let mut index = index.min(value.len());
     while index > 0 && !value.is_char_boundary(index) {
@@ -376,8 +543,8 @@ fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
     index
 }
 
-fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let chunks = Layout::default()
+pub(crate) fn search_and_filter_layout(area: Rect) -> [Rect; 9] {
+    Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(30),    // search
@@ -390,35 +557,51 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
             Constraint::Length(14), // TP filter
             Constraint::Length(16), // theme
         ])
-        .split(area);
+        .areas(area)
+}
 
-    // Search box
-    let search_style = match app.input_mode {
-        InputMode::Search => Style::default().fg(tc.accent_secondary),
-        InputMode::Normal
-        | InputMode::Plan
-        | InputMode::ProviderPopup
-        | InputMode::UseCasePopup
-        | InputMode::CapabilityPopup
-        | InputMode::DownloadProviderPopup
-        | InputMode::Visual
-        | InputMode::Select
-        | InputMode::QuantPopup
-        | InputMode::RunModePopup
-        | InputMode::ParamsBucketPopup
-        | InputMode::LicensePopup
-        | InputMode::RuntimePopup
-        | InputMode::HelpPopup
-        | InputMode::Simulation
-        | InputMode::AdvancedConfig
-        | InputMode::DownloadManager
-        | InputMode::FilterPopup
-        | InputMode::Benchmarks => Style::default().fg(tc.muted),
+fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let chunks = search_and_filter_layout(area);
+
+    // Search box — in the leaderboard view it shows the `/` benchmark search
+    let bench_search = app.input_mode == InputMode::Benchmarks
+        && (app.bench_search_active || !app.bench_search_query.is_empty());
+    let search_style = if bench_search && app.bench_search_active {
+        Style::default().fg(tc.accent_secondary)
+    } else {
+        match app.input_mode {
+            InputMode::Search => Style::default().fg(tc.accent_secondary),
+            InputMode::Normal
+            | InputMode::Plan
+            | InputMode::ProviderPopup
+            | InputMode::UseCasePopup
+            | InputMode::CapabilityPopup
+            | InputMode::DownloadProviderPopup
+            | InputMode::Visual
+            | InputMode::Select
+            | InputMode::QuantPopup
+            | InputMode::RunModePopup
+            | InputMode::ParamsBucketPopup
+            | InputMode::LicensePopup
+            | InputMode::RuntimePopup
+            | InputMode::HelpPopup
+            | InputMode::Simulation
+            | InputMode::AdvancedConfig
+            | InputMode::DownloadManager
+            | InputMode::FilterPopup
+            | InputMode::Benchmarks
+            | InputMode::BenchOffer => Style::default().fg(tc.muted),
+        }
     };
 
+    let (query, query_cursor) = if bench_search {
+        (&app.bench_search_query, app.bench_search_query.len())
+    } else {
+        (&app.search_query, app.cursor_position)
+    };
     let search_inner_width = chunks[0].width.saturating_sub(2) as usize;
     let (visible_query, cursor_offset) =
-        visible_search_query(&app.search_query, app.cursor_position, search_inner_width);
+        visible_search_query(query, query_cursor, search_inner_width);
 
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
         Line::from(Span::styled(
@@ -438,7 +621,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let search = Paragraph::new(search_text).block(search_block);
     frame.render_widget(search, chunks[0]);
 
-    if app.input_mode == InputMode::Search {
+    if app.input_mode == InputMode::Search || (bench_search && app.bench_search_active) {
         frame.set_cursor_position((chunks[0].x + cursor_offset + 1, chunks[0].y + 1));
     }
 
@@ -539,8 +722,12 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let sort_text = Paragraph::new(Line::from(Span::styled(
         format!(
             " {} {}",
-            app.sort_column.label(),
-            if app.sort_ascending { "↑" } else { "↓" }
+            app.table_sort_label(),
+            if app.table_sort_is_ascending() {
+                "↑"
+            } else {
+                "↓"
+            }
         ),
         Style::default().fg(tc.accent),
     )))
@@ -548,10 +735,8 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     frame.render_widget(sort_text, chunks[4]);
 
     // Fit + Filter indicator [f/F]
-    let has_range_filters = !app.filter_params_min_input.is_empty()
-        || !app.filter_params_max_input.is_empty()
-        || !app.filter_mem_pct_min_input.is_empty()
-        || !app.filter_mem_pct_max_input.is_empty();
+    let range_labels = app.advanced_range_labels();
+    let has_range_filters = !range_labels.is_empty();
 
     let fit_color = if has_range_filters || app.fit_filter != FitFilter::All {
         match app.fit_filter {
@@ -568,21 +753,23 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let fit_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.border))
-        .title(" Fit [f] Filter [F] ")
+        .title(" Fit[f] Filter[F] ")
         .title_style(Style::default().fg(tc.muted));
 
-    let mut parts: Vec<&str> = vec![app.fit_filter.label()];
-    if !app.filter_params_min_input.is_empty() || !app.filter_params_max_input.is_empty() {
-        parts.push("R");
-    }
-    if !app.filter_mem_pct_min_input.is_empty() || !app.filter_mem_pct_max_input.is_empty() {
-        parts.push("M");
-    }
-    let fit_text = Paragraph::new(Line::from(Span::styled(
-        parts.join(" "),
+    // Fit level label, then any active range filters spelled out (e.g.
+    // "≤2B") — a range from the F popup silently constrains every fit
+    // category, so it must be readable at a glance.
+    let mut fit_spans = vec![Span::styled(
+        app.fit_filter.label(),
         Style::default().fg(fit_color),
-    )))
-    .block(fit_block);
+    )];
+    for label in &range_labels {
+        fit_spans.push(Span::styled(
+            format!(" {}", label),
+            Style::default().fg(tc.warning).bold(),
+        ));
+    }
+    let fit_text = Paragraph::new(Line::from(fit_spans)).block(fit_block);
     frame.render_widget(fit_text, chunks[5]);
 
     // Availability filter
@@ -690,6 +877,40 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     format!("{}…", head)
 }
 
+/// Display width of the Provider column in the model table.
+const PROVIDER_COL_WIDTH: usize = 12;
+
+/// Whether this GGUF source is one of the reasons the row is in the list: the
+/// row came in through a publisher rather than its own provider, and this
+/// source's publisher is selected. Several sources qualify at once when several
+/// publishers are selected, so this asks per source instead of comparing
+/// against the single first match.
+fn gguf_source_attributed(
+    matched_gguf: Option<&str>,
+    src_provider: &str,
+    providers: &[String],
+    selected: &[bool],
+) -> bool {
+    matched_gguf.is_some() && provider_selected(src_provider, providers, selected)
+}
+
+/// The Provider cell: the model's own provider, plus a `*` when the row is only
+/// in the list because one of its GGUF publishers is selected (issue #569).
+///
+/// Catalog provider names run up to 30 chars while the column is 12, so a
+/// marked name is truncated to leave the marker its own column. Appending to
+/// the raw name would let the terminal clip the `*` away on the very rows it
+/// explains. Unmarked cells are returned untouched.
+fn provider_cell(provider: &str, matched_gguf: Option<&str>, width: usize) -> String {
+    match matched_gguf {
+        None => provider.to_string(),
+        Some(_) => format!(
+            "{}*",
+            truncate_with_ellipsis(provider, width.saturating_sub(1))
+        ),
+    }
+}
+
 fn marquee_text(text: &str, window_chars: usize, tick: u64) -> String {
     if window_chars == 0 {
         return String::new();
@@ -728,22 +949,71 @@ fn model_col_text_width(area: Rect, widths: [Constraint; 14]) -> usize {
         .unwrap_or(0)
 }
 
-fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
-    let sort_col = app.sort_column;
+const MODEL_TABLE_WIDTHS: [Constraint; 15] = [
+    Constraint::Length(2),                         // indicator
+    Constraint::Length(5),                         // installed / pull %
+    Constraint::Min(20),                           // model name
+    Constraint::Length(PROVIDER_COL_WIDTH as u16), // provider
+    Constraint::Length(8),                         // params
+    Constraint::Length(8),                         // score
+    Constraint::Length(8),                         // tok/s
+    Constraint::Length(10),                        // quant
+    Constraint::Length(6),                         // disk
+    Constraint::Length(7),                         // mode
+    Constraint::Length(7),                         // mem %
+    Constraint::Length(10),                        // ctx
+    Constraint::Length(8),                         // date
+    Constraint::Length(10),                        // fit
+    Constraint::Min(10),                           // use case
+];
+
+/// Match Table's border, highlight symbol, and default column spacing
+pub(crate) fn model_table_columns(area: Rect) -> [Rect; 15] {
+    let inner = area.inner(Margin::new(1, 1));
+    let [_, columns] = Layout::horizontal([Constraint::Length(2), Constraint::Fill(0)])
+        .areas(Rect::new(0, 0, inner.width, 1));
+    // Table solves column constraints at the origin before translating them
+    // Match that exactly, including rounding in narrow terminals
+    let columns: [Rect; 15] = Layout::horizontal(MODEL_TABLE_WIDTHS)
+        .flex(Flex::Start)
+        .spacing(1)
+        .areas(columns);
+    columns.map(|column| Rect::new(inner.x + column.x, inner.y, column.width, 1))
+}
+
+/// Visible range for the model table's single-line rows. Keep the widget offset
+/// in full-list coordinates while constructing only rows that fit on screen.
+pub(crate) fn model_table_viewport(
+    len: usize,
+    selected: usize,
+    offset: usize,
+    capacity: usize,
+    follow_selection: bool,
+) -> std::ops::Range<usize> {
+    if len == 0 {
+        return 0..0;
+    }
+    if !follow_selection {
+        let start = offset.min(len.saturating_sub(capacity.max(1)));
+        return start..start.saturating_add(capacity).min(len);
+    }
+    let selected = selected.min(len - 1);
+    let mut start = offset.min(len - 1).min(selected);
+    if capacity == 0 {
+        return start..start;
+    }
+    if selected - start >= capacity {
+        start = selected + 1 - capacity;
+    }
+    start..start.saturating_add(capacity).min(len)
+}
+
+fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let header_names = [
         "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Disk", "Mode",
         "Mem %", "Ctx", "Date", "Fit", "Use Case",
     ];
-    let sort_col_idx: Option<usize> = match sort_col {
-        SortColumn::Score => Some(5),
-        SortColumn::Tps => Some(6),
-        SortColumn::Params => Some(4),
-        SortColumn::MemPct => Some(10),
-        SortColumn::Ctx => Some(11),
-        SortColumn::ReleaseDate => Some(12),
-        SortColumn::UseCase => Some(14),
-        SortColumn::Provider => Some(3),
-    };
+    let sort_col_idx = app.sorted_table_column();
     let in_select_mode = app.input_mode == InputMode::Select;
     let header_cells = header_names.iter().enumerate().map(|(i, h)| {
         if in_select_mode && app.select_column == i {
@@ -753,9 +1023,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                     .bg(tc.accent_secondary)
                     .add_modifier(Modifier::BOLD),
             )
-        } else if sort_col_idx == Some(i) {
-            let arrow = if app.sort_ascending { "▲" } else { "▼" };
-            Cell::from(format!("{} {}", h, arrow)).style(
+        } else if sort_col_idx == i {
+            let arrow = if app.table_sort_is_ascending() {
+                "▲"
+            } else {
+                "▼"
+            };
+            Cell::from(format!("{}{}", h, arrow)).style(
                 Style::default()
                     .fg(tc.accent_secondary)
                     .add_modifier(Modifier::BOLD),
@@ -778,7 +1052,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         Constraint::Length(10), // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
         Constraint::Length(7),  // mode
         Constraint::Length(6),  // mem %
-        Constraint::Length(5),  // ctx
+        Constraint::Length(10), // ctx ("262k→14k" when memory-constrained)
         Constraint::Length(8),  // date (YYYY-MM)
         Constraint::Length(10), // fit
         Constraint::Min(10),    // use case
@@ -786,11 +1060,19 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let model_col_chars = model_col_text_width(area, widths);
 
-    let rows: Vec<Row> = app
-        .filtered_fits
+    // Two border lines and one header line leave the rest for model rows.
+    let viewport = model_table_viewport(
+        app.filtered_fits.len(),
+        app.selected_row,
+        app.table_state.offset(),
+        usize::from(area.height.saturating_sub(3)),
+        app.table_follow_selection,
+    );
+    let rows: Vec<Row> = app.filtered_fits[viewport.clone()]
         .iter()
         .enumerate()
-        .map(|(row_idx, &idx)| {
+        .map(|(local_row, &idx)| {
+            let row_idx = viewport.start + local_row;
             let fit = &app.all_fits[idx];
             let color = fit_color(fit.fit_level, tc);
 
@@ -810,14 +1092,23 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 tc.score_low
             };
 
-            #[allow(clippy::if_same_then_else)]
-            let tps_text = if fit.estimated_tps >= 100.0 {
-                format!("{:.0}", fit.estimated_tps)
-            } else if fit.estimated_tps >= 10.0 {
-                format!("{:.1}", fit.estimated_tps)
-            } else {
-                format!("{:.1}", fit.estimated_tps)
+            // Community-measured tok/s (marked ✓) takes priority over the
+            // formula estimate when matching hardware data exists.
+            let (tps_value, tps_measured) = match &fit.measured_tps {
+                Some(m) => (m.tok_s, true),
+                None => (fit.estimated_tps, false),
             };
+            let mut tps_text = if !tps_measured && !fit.reports_speed() {
+                // A cluster layout vLLM refuses has no speed.
+                "-".to_string()
+            } else if tps_value >= 100.0 {
+                format!("{:.0}", tps_value)
+            } else {
+                format!("{:.1}", tps_value)
+            };
+            if tps_measured {
+                tps_text.push('✓');
+            }
 
             let is_pulling = app.pull_active.is_some()
                 && app.pull_model_name.as_deref() == Some(&fit.model.name);
@@ -891,11 +1182,21 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 truncate_with_ellipsis(&fit.model.name, model_col_chars)
             };
 
+            // The row may be here because one of its GGUF publishers is
+            // selected rather than its own provider — say so (issue #569).
+            let matched_gguf =
+                matched_gguf_provider(&fit.model, &app.providers, &app.selected_providers);
+
             Row::new(vec![
                 Cell::from(marker).style(Style::default().fg(color)),
                 Cell::from(installed_icon).style(Style::default().fg(installed_color)),
                 Cell::from(model_text).style(Style::default().fg(tc.fg)),
-                Cell::from(fit.model.provider.clone()).style(Style::default().fg(tc.muted)),
+                Cell::from(provider_cell(
+                    &fit.model.provider,
+                    matched_gguf,
+                    PROVIDER_COL_WIDTH,
+                ))
+                .style(Style::default().fg(tc.muted)),
                 Cell::from(fit.model.parameter_count.clone()).style(Style::default().fg(tc.fg)),
                 Cell::from(format!("{:.0}", fit.score)).style(Style::default().fg(score_color)),
                 Cell::from(tps_text).style(Style::default().fg(tc.fg)),
@@ -908,8 +1209,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 Cell::from(fit.run_mode_text().to_string()).style(Style::default().fg(mode_color)),
                 Cell::from(format!("{:.0}%", fit.utilization_pct))
                     .style(Style::default().fg(color)),
-                Cell::from(format!("{}k", fit.model.context_length / 1000))
-                    .style(Style::default().fg(tc.muted)),
+                Cell::from(fit.context_display()).style(Style::default().fg(
+                    if fit.context_severely_limited() {
+                        tc.warning
+                    } else {
+                        tc.muted
+                    },
+                )),
                 Cell::from(
                     fit.model
                         .release_date
@@ -926,31 +1232,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(2),  // indicator
-        Constraint::Length(5),  // installed / pull %
-        Constraint::Min(20),    // model name
-        Constraint::Length(12), // provider
-        Constraint::Length(8),  // params
-        Constraint::Length(8),  // score
-        Constraint::Length(8),  // tok/s
-        Constraint::Length(10), // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
-        Constraint::Length(6),  // disk
-        Constraint::Length(7),  // mode
-        Constraint::Length(7),  // mem %
-        Constraint::Length(5),  // ctx
-        Constraint::Length(8),  // date (YYYY-MM)
-        Constraint::Length(10), // fit
-        Constraint::Min(10),    // use case
-    ];
-
     let count_text = format!(
         " Models ({}/{}) ",
         app.filtered_fits.len(),
         app.all_fits.len()
     );
 
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, MODEL_TABLE_WIDTHS)
         .header(header)
         .block(
             Block::default()
@@ -964,22 +1252,32 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 .bg(tc.highlight_bg)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("▶ ")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
-    if app.filtered_fits.is_empty() {
-        app.table_state.select(None);
-    } else {
-        app.table_state.select(Some(app.selected_row));
-    }
-
-    frame.render_stateful_widget(table, area, &mut app.table_state);
+    // Widget selection is local to this frame. Persistent navigation state is
+    // updated by tui_events, never by drawing the table.
+    let mut visible_state = TableState::default();
+    visible_state.select(
+        viewport
+            .contains(&app.selected_row)
+            .then(|| app.selected_row - viewport.start),
+    );
+    frame.render_stateful_widget(table, area, &mut visible_state);
 
     // Empty-state hint when filters hide all models
     if app.filtered_fits.is_empty() && !app.all_fits.is_empty() {
-        let hint = if app.has_advanced_filters_active() {
+        let ranges = app.advanced_range_labels();
+        let hint = if !ranges.is_empty() {
+            format!(
+                "No models match current filters — active range filter: {}. Press F to adjust, / to check search.",
+                ranges.join(", ")
+            )
+        } else if app.has_advanced_filters_active() {
             "No models match current filters. Press F to check advanced filters, / to check search."
+                .to_string()
         } else {
-            "No models match the selected fit level."
+            "No models match the selected fit level.".to_string()
         };
         let hint_paragraph = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -999,7 +1297,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     // Scrollbar
     if app.filtered_fits.len() > (area.height as usize).saturating_sub(3) {
         let mut scrollbar_state =
-            ScrollbarState::new(app.filtered_fits.len()).position(app.selected_row);
+            ScrollbarState::new(app.filtered_fits.len().saturating_sub(viewport.len()) + 1)
+                .position(viewport.start)
+                .viewport_content_length(viewport.len());
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -1066,7 +1366,12 @@ fn draw_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(title, sections[0]);
 
     let score_delta = right.score - left.score;
-    let tps_delta = right.estimated_tps - left.estimated_tps;
+    // No speed delta against a refused cluster layout (it has no speed).
+    let tps_delta = if left.reports_speed() && right.reports_speed() {
+        right.estimated_tps - left.estimated_tps
+    } else {
+        0.0
+    };
     let mem_delta = right.utilization_pct - left.utilization_pct;
     let params_delta = right.model.params_b() - left.model.params_b();
     let ctx_delta = right.model.context_length as i64 - left.model.context_length as i64;
@@ -1138,7 +1443,11 @@ fn draw_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let left_metrics = CompareMetrics {
         score: format!("{:.1}", left.score),
         score_style: Style::default().fg(tc.score_high),
-        tps: format!("{:.1}", left.estimated_tps),
+        tps: if left.reports_speed() {
+            format!("{:.1}", left.estimated_tps)
+        } else {
+            "-".to_string()
+        },
         tps_style: Style::default().fg(tc.fg),
         mem: format!("{:.1}%", left.utilization_pct),
         mem_style: Style::default().fg(fit_color(left.fit_level, tc)),
@@ -1151,7 +1460,14 @@ fn draw_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let right_metrics = CompareMetrics {
         score: format!("{:.1} ({:+.1}){}", right.score, score_delta, score_hint),
         score_style,
-        tps: format!("{:.1} ({:+.1}){}", right.estimated_tps, tps_delta, tps_hint),
+        // A refused cluster layout has no speed, so no value or delta.
+        tps: if !right.reports_speed() {
+            "-".to_string()
+        } else if !left.reports_speed() {
+            format!("{:.1}", right.estimated_tps)
+        } else {
+            format!("{:.1} ({:+.1}){}", right.estimated_tps, tps_delta, tps_hint)
+        },
         tps_style,
         mem: format!(
             "{:.1}% ({:+.1}%){}",
@@ -1334,6 +1650,16 @@ fn render_compare_panel(
     );
 }
 
+/// The highest score among compared models that can run, or `None` when
+/// every one is Too Tight (including cluster layouts vLLM refuses).
+fn best_runnable_score(models: &[&ModelFit]) -> Option<f64> {
+    models
+        .iter()
+        .filter(|m| m.fit_level != FitLevel::TooTight)
+        .map(|m| m.score)
+        .reduce(f64::max)
+}
+
 fn draw_multi_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     if app.compare_models.is_empty() {
         let block = Block::default()
@@ -1387,9 +1713,12 @@ fn draw_multi_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors
     let n = visible_models.len();
 
     // Find best/worst for highlighting
-    let best_score = models.iter().map(|m| m.score).fold(f64::MIN, f64::max);
+    // Only a model that runs can be the best: a Too Tight or refused
+    // layout keeps its score but is never highlighted as the winner.
+    let best_score = best_runnable_score(&models);
     let best_tps = models
         .iter()
+        .filter(|m| m.reports_speed())
         .map(|m| m.estimated_tps)
         .fold(f64::MIN, f64::max);
     let best_mem = models
@@ -1434,7 +1763,9 @@ fn draw_multi_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors
         styles: visible_models
             .iter()
             .map(|m| {
-                if (m.score - best_score).abs() < 0.1 {
+                if best_score.is_some_and(|best| {
+                    m.fit_level != FitLevel::TooTight && (m.score - best).abs() < 0.1
+                }) {
                     Style::default().fg(tc.good).add_modifier(Modifier::BOLD)
                 } else if m.score >= 70.0 {
                     Style::default().fg(tc.score_high)
@@ -1452,12 +1783,18 @@ fn draw_multi_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors
         label: "tok/s",
         values: visible_models
             .iter()
-            .map(|m| format!("{:.1}", m.estimated_tps))
+            .map(|m| {
+                if m.reports_speed() {
+                    format!("{:.1}", m.estimated_tps)
+                } else {
+                    "-".to_string()
+                }
+            })
             .collect(),
         styles: visible_models
             .iter()
             .map(|m| {
-                if (m.estimated_tps - best_tps).abs() < 0.1 {
+                if m.reports_speed() && (m.estimated_tps - best_tps).abs() < 0.1 {
                     Style::default().fg(tc.good).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(tc.fg)
@@ -1671,21 +2008,32 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let fit = match app.selected_fit() {
-        Some(f) => f,
-        None => {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(" No model selected ");
-            frame.render_widget(block, area);
-            return;
-        }
-    };
+/// Prompt-processing rows for the detail pane, as `(label, value)` pairs with
+/// the label already padded to the pane's 15-column gutter.
+///
+/// The CLI prints this as one 78-column sentence (`display.rs`), but the detail
+/// pane is only 55% of the terminal — 42 columns at 80, of which the gutter
+/// takes 15. One fact per row keeps every value inside that budget and matches
+/// the rest of the pane (issue #974).
+///
+/// Both figures come from `gpu_compute_tflops_fp16` together, so a missing half
+/// means the pair is unknown. That collapses to a single "not estimated" row
+/// rather than a zero, which would read as "immeasurably slow" (issue #969).
+fn prefill_detail_rows(
+    prefill_tps: Option<f64>,
+    ttft_ms: Option<f64>,
+) -> Vec<(&'static str, String)> {
+    match (prefill_tps, ttft_ms) {
+        (Some(prefill), Some(ttft)) => vec![
+            ("  Prefill:     ", format!("~{prefill:.0} tok/s")),
+            ("  TTFT:        ", format!("~{ttft:.0} ms")),
+        ],
+        _ => vec![("  Prefill:     ", "not estimated".to_string())],
+    }
+}
 
-    let color = fit_color(fit.fit_level, tc);
-
-    let mut lines = vec![
+fn detail_metadata_lines<'a>(app: &'a App, fit: &'a ModelFit, tc: &ThemeColors) -> Vec<Line<'a>> {
+    vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Model:       ", Style::default().fg(tc.muted)),
@@ -1772,59 +2120,111 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 }),
             ),
             Span::styled(
-                format!(" (baseline est. ~{:.1} tok/s)", fit.estimated_tps),
+                if fit.reports_speed() {
+                    format!(" (baseline est. ~{:.1} tok/s)", fit.estimated_tps)
+                } else {
+                    String::new()
+                },
                 Style::default().fg(tc.muted),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("  Installed:   ", Style::default().fg(tc.muted)),
-            {
-                let mut installed_providers = Vec::new();
-                if providers::is_model_installed(&fit.model.name, &app.ollama_installed) {
-                    installed_providers.push("Ollama");
-                }
-                if providers::is_model_installed_mlx(&fit.model.name, &app.mlx_installed) {
-                    installed_providers.push("MLX");
-                }
-                if providers::is_model_installed_llamacpp(&fit.model.name, &app.llamacpp_installed)
-                {
-                    installed_providers.push("llama.cpp");
-                }
-                if providers::is_model_installed_docker_mr(
-                    &fit.model.name,
-                    &app.docker_mr_installed,
-                ) {
-                    installed_providers.push("Docker");
-                }
-                if providers::is_model_installed_lmstudio(&fit.model.name, &app.lmstudio_installed)
-                {
-                    installed_providers.push("LM Studio");
-                }
-                if providers::is_model_installed_vllm(&fit.model.name, &app.vllm_installed) {
-                    installed_providers.push("vLLM");
-                }
-                let any_available = app.ollama_available
-                    || app.mlx_available
-                    || app.llamacpp_available
-                    || app.docker_mr_available
-                    || app.lmstudio_available
-                    || app.vllm_available;
+        Line::from({
+            let mut spans = vec![Span::styled(
+                "  Installed:   ",
+                Style::default().fg(tc.muted),
+            )];
+            let installed_providers = app.installed.installed_providers(&fit.model);
+            let any_available = app.ollama_available
+                || app.mlx_available
+                || app.llamacpp_available
+                || app.docker_mr_available
+                || app.lmstudio_available
+                || app.vllm_available;
 
-                if !installed_providers.is_empty() {
-                    let label = installed_providers
-                        .iter()
-                        .map(|p| format!("✓ {p}"))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    Span::styled(label, Style::default().fg(tc.good).bold())
-                } else if any_available {
-                    Span::styled("✗ No  (press d to pull)", Style::default().fg(tc.muted))
-                } else {
-                    Span::styled("- No runtime detected", Style::default().fg(tc.muted))
-                }
-            },
-        ]),
-    ];
+            if !installed_providers.is_empty() {
+                let label = installed_providers
+                    .iter()
+                    .map(|p| format!("✓ {p}"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                spans.push(Span::styled(label, Style::default().fg(tc.good).bold()));
+            } else if any_available {
+                spans.push(Span::styled("✗ No  ", Style::default().fg(tc.muted)));
+                spans.push(Span::styled(
+                    "(press d to pull)",
+                    Style::default().fg(tc.accent).underlined(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "- No runtime detected",
+                    Style::default().fg(tc.muted),
+                ));
+            }
+            spans
+        }),
+    ]
+}
+
+/// Use the same paragraph wrapping as drawing; only underlined action spans hit
+pub(crate) fn paragraph_action_at(
+    lines: Vec<Line<'_>>,
+    area: Rect,
+    position: ratatui::layout::Position,
+    wrap: bool,
+) -> bool {
+    use ratatui::{buffer::Buffer, widgets::Widget};
+    if !area.contains(position) {
+        return false;
+    }
+    let mut buffer = Buffer::empty(area);
+    let paragraph = Paragraph::new(lines);
+    if wrap {
+        paragraph
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buffer);
+    } else {
+        paragraph.render(area, &mut buffer);
+    }
+    let cell = &buffer[(position.x, position.y)];
+    cell.modifier.contains(Modifier::UNDERLINED) && !cell.symbol().trim().is_empty()
+}
+
+pub(crate) fn detail_pull_at(app: &App, area: Rect, position: ratatui::layout::Position) -> bool {
+    let Some(fit) = app.selected_fit() else {
+        return false;
+    };
+    let left = detail_layout(fit, area)[0].inner(Margin::new(1, 1));
+    paragraph_action_at(
+        detail_metadata_lines(app, fit, &app.theme.colors()),
+        left,
+        position,
+        true,
+    )
+}
+
+fn detail_layout(fit: &ModelFit, area: Rect) -> [Rect; 2] {
+    if !fit.model.gguf_sources.is_empty() || !fit.notes.is_empty() || fit.fits_with_turboquant {
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+    } else {
+        [area, Rect::default()]
+    }
+}
+
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let fit = match app.selected_fit() {
+        Some(f) => f,
+        None => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" No model selected ");
+            frame.render_widget(block, area);
+            return;
+        }
+    };
+
+    let color = fit_color(fit.fit_level, tc);
+
+    let mut lines = detail_metadata_lines(app, fit, tc);
 
     // Scoring section
     let score_color = if fit.score >= 70.0 {
@@ -1873,11 +2273,45 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Line::from(vec![
             Span::styled("  Baseline Est:", Style::default().fg(tc.muted)),
             Span::styled(
-                format!("{:.1} tok/s", fit.estimated_tps),
+                if fit.reports_speed() {
+                    format!("{:.1} tok/s", fit.estimated_tps)
+                } else {
+                    "- (layout refused)".to_string()
+                },
+                Style::default().fg(tc.fg),
+            ),
+        ]),
+        // The full label, matching the CLI's `Estimate Basis:` block. The fit
+        // table carries the short code instead (issue #974). Derived, not read
+        // from the stale `estimate_confidence` field (issue #969).
+        Line::from(vec![
+            Span::styled("  Confidence:  ", Style::default().fg(tc.muted)),
+            Span::styled(
+                fit.effective_estimate_confidence().label(),
                 Style::default().fg(tc.fg),
             ),
         ]),
     ]);
+
+    if let Some(grade) = fit.measured_tps.as_ref().and_then(|m| m.match_grade) {
+        lines.push(Line::from(vec![
+            Span::styled("  PCIe match:  ", Style::default().fg(tc.muted)),
+            Span::styled(grade.label(), Style::default().fg(tc.fg)),
+        ]));
+    }
+
+    // The CLI stops its Estimate Basis block right after Confidence when there
+    // is no estimate left to qualify (display.rs); mirror that here rather than
+    // printing a prefill line under a model that has no throughput estimate.
+    if fit.estimate_basis.method != llmfit_core::fit::UNSUPPORTED_METHOD && fit.estimated_tps > 0.0
+    {
+        for (label, value) in prefill_detail_rows(fit.prefill_tps, fit.ttft_ms) {
+            lines.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(tc.muted)),
+                Span::styled(value, Style::default().fg(tc.fg)),
+            ]));
+        }
+    }
 
     // MoE Architecture section
     if fit.model.is_moe {
@@ -2127,23 +2561,39 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             Style::default().fg(tc.accent),
         )));
         right_lines.push(Line::from(""));
+        // When the row is only in the list because these publishers are
+        // selected in the provider filter, point at them (issue #569).
+        let matched = matched_gguf_provider(&fit.model, &app.providers, &app.selected_providers);
         for src in &fit.model.gguf_sources {
-            let provider_str = format!("  📦 {:<12}", src.provider);
+            let is_match = gguf_source_attributed(
+                matched,
+                &src.provider,
+                &app.providers,
+                &app.selected_providers,
+            );
+            // "▸" replaces a leading space, so the column stays aligned.
+            let provider_str = if is_match {
+                format!("▸ 📦 {:<12}", src.provider)
+            } else {
+                format!("  📦 {:<12}", src.provider)
+            };
+            let provider_style = if is_match {
+                Style::default().fg(tc.accent).bold()
+            } else {
+                Style::default().fg(tc.info)
+            };
             let url_str = format!("hf.co/{}", src.repo);
-            // Visual width: "  📦 " = 5 display cols (📦 is 2-wide), plus padded provider
+            // Visual width: "  📦 " / "▸ 📦 " = 5 display cols (📦 is 2-wide), plus padded provider
             let provider_visual_width = 5 + src.provider.len().max(12);
             if provider_visual_width + url_str.len() <= right_inner_width {
                 // Fits on one line
                 right_lines.push(Line::from(vec![
-                    Span::styled(provider_str, Style::default().fg(tc.info)),
+                    Span::styled(provider_str, provider_style),
                     Span::styled(url_str, Style::default().fg(tc.fg)),
                 ]));
             } else {
                 // Too wide: put URL on its own indented line
-                right_lines.push(Line::from(Span::styled(
-                    provider_str,
-                    Style::default().fg(tc.info),
-                )));
+                right_lines.push(Line::from(Span::styled(provider_str, provider_style)));
                 right_lines.push(Line::from(Span::styled(
                     format!("       {}", url_str),
                     Style::default().fg(tc.fg),
@@ -2197,10 +2647,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     if has_right_pane {
         // Split into left (model info) and right (downloads + notes) panes
-        let h_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(area);
+        let h_layout = detail_layout(fit, area);
 
         left_area = h_layout[0];
 
@@ -2560,21 +3007,32 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     // Search input row.
     let mut lines: Vec<Line> = Vec::with_capacity(inner_height + 1);
+    let search_prefix = " / ";
+    let search_inner_width = popup_width.saturating_sub(2) as usize;
+    let search_query_width = search_inner_width.saturating_sub(search_prefix.len());
+    let (visible_provider_search, provider_cursor_offset) = visible_search_query(
+        &app.provider_search,
+        app.provider_search_cursor_position,
+        search_query_width,
+    );
     let search_display = if app.provider_search.is_empty() {
-        Span::styled(
-            " / type to filter",
-            Style::default().fg(tc.muted).add_modifier(Modifier::ITALIC),
-        )
+        Line::from(vec![
+            Span::styled(search_prefix, Style::default().fg(tc.fg)),
+            Span::styled(
+                "type to filter",
+                Style::default().fg(tc.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ])
     } else {
-        Span::styled(
-            format!(" / {}", app.provider_search),
-            Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
-        )
+        Line::from(vec![
+            Span::styled(search_prefix, Style::default().fg(tc.fg)),
+            Span::styled(
+                visible_provider_search,
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+            ),
+        ])
     };
-    lines.push(Line::from(vec![
-        search_display,
-        Span::styled("_", Style::default().fg(tc.accent_secondary)),
-    ]));
+    lines.push(search_display);
 
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -2665,6 +3123,15 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    let cursor_x = popup_area.x
+        + 1
+        + search_prefix.len() as u16
+        + provider_cursor_offset.min(search_query_width as u16);
+    let cursor_y = popup_area.y + 1;
+    if cursor_x < popup_area.x + popup_area.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
@@ -2895,9 +3362,15 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
     frame.render_widget(paragraph, popup_area);
 }
 
-fn status_keys_and_mode(app: &App) -> (String, String) {
+pub(crate) fn status_keys_and_mode(app: &App) -> (String, String) {
     match app.input_mode {
         InputMode::Normal => {
+            if app.bench_confirm_quit {
+                return (
+                    " q:stop benchmark  Esc:keep running".to_string(),
+                    "CONFIRM EXIT".to_string(),
+                );
+            }
             if app.show_bench {
                 let keys = match app.bench_view_mode {
                     BenchViewMode::Results => {
@@ -2962,8 +3435,8 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
         }
         InputMode::Select => {
             let header_names = [
-                "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Mode",
-                "Mem %", "Ctx", "Date", "Fit", "Use Case",
+                "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Disk",
+                "Mode", "Mem %", "Ctx", "Date", "Fit", "Use Case",
             ];
             let col_name = header_names.get(app.select_column).unwrap_or(&"");
             (
@@ -2976,12 +3449,13 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "SEARCH".to_string(),
         ),
         InputMode::Plan => (
-            "  Tab/jk:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
+            "  Tab/↑↓:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
                 .to_string(),
             "PLAN".to_string(),
         ),
         InputMode::ProviderPopup => (
-            "  ↑↓:navigate (+Shift:speed up)  Space:toggle  a:all/none  Esc:close".to_string(),
+            "  ↑↓:navigate (+Shift:speed up)  Space:toggle  Ctrl-A:all  Ctrl-N:none  Esc:close"
+                .to_string(),
             "PROVIDERS".to_string(),
         ),
         InputMode::UseCasePopup => (
@@ -3028,6 +3502,14 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "  Tab/jk:field  type:edit  Enter:apply  Ctrl-R:reset  Esc:close".to_string(),
             "ADV CONFIG".to_string(),
         ),
+        InputMode::DownloadManager if app.dm_confirm_delete => (
+            " y:delete  n:cancel".to_string(),
+            "CONFIRM DELETE".to_string(),
+        ),
+        InputMode::DownloadManager if app.dm_editing_dir => (
+            " Enter:apply  Ctrl-U:clear  Esc:cancel".to_string(),
+            "EDIT DIRECTORY".to_string(),
+        ),
         InputMode::DownloadManager => (
             "  Tab:section  jk:navigate  x:delete  e:edit dir  D/Esc:close".to_string(),
             "DOWNLOADS".to_string(),
@@ -3037,11 +3519,91 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
                 .to_string(),
             "FILTER".to_string(),
         ),
+        InputMode::Benchmarks if app.bench_hw_picker_open => (
+            " ↑↓:choose  Enter:select  Esc:cancel".to_string(),
+            "HARDWARE".to_string(),
+        ),
         InputMode::Benchmarks => (
-            " ↑/k:up  ↓/j:down  H:change GPU  r:refresh  b/q/Esc:close".to_string(),
+            if app.bench_search_active {
+                " type:filter  ↑↓:move  Enter:apply  Esc:clear".to_string()
+            } else if !app.bench_search_query.is_empty() {
+                " ↑/k:up  ↓/j:down  /:edit search  Esc:clear search  H:change GPU  r:refresh  b/q:close"
+                    .to_string()
+            } else {
+                " ↑/k:up  ↓/j:down  /:search  H:change GPU  r:refresh  b/q/Esc:close".to_string()
+            },
             "COMMUNITY LEADERBOARD".to_string(),
         ),
+        InputMode::BenchOffer => (
+            match app.bench_offer_state {
+                BenchOfferState::Offer => " Enter:run  Space:share toggle  Esc:skip",
+                BenchOfferState::Running => " Esc:continue in background",
+                _ => " Enter:continue  Esc:close",
+            }
+            .to_string(),
+            "BENCHMARK".to_string(),
+        ),
     }
+}
+
+pub(crate) fn status_progress_text(app: &App) -> Option<String> {
+    app.pull_status
+        .as_ref()
+        .map(|status| match app.pull_percent {
+            Some(pct) => format!(" {} [{:.0}%] ", status, pct),
+            None => format!(" {} ", status),
+        })
+}
+
+fn status_shows_model(app: &App) -> bool {
+    !(app.show_detail
+        || app.show_compare
+        || app.show_multi_compare
+        || app.show_plan
+        || app.show_downloads
+        || app.show_benchmarks
+        || app.show_bench)
+}
+
+pub(crate) fn status_model_area(app: &App, area: Rect) -> Option<Rect> {
+    if !status_shows_model(app) {
+        return None;
+    }
+    let fit = app.selected_fit()?;
+    let row = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas::<2>(area)[0];
+    Some(Rect::new(
+        row.x,
+        row.y,
+        row.width
+            .min(3 + UnicodeWidthStr::width(fit.model.name.as_str()) as u16),
+        row.height,
+    ))
+}
+
+fn status_footer_areas(app: &App, area: Rect) -> [Rect; 2] {
+    let footer =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas::<2>(area)[1];
+    if let Some(text) = status_progress_text(app) {
+        Layout::horizontal([
+            Constraint::Min(20),
+            Constraint::Length(text.len() as u16 + 2),
+        ])
+        .areas(footer)
+    } else {
+        [footer, Rect::default()]
+    }
+}
+
+pub(crate) fn status_progress_area(app: &App, area: Rect) -> Option<Rect> {
+    (app.pull_active.is_some() || app.pull_percent.is_some())
+        .then(|| status_footer_areas(app, area)[1])
+}
+
+pub(crate) fn status_key_area(app: &App, area: Rect) -> Rect {
+    let keys = status_footer_areas(app, area)[0];
+    let prefix = UnicodeWidthStr::width(status_keys_and_mode(app).1.as_str()) as u16 + 2;
+    let skip = prefix.min(keys.width);
+    Rect::new(keys.x + skip, keys.y, keys.width - skip, keys.height)
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
@@ -3054,13 +3616,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .split(area);
 
     // Row 0: selected model full name
-    let model_line = if !app.show_detail
-        && !app.show_compare
-        && !app.show_multi_compare
-        && !app.show_plan
-        && !app.show_downloads
-        && !app.show_benchmarks
-    {
+    let model_line = if status_shows_model(app) {
         if let Some(&idx) = app.filtered_fits.get(app.selected_row) {
             let fit = &app.all_fits[idx];
             Line::from(vec![
@@ -3086,20 +3642,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(model_line), rows[0]);
 
     // Row 1: keybindings (with download progress if active)
-    if let Some(status) = &app.pull_status {
-        let progress_text = if let Some(pct) = app.pull_percent {
-            format!(" {} [{:.0}%] ", status, pct)
-        } else {
-            format!(" {} ", status)
-        };
-
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(20),
-                Constraint::Length(progress_text.len() as u16 + 2),
-            ])
-            .split(rows[1]);
+    if let Some(progress_text) = status_progress_text(app) {
+        let chunks = status_footer_areas(app, area);
 
         let status_line = Line::from(vec![
             Span::styled(
@@ -3365,11 +3909,177 @@ fn draw_params_bucket_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, popup_area);
 }
 
+pub(crate) fn bench_offer_lines(app: &App, tc: &ThemeColors) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Model:    ", Style::default().fg(tc.muted)),
+            Span::styled(
+                app.bench_offer_model.clone(),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Provider: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                app.bench_offer_providers.join(", "),
+                Style::default().fg(tc.fg),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    match app.bench_offer_state {
+        BenchOfferState::Offer => {
+            if let Some(reason) = &app.bench_offer_share_unavailable {
+                lines.push(Line::from(vec![
+                    Span::styled("  [-] ", Style::default().fg(tc.muted)),
+                    Span::styled("Share with llmfit ", Style::default().fg(tc.muted)),
+                    Span::styled(
+                        format!("(unavailable: {reason})"),
+                        Style::default().fg(tc.warning),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "      Results are saved locally for sharing later",
+                    Style::default().fg(tc.muted),
+                )));
+            } else {
+                let (mark, mark_style) = if app.bench_offer_share {
+                    (
+                        "[x]",
+                        Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    ("[ ]", Style::default().fg(tc.muted))
+                };
+                let desc = if app.bench_offer_pending > 0 {
+                    format!(
+                        "(one PR: this run + {} stored local result(s))",
+                        app.bench_offer_pending
+                    )
+                } else {
+                    "(opens a PR with your results)".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), mark_style),
+                    Span::styled("Share with llmfit ", Style::default().fg(tc.fg)),
+                    Span::styled(desc, Style::default().fg(tc.muted)),
+                ]));
+                if !app.bench_offer_share {
+                    lines.push(Line::from(Span::styled(
+                        "      Off: results are saved locally for sharing later",
+                        Style::default().fg(tc.muted),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Run   [Space] Toggle share   [Esc] Skip",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Running => {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", app.bench_offer_progress),
+                Style::default().fg(tc.info),
+            )));
+            if let Some((code, url)) = &app.bench_offer_auth {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Authorize on GitHub to share:",
+                    Style::default().fg(tc.fg),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("    Open ", Style::default().fg(tc.muted)),
+                    Span::styled(url.clone(), Style::default().fg(tc.accent)),
+                    Span::styled("  and enter code ", Style::default().fg(tc.muted)),
+                    Span::styled(
+                        code.clone(),
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] Continue in background",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Done => {
+            if let Some(summary) = &app.bench_offer_summary {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", summary),
+                    Style::default().fg(tc.good),
+                )));
+            }
+            if let Some(url) = &app.bench_offer_pr_url {
+                lines.push(Line::from(vec![
+                    Span::styled("  Results PR: ", Style::default().fg(tc.fg)),
+                    Span::styled(url.clone(), Style::default().fg(tc.accent)),
+                ]));
+            }
+            if let Some(note) = &app.bench_offer_share_note {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", note),
+                    Style::default().fg(tc.warning),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Continue to leaderboard",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Error => {
+            if let Some(e) = &app.bench_offer_error {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", e),
+                    Style::default().fg(tc.error),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Continue to leaderboard",
+                Style::default().fg(tc.muted),
+            )));
+        }
+    }
+
+    lines
+}
+
+fn draw_bench_offer_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+
+    let popup_width = 64.min(area.width.saturating_sub(4));
+    let popup_height = 14.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let lines = bench_offer_lines(app, tc);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(Span::styled(
+            " Benchmark this model ",
+            Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let popup_height = (area.height - 4).min(32);
+    let popup_height = area.height.saturating_sub(4).min(32);
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -3380,6 +4090,9 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     // Entries: ("key", "description") — empty key = blank line, key without leading spaces = section header
     let help_entries: Vec<(&str, &str)> = vec![
         ("Navigation", ""),
+        ("  Mouse wheel", "Scroll list (keep selection)"),
+        ("  Left click", "Controls, hotkeys, rows and fields"),
+        ("  Double click", "Open model details"),
         ("  ↑ / k", "Move up"),
         ("  ↓ / j", "Move down"),
         ("  Enter", "Toggle detail view"),
@@ -3414,6 +4127,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             "Inference Bench (local quality scoring against your models)",
         ),
         ("  H", "Change GPU (in community leaderboard view)"),
+        ("  /", "Search results (in community leaderboard view)"),
         ("  y", "Copy model name"),
         ("", ""),
         ("Comparison", ""),
@@ -3628,6 +4342,11 @@ fn draw_license_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Column, inside the simulation popup border, where each input value starts.
+/// Rendering, the text cursor and mouse clicks all use it, so a longer field
+/// label only needs this one change.
+pub(crate) const SIM_INPUT_COLUMN: u16 = 17;
+
 fn draw_simulation_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
@@ -3655,7 +4374,11 @@ fn draw_simulation_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let fields = [
         ("  RAM (GB):", &app.sim_ram_input, SimulationField::Ram),
-        ("  VRAM (GB):", &app.sim_vram_input, SimulationField::Vram),
+        (
+            "  VRAM/GPU (GB):",
+            &app.sim_vram_input,
+            SimulationField::Vram,
+        ),
         (
             "  CPU Cores:",
             &app.sim_cpu_input,
@@ -3686,7 +4409,10 @@ fn draw_simulation_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", label), label_style),
+            Span::styled(
+                format!("{:<width$}", label, width = SIM_INPUT_COLUMN as usize),
+                label_style,
+            ),
             Span::styled(display_val, value_style),
         ]));
     }
@@ -3736,7 +4462,7 @@ fn draw_simulation_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         SimulationField::Vram => 2,
         SimulationField::CpuCores => 3,
     };
-    let cursor_x = inner.x + 14 + app.sim_cursor_position as u16;
+    let cursor_x = inner.x + SIM_INPUT_COLUMN + app.sim_cursor_position as u16;
     let cursor_y = inner.y + field_row;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -3747,7 +4473,7 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
     let popup_width = 52u16.min(area.width.saturating_sub(4));
-    let popup_height = 16u16.min(area.height.saturating_sub(4));
+    let popup_height = 17u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -3805,6 +4531,11 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             &app.adv_config_context_cap_input,
             AdvConfigField::ContextCap,
         ),
+        (
+            "  DDR GB/s:",
+            &app.adv_config_ddr_bandwidth_input,
+            AdvConfigField::DdrBandwidth,
+        ),
     ];
 
     let mut lines: Vec<Line> = Vec::new();
@@ -3853,6 +4584,7 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         AdvConfigField::FactorTp => 5,
         AdvConfigField::FactorCpuOnly => 6,
         AdvConfigField::ContextCap => 7,
+        AdvConfigField::DdrBandwidth => 8,
     };
     let cursor_x = inner.x + 14 + app.adv_config_cursor_position as u16;
     let cursor_y = inner.y + field_row;
@@ -3865,15 +4597,19 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 // Download Manager view
 // ---------------------------------------------------------------------------
 
-fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let chunks = Layout::default()
+pub(crate) fn download_manager_layout(area: Rect) -> [Rect; 3] {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // Active download
             Constraint::Length(3), // Config
             Constraint::Min(6),    // History
         ])
-        .split(area);
+        .areas(area)
+}
+
+fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let chunks = download_manager_layout(area);
 
     draw_dm_active(frame, app, chunks[0], tc);
     draw_dm_config(frame, app, chunks[1], tc);
@@ -3881,11 +4617,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     // Show delete confirmation overlay
     if app.dm_confirm_delete {
-        let popup_width = 50u16.min(area.width.saturating_sub(4));
-        let popup_height = 5u16;
-        let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-        let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-        let popup_area = Rect::new(x, y, popup_width, popup_height);
+        let popup_area = centered_popup(area, 50, 5);
         frame.render_widget(Clear, popup_area);
 
         let model_name = app
@@ -4063,6 +4795,11 @@ fn draw_dm_history(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .iter()
         .rev()
         .enumerate()
+        .skip(
+            app.dm_history_cursor
+                .saturating_sub((area.height.saturating_sub(3) as usize).saturating_sub(1)),
+        )
+        .take(area.height.saturating_sub(3) as usize)
         .map(|(display_idx, record)| {
             let (status_text, status_color) = match &record.result {
                 DownloadResult::Success => ("✓ Done", tc.good),
@@ -4148,6 +4885,75 @@ fn format_epoch(epoch: u64) -> String {
     format!("{:04}-{:02}-{:02}", y, m + 1, remaining + 1)
 }
 
+pub(crate) fn leaderboard_notice(
+    app: &App,
+    area: Rect,
+) -> Option<(Rect, Vec<Line<'_>>, &'static str)> {
+    if app.bench_loading {
+        return None;
+    }
+    let inner = area.inner(Margin::new(1, 1));
+    let tc = app.theme.colors();
+    let action = Style::default().fg(tc.accent).underlined();
+    if let Some(err) = &app.bench_error
+        && app.bench_entries.is_empty()
+    {
+        return Some((
+            inner,
+            vec![
+                Line::from(Span::styled(
+                    "  Failed to fetch benchmarks:",
+                    Style::default().fg(tc.error),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", err),
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  r:retry", action),
+                    Span::styled(
+                        ", or set LOCALMAXXING_API_KEY env var",
+                        Style::default().fg(tc.muted),
+                    ),
+                ]),
+            ],
+            "r",
+        ));
+    }
+    if app.bench_entries.is_empty() {
+        return Some((
+            inner,
+            vec![
+                Line::from(Span::styled(
+                    "  No benchmark results found for this hardware configuration.",
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("  H:pick a different GPU/chip", action)),
+            ],
+            "H",
+        ));
+    }
+    if app.bench_visible_indices().is_empty() && !app.bench_search_query.is_empty() {
+        let content =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas::<2>(inner)[1];
+        return Some((
+            content,
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  No results match /{}", app.bench_search_query),
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(Span::styled("  Esc:clear the search", action)),
+            ],
+            "Esc",
+        ));
+    }
+    None
+}
+
 fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4164,42 +4970,16 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
             Style::default().fg(tc.warning),
         )));
         frame.render_widget(loading, inner);
+        if app.bench_hw_picker_open {
+            draw_bench_hw_picker(frame, app, tc);
+        }
         return;
     }
 
-    if let Some(ref err) = app.bench_error {
-        let err_text = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  Failed to fetch benchmarks:",
-                Style::default().fg(tc.error),
-            )),
-            Line::from(Span::styled(
-                format!("  {}", err),
-                Style::default().fg(tc.muted),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Press r to retry, or set LOCALMAXXING_API_KEY env var",
-                Style::default().fg(tc.muted),
-            )),
-        ]);
-        frame.render_widget(err_text, inner);
-        return;
-    }
-
-    if app.bench_entries.is_empty() && !app.bench_hw_picker_open {
-        let empty = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  No benchmark results found for this hardware configuration.",
-                Style::default().fg(tc.muted),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Press H to pick a different GPU/chip",
-                Style::default().fg(tc.muted),
-            )),
-        ]);
-        frame.render_widget(empty, inner);
+    if let Some((notice_area, lines, _)) = leaderboard_notice(app, area)
+        && notice_area.y == inner.y
+    {
+        frame.render_widget(Paragraph::new(lines), notice_area);
         if app.bench_hw_picker_open {
             draw_bench_hw_picker(frame, app, tc);
         }
@@ -4216,15 +4996,56 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
             .unwrap_or(&app.specs.cpu_name)
             .to_string()
     };
-    let summary = Line::from(vec![
+    let local_count = app
+        .bench_entries
+        .iter()
+        .filter(|e| e.id.starts_with("local:"))
+        .count();
+    let community_count = app
+        .bench_entries
+        .iter()
+        .filter(|e| e.id.starts_with("community:"))
+        .count();
+    let mut counts = format!("  ({} results", app.bench_total);
+    if local_count > 0 {
+        counts.push_str(&format!(", {} yours", local_count));
+    }
+    if community_count > 0 {
+        counts.push_str(&format!(", {} llmfit community", community_count));
+    }
+    counts.push(')');
+    let mut summary_spans = vec![
         Span::styled("  Hardware: ", Style::default().fg(tc.muted)),
         Span::styled(&hw_desc, Style::default().fg(tc.fg).bold()),
-        Span::styled(
-            format!("  ({} results)", app.bench_total),
-            Style::default().fg(tc.muted),
-        ),
-        Span::styled("  H:change GPU", Style::default().fg(tc.accent)),
-    ]);
+    ];
+    if app.bench_hw_label.is_some() {
+        summary_spans.push(Span::styled(
+            " [SIMULATED]",
+            Style::default().fg(tc.warning).bold(),
+        ));
+    }
+    summary_spans.push(Span::styled(counts, Style::default().fg(tc.muted)));
+    summary_spans.push(Span::styled(
+        "  H:change GPU",
+        Style::default().fg(tc.accent),
+    ));
+
+    // The query itself is typed into the Search box up top; here just the
+    // match count.
+    let visible = app.bench_visible_indices();
+    if app.bench_search_active || !app.bench_search_query.is_empty() {
+        summary_spans.push(Span::styled(
+            format!("  {}/{} match", visible.len(), app.bench_entries.len()),
+            Style::default().fg(tc.accent).bold(),
+        ));
+    }
+    if let Some(ref err) = app.bench_error {
+        summary_spans.push(Span::styled(
+            format!("  ⚠ {}", err),
+            Style::default().fg(tc.warning),
+        ));
+    }
+    let summary = Line::from(summary_spans);
 
     // Table header
     let header_cells = [
@@ -4248,21 +5069,24 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
     .height(1);
 
     let visible_height = inner.height.saturating_sub(3) as usize; // 1 summary + 1 header + 1 spacing
-    // Adjust scroll to keep cursor visible
+    // The cursor indexes into the filtered list; keep it valid and visible.
+    if !visible.is_empty() && app.bench_cursor >= visible.len() {
+        app.bench_cursor = visible.len() - 1;
+    }
     if app.bench_cursor < app.bench_scroll {
         app.bench_scroll = app.bench_cursor;
     } else if app.bench_cursor >= app.bench_scroll + visible_height {
         app.bench_scroll = app.bench_cursor.saturating_sub(visible_height - 1);
     }
 
-    let rows: Vec<Row> = app
-        .bench_entries
+    let rows: Vec<Row> = visible
         .iter()
         .enumerate()
         .skip(app.bench_scroll)
         .take(visible_height)
-        .map(|(i, entry)| {
-            let is_selected = i == app.bench_cursor;
+        .map(|(vi, &i)| {
+            let entry = &app.bench_entries[i];
+            let is_selected = vi == app.bench_cursor;
             let style = if is_selected {
                 Style::default().bg(tc.highlight_bg).fg(tc.fg)
             } else {
@@ -4290,6 +5114,8 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
                 .map(|v| format!("{}", v))
                 .unwrap_or_default();
 
+            let is_local = entry.id.starts_with("local:");
+            let is_community = entry.id.starts_with("community:");
             let verified_marker = if entry.verified() { " *" } else { "" };
             let user = format!("{}{}", entry.username(), verified_marker);
 
@@ -4311,7 +5137,16 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
                 Cell::from(ttft),
                 Cell::from(vram),
                 Cell::from(ctx),
-                Cell::from(user),
+                if is_local {
+                    // Your own stored results, pinned above the fetched board.
+                    Cell::from(user).style(Style::default().fg(tc.accent))
+                } else if is_community {
+                    // Repo-contributed runs with matching CPU and GPU, shipped
+                    // inside this build.
+                    Cell::from(user).style(Style::default().fg(tc.info))
+                } else {
+                    Cell::from(user)
+                },
             ])
             .style(style)
         })
@@ -4338,7 +5173,11 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
         .split(inner);
 
     frame.render_widget(Paragraph::new(summary), chunks[0]);
-    frame.render_widget(table, chunks[1]);
+    if let Some((notice_area, lines, _)) = leaderboard_notice(app, area) {
+        frame.render_widget(Paragraph::new(lines), notice_area);
+    } else {
+        frame.render_widget(table, chunks[1]);
+    }
 
     // Draw hardware picker popup overlay if open
     if app.bench_hw_picker_open {
@@ -4354,7 +5193,8 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     // +3 for border + "My Hardware" entry + bottom hint
     let popup_height = (presets.len() as u16 + 5).min(area.height.saturating_sub(6));
-    let popup_width = 42u16.min(area.width.saturating_sub(4));
+    // Wide enough for "<label> (NNN benchmarks)" plus marker and check.
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -4378,7 +5218,8 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     // Scrolling: keep cursor in view
     let scroll = if app.bench_hw_picker_cursor >= inner_height {
-        app.bench_hw_picker_cursor.saturating_sub(inner_height - 1)
+        app.bench_hw_picker_cursor
+            .saturating_sub(inner_height.saturating_sub(1))
     } else {
         0
     };
@@ -4396,10 +5237,12 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             )
         } else {
             let p = &presets[i - 1];
-            (
-                p.label.to_string(),
-                app.bench_hw_label.as_deref() == Some(p.label),
-            )
+            let label = match llmfit_core::benchmarks::cached_preset_benchmark_count(p.label) {
+                Some(1) => format!("{} (1 benchmark)", p.label),
+                Some(n) => format!("{} ({} benchmarks)", p.label, n),
+                None => p.label.to_string(),
+            };
+            (label, app.bench_hw_label.as_deref() == Some(p.label))
         };
 
         let style = if is_selected {
@@ -4422,11 +5265,11 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    use crate::tui_app::{FilterPopupField, FitFilter};
+    use crate::tui_app::{AvailabilityFilter, FilterPopupField, FitFilter};
 
     let area = frame.area();
     let popup_width = 56u16.min(area.width.saturating_sub(4));
-    let popup_height = 18u16.min(area.height.saturating_sub(4));
+    let popup_height = 21u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -4536,7 +5379,7 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     )));
 
     let is_sort = app.filter_field == FilterPopupField::SortDirection;
-    let dir_text = if app.filter_sort_ascending {
+    let dir_text = if app.table_sort_direction_is_ascending(app.filter_sort_ascending) {
         "Ascending ↑"
     } else {
         "Descending ↓"
@@ -4577,6 +5420,33 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         Span::styled(format!(" {:>12}", app.fit_filter.label()), fit_val_style),
     ]));
 
+    lines.push(Line::from(""));
+
+    // Availability Filter (installed / GGUF-available)
+    lines.push(Line::from(Span::styled(
+        "  Availability:",
+        Style::default().fg(tc.accent).bold(),
+    )));
+
+    let is_avail = app.filter_field == FilterPopupField::Availability;
+    let avail_color = match app.availability_filter {
+        AvailabilityFilter::All => tc.fg,
+        AvailabilityFilter::HasGguf => tc.info,
+        AvailabilityFilter::Installed => tc.good,
+    };
+    let avail_val_style = if is_avail {
+        Style::default().fg(avail_color).bg(tc.highlight_bg)
+    } else {
+        Style::default().fg(avail_color)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("    Show:", label_style(is_avail)),
+        Span::styled(
+            format!(" {:>12}", app.availability_filter.label()),
+            avail_val_style,
+        ),
+    ]));
+
     // Footer
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -4592,7 +5462,8 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     //  0: "Parameters (B):"    1: Min  2: Max  3: (blank)
     //  4: "Memory Usage (%):"  5: Min  6: Max  7: (blank)
     //  8: "Sort:"              9: Direction     10: (blank)
-    // 11: "Fit Filter:"       12: Fit
+    // 11: "Fit Filter:"       12: Fit           13: (blank)
+    // 14: "Availability:"     15: Show
     let field_row: u16 = match app.filter_field {
         FilterPopupField::ParamsMin => 1,
         FilterPopupField::ParamsMax => 2,
@@ -4600,6 +5471,7 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         FilterPopupField::MemPctMax => 6,
         FilterPopupField::SortDirection => 9,
         FilterPopupField::FitFilter => 12,
+        FilterPopupField::Availability => 15,
     };
 
     // "    Min: " / "    Max: " = 9 chars label
@@ -4643,8 +5515,8 @@ fn bench_get_role_quality(
         .map(|rs| rs.quality)
 }
 
-fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let title = match app.bench_view_mode {
+pub(crate) fn bench_title(app: &App) -> &'static str {
+    match app.bench_view_mode {
         BenchViewMode::Results => {
             if app.bench_show_detail {
                 " INFERENCE BENCH: Quality Benchmarks (j/k=scroll, Enter/q=close detail) "
@@ -4653,7 +5525,11 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             }
         }
         BenchViewMode::Routing => " INFERENCE BENCH: Routing Matrix (r=results, q=back) ",
-    };
+    }
+}
+
+fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let title = bench_title(app);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4679,13 +5555,6 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 width: inner.width,
                 height: progress_height.min(inner.height),
             };
-            let remaining = Rect {
-                x: inner.x,
-                y: inner.y + progress_area.height,
-                width: inner.width,
-                height: inner.height.saturating_sub(progress_area.height),
-            };
-
             // ── Progress line ──
             let spinner_display = if app.bench_running {
                 format!("{} ", spinner_char)
@@ -4717,15 +5586,7 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             frame.render_widget(progress_line, progress_area);
 
             // ── Split remaining area: table top, detail bottom ──
-            let (table_area, detail_area) = if app.bench_show_detail {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                    .split(remaining);
-                (chunks[0], Some(chunks[1]))
-            } else {
-                (remaining, None)
-            };
+            let (table_area, detail_area) = bench_results_layout(area, app.bench_show_detail);
 
             // ── Build Table widget ──
             if app.bench_model_status.is_empty() && !app.bench_running {
@@ -4767,11 +5628,20 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                     "long-context",
                 ];
 
-                let rows: Vec<Row> = app
-                    .bench_model_status
+                // Keep only the rows that fit in the current table. The
+                // viewport follows selection because drawing is stateless.
+                let viewport = model_table_viewport(
+                    app.bench_model_status.len(),
+                    app.bench_selected_row,
+                    app.bench_table_offset,
+                    usize::from(table_area.height.saturating_sub(1)),
+                    true,
+                );
+                let rows: Vec<Row> = app.bench_model_status[viewport.clone()]
                     .iter()
                     .enumerate()
-                    .map(|(i, ms)| {
+                    .map(|(local_i, ms)| {
+                        let i = viewport.start + local_i;
                         let result = app.bench_results.iter().find(|r| r.model == ms.name);
 
                         let marker = if i == selected_row { "▶" } else { " " };
@@ -4967,204 +5837,196 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             }
 
             // ── Detail pane (when open) ──
-            if let Some(det_area) = detail_area {
-                if let Some(ms) = app.bench_model_status.get(app.bench_selected_row) {
-                    let result = app.bench_results.iter().find(|r| r.model == ms.name);
+            if let Some(det_area) = detail_area
+                && let Some(ms) = app.bench_model_status.get(app.bench_selected_row)
+            {
+                let result = app.bench_results.iter().find(|r| r.model == ms.name);
 
-                    let mut detail_lines: Vec<Line> = Vec::new();
+                let mut detail_lines: Vec<Line> = Vec::new();
 
-                    if let Some(result) = result {
+                if let Some(result) = result {
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("  Model: ", Style::default().fg(tc.muted)),
+                        Span::styled(
+                            &result.model,
+                            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    detail_lines.push(Line::from(Span::styled(
+                        format!(
+                            "  Overall: Q:{:.1}  S:{:.1} t/s  C:{:.1}  |  Tests: {}  Roles: {}",
+                            result.overall_quality,
+                            result.overall_speed,
+                            result.overall_composite,
+                            result.test_results.len(),
+                            result.roles.len()
+                        ),
+                        Style::default().fg(tc.fg),
+                    )));
+                    detail_lines.push(Line::from(""));
+
+                    // ── Role summary table ──
+                    let bold_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(format!("{:<16}", "Role"), bold_style),
+                        Span::styled(format!("{:>5}", "Qual"), bold_style),
+                        Span::styled(format!("{:>9}", "Speed"), bold_style),
+                        Span::styled(format!("{:>7}", "Comp"), bold_style),
+                        Span::styled(format!("{:>8}", "TTFT"), bold_style),
+                        Span::styled("  Bar", bold_style),
+                    ]));
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {}", "─".repeat(60)),
+                        Style::default().fg(tc.border),
+                    )));
+
+                    for rs in &result.roles {
+                        let q_color = bench_score_color(rs.quality, tc);
+                        let c_color = bench_score_color(rs.composite, tc);
+                        let bar = bench_bar(rs.composite, 15);
+
+                        let role_tests: Vec<&llmfit_core::quality::QualityResult> = result
+                            .test_results
+                            .iter()
+                            .filter(|t| t.role == rs.role)
+                            .collect();
+                        let avg_ttft = if role_tests.is_empty() {
+                            0.0
+                        } else {
+                            role_tests.iter().filter_map(|t| t.ttft_ms).sum::<f64>()
+                                / role_tests
+                                    .iter()
+                                    .filter(|t| t.ttft_ms.is_some())
+                                    .count()
+                                    .max(1) as f64
+                        };
+
                         detail_lines.push(Line::from(vec![
-                            Span::styled("  Model: ", Style::default().fg(tc.muted)),
+                            Span::styled(format!("  {:<16}", rs.role), Style::default().fg(tc.fg)),
                             Span::styled(
-                                &result.model,
-                                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                                format!("{:>5.1}", rs.quality),
+                                Style::default().fg(q_color),
                             ),
+                            Span::styled(
+                                format!("{:>7.1}t/s", rs.speed),
+                                Style::default().fg(tc.accent_secondary),
+                            ),
+                            Span::styled(
+                                format!("{:>7.1}", rs.composite),
+                                Style::default().fg(c_color),
+                            ),
+                            Span::styled(
+                                if avg_ttft > 0.0 {
+                                    format!("{:>6.0}ms", avg_ttft)
+                                } else {
+                                    format!("{:>8}", "—")
+                                },
+                                Style::default().fg(tc.muted),
+                            ),
+                            Span::styled(format!("  {}", bar), Style::default().fg(c_color)),
                         ]));
+                    }
+
+                    // ── Full test rubric grouped by role ──
+                    if !result.test_results.is_empty() {
+                        detail_lines.push(Line::from(""));
                         detail_lines.push(Line::from(Span::styled(
-                            format!(
-                                "  Overall: Q:{:.1}  S:{:.1} t/s  C:{:.1}  |  Tests: {}  Roles: {}",
-                                result.overall_quality,
-                                result.overall_speed,
-                                result.overall_composite,
-                                result.test_results.len(),
-                                result.roles.len()
-                            ),
-                            Style::default().fg(tc.fg),
+                            "  ── Full Test Rubric ──",
+                            Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
                         )));
                         detail_lines.push(Line::from(""));
 
-                        // ── Role summary table ──
-                        let bold_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
-                        detail_lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(format!("{:<16}", "Role"), bold_style),
-                            Span::styled(format!("{:>5}", "Qual"), bold_style),
-                            Span::styled(format!("{:>9}", "Speed"), bold_style),
-                            Span::styled(format!("{:>7}", "Comp"), bold_style),
-                            Span::styled(format!("{:>8}", "TTFT"), bold_style),
-                            Span::styled("  Bar", bold_style),
-                        ]));
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  {}", "─".repeat(60)),
-                            Style::default().fg(tc.border),
-                        )));
+                        let mut current_role = String::new();
+                        for t in &result.test_results {
+                            if t.role != current_role {
+                                if !current_role.is_empty() {
+                                    detail_lines.push(Line::from(Span::styled(
+                                        "  └────────────────────────────────────────────────",
+                                        Style::default().fg(tc.border),
+                                    )));
+                                }
+                                current_role = t.role.clone();
+                                detail_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("  ┌─ {} ", t.role.to_uppercase()),
+                                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled("─".repeat(50), Style::default().fg(tc.border)),
+                                ]));
+                            }
 
-                        for rs in &result.roles {
-                            let q_color = bench_score_color(rs.quality, tc);
-                            let c_color = bench_score_color(rs.composite, tc);
-                            let bar = bench_bar(rs.composite, 15);
-
-                            let role_tests: Vec<&llmfit_core::quality::QualityResult> = result
-                                .test_results
-                                .iter()
-                                .filter(|t| t.role == rs.role)
-                                .collect();
-                            let avg_ttft = if role_tests.is_empty() {
-                                0.0
+                            let q_color = bench_score_color(t.quality, tc);
+                            let status = if t.error.is_some() {
+                                "ERR"
+                            } else if t.quality >= 7.0 {
+                                " ✓ "
+                            } else if t.quality >= 4.0 {
+                                " ~ "
                             } else {
-                                role_tests.iter().filter_map(|t| t.ttft_ms).sum::<f64>()
-                                    / role_tests
-                                        .iter()
-                                        .filter(|t| t.ttft_ms.is_some())
-                                        .count()
-                                        .max(1) as f64
+                                " ✗ "
+                            };
+                            let status_color = if t.error.is_some() {
+                                tc.error
+                            } else if t.quality >= 7.0 {
+                                tc.good
+                            } else if t.quality >= 4.0 {
+                                tc.warning
+                            } else {
+                                tc.error
                             };
 
                             detail_lines.push(Line::from(vec![
                                 Span::styled(
-                                    format!("  {:<16}", rs.role),
+                                    format!("  │  {:<28}", t.test_name),
                                     Style::default().fg(tc.fg),
                                 ),
+                                Span::styled(status, Style::default().fg(status_color)),
                                 Span::styled(
-                                    format!("{:>5.1}", rs.quality),
+                                    format!("  Q:{:>4.1}", t.quality),
                                     Style::default().fg(q_color),
                                 ),
                                 Span::styled(
-                                    format!("{:>7.1}t/s", rs.speed),
-                                    Style::default().fg(tc.accent_secondary),
-                                ),
-                                Span::styled(
-                                    format!("{:>7.1}", rs.composite),
-                                    Style::default().fg(c_color),
-                                ),
-                                Span::styled(
-                                    if avg_ttft > 0.0 {
-                                        format!("{:>6.0}ms", avg_ttft)
-                                    } else {
-                                        format!("{:>8}", "—")
-                                    },
+                                    format!("  {:>6.1}t/s", t.tok_per_sec),
                                     Style::default().fg(tc.muted),
                                 ),
-                                Span::styled(format!("  {}", bar), Style::default().fg(c_color)),
+                                Span::styled(
+                                    format!("  {:>5.1}s", t.wall_time_sec),
+                                    Style::default().fg(tc.muted),
+                                ),
                             ]));
-                        }
 
-                        // ── Full test rubric grouped by role ──
-                        if !result.test_results.is_empty() {
-                            detail_lines.push(Line::from(""));
-                            detail_lines.push(Line::from(Span::styled(
-                                "  ── Full Test Rubric ──",
-                                Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
-                            )));
-                            detail_lines.push(Line::from(""));
-
-                            let mut current_role = String::new();
-                            for t in &result.test_results {
-                                if t.role != current_role {
-                                    if !current_role.is_empty() {
-                                        detail_lines.push(Line::from(Span::styled(
-                                            "  └────────────────────────────────────────────────",
-                                            Style::default().fg(tc.border),
-                                        )));
-                                    }
-                                    current_role = t.role.clone();
-                                    detail_lines.push(Line::from(vec![
-                                        Span::styled(
-                                            format!("  ┌─ {} ", t.role.to_uppercase()),
-                                            Style::default()
-                                                .fg(tc.accent)
-                                                .add_modifier(Modifier::BOLD),
-                                        ),
-                                        Span::styled(
-                                            "─".repeat(50),
-                                            Style::default().fg(tc.border),
-                                        ),
-                                    ]));
-                                }
-
-                                let q_color = bench_score_color(t.quality, tc);
-                                let status = if t.error.is_some() {
-                                    "ERR"
-                                } else if t.quality >= 7.0 {
-                                    " ✓ "
-                                } else if t.quality >= 4.0 {
-                                    " ~ "
-                                } else {
-                                    " ✗ "
-                                };
-                                let status_color = if t.error.is_some() {
-                                    tc.error
-                                } else if t.quality >= 7.0 {
-                                    tc.good
-                                } else if t.quality >= 4.0 {
-                                    tc.warning
-                                } else {
-                                    tc.error
-                                };
-
-                                detail_lines.push(Line::from(vec![
-                                    Span::styled(
-                                        format!("  │  {:<28}", t.test_name),
-                                        Style::default().fg(tc.fg),
-                                    ),
-                                    Span::styled(status, Style::default().fg(status_color)),
-                                    Span::styled(
-                                        format!("  Q:{:>4.1}", t.quality),
-                                        Style::default().fg(q_color),
-                                    ),
-                                    Span::styled(
-                                        format!("  {:>6.1}t/s", t.tok_per_sec),
-                                        Style::default().fg(tc.muted),
-                                    ),
-                                    Span::styled(
-                                        format!("  {:>5.1}s", t.wall_time_sec),
-                                        Style::default().fg(tc.muted),
-                                    ),
-                                ]));
-
-                                if let Some(e) = &t.error {
-                                    detail_lines.push(Line::from(Span::styled(
-                                        format!("  │      Error: {}", e),
-                                        Style::default().fg(tc.error),
-                                    )));
-                                } else if !t.response_preview.is_empty() {
-                                    detail_lines.push(Line::from(Span::styled(
-                                        format!("  │      Preview: {}…", &t.response_preview),
-                                        Style::default().fg(tc.muted),
-                                    )));
-                                }
-                            }
-                            if !result.test_results.is_empty() {
+                            if let Some(e) = &t.error {
                                 detail_lines.push(Line::from(Span::styled(
-                                    "  └────────────────────────────────────────────────",
-                                    Style::default().fg(tc.border),
+                                    format!("  │      Error: {}", e),
+                                    Style::default().fg(tc.error),
+                                )));
+                            } else if !t.response_preview.is_empty() {
+                                detail_lines.push(Line::from(Span::styled(
+                                    format!("  │      Preview: {}…", &t.response_preview),
+                                    Style::default().fg(tc.muted),
                                 )));
                             }
                         }
-                    } else {
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  {} — pending or no results yet.", ms.name),
-                            Style::default().fg(tc.muted),
-                        )));
+                        if !result.test_results.is_empty() {
+                            detail_lines.push(Line::from(Span::styled(
+                                "  └────────────────────────────────────────────────",
+                                Style::default().fg(tc.border),
+                            )));
+                        }
                     }
-
-                    let scroll = app.live_bench_scroll as u16;
-                    let paragraph = Paragraph::new(detail_lines)
-                        .scroll((scroll, 0))
-                        .wrap(Wrap { trim: false });
-                    frame.render_widget(paragraph, det_area);
+                } else {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {} — pending or no results yet.", ms.name),
+                        Style::default().fg(tc.muted),
+                    )));
                 }
+
+                let scroll = app.live_bench_scroll as u16;
+                let paragraph = Paragraph::new(detail_lines)
+                    .scroll((scroll, 0))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, det_area);
             }
         }
 
@@ -5310,6 +6172,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_viewport_matches_full_table_navigation_and_resize() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut full_state = TableState::default();
+        let mut offset = 0;
+        // Down/up, page jumps, last/first row, resize, and a shrinking filter.
+        for (len, selected, height) in [
+            (100, 0, 10),
+            (100, 1, 10),
+            (100, 7, 10),
+            (100, 8, 10),
+            (100, 50, 10),
+            (100, 49, 10),
+            (100, 99, 10),
+            (100, 99, 20),
+            (100, 99, 5),
+            (100, 0, 5),
+            (3, 2, 10),
+            (1, 0, 10),
+            (0, 0, 10),
+            (100, 50, 10),
+        ] {
+            let mut full = Terminal::new(TestBackend::new(30, height)).expect("full table");
+            let mut window = Terminal::new(TestBackend::new(30, height)).expect("window table");
+            let range = model_table_viewport(len, selected, offset, usize::from(height - 3), true);
+            let make_table = |range: std::ops::Range<usize>| {
+                Table::new(
+                    range.map(|i| Row::new([format!("Model {i}")])),
+                    [Constraint::Min(10)],
+                )
+                .header(Row::new(["Models"]))
+                .block(Block::default().borders(Borders::ALL))
+                .highlight_symbol("▶ ")
+                .row_highlight_style(Style::default().bg(Color::Blue))
+            };
+            full_state.select((len > 0).then_some(selected));
+            let mut local_state = TableState::default();
+            local_state.select((len > 0).then(|| selected - range.start));
+            full.draw(|f| f.render_stateful_widget(make_table(0..len), f.area(), &mut full_state))
+                .expect("full frame");
+            window
+                .draw(|f| {
+                    f.render_stateful_widget(make_table(range.clone()), f.area(), &mut local_state)
+                })
+                .expect("window frame");
+            assert_eq!(
+                full.backend().buffer(),
+                window.backend().buffer(),
+                "len={len}, selected={selected}, height={height}"
+            );
+            offset = range.start;
+            assert_eq!(offset, full_state.offset());
+        }
+    }
+
+    /// The multi-compare view highlighted a refused (Too Tight) model's
+    /// higher score as the best; only runnable models can win.
+    #[test]
+    fn multi_compare_best_score_ignores_too_tight_models() {
+        let node = llmfit_core::cluster::ClusterNode {
+            hostname: "n".to_string(),
+            ip: "10.0.0.1".to_string(),
+            gpu_name: "NVIDIA A100-SXM4-80GB".to_string(),
+            gpu_vram_gb: 80.0,
+            total_ram_gb: 256.0,
+            cpu_cores: 32,
+            gpu_count: 1,
+            unified_memory: false,
+            is_head: true,
+            backend: Some(llmfit_core::hardware::GpuBackend::Cuda),
+        };
+        let specs = llmfit_core::cluster::ClusterConfig::from_nodes("10.0.0.1", vec![node])
+            .to_system_specs();
+        let db = llmfit_core::models::ModelDatabase::new();
+        let base = ModelFit::analyze(&db.get_all_models()[0], &specs);
+        let mut refused = base.clone();
+        refused.fit_level = FitLevel::TooTight;
+        refused.score = 90.0;
+        let mut good = base.clone();
+        good.fit_level = FitLevel::Good;
+        good.score = 70.0;
+        assert_eq!(best_runnable_score(&[&refused, &good]), Some(70.0));
+        assert_eq!(best_runnable_score(&[&refused]), None);
+    }
+
+    #[test]
+    fn model_viewport_handles_no_room_for_rows() {
+        assert_eq!(model_table_viewport(0, 0, 0, 0, true), 0..0);
+        assert_eq!(model_table_viewport(100, 50, 40, 0, true), 40..40);
+        assert_eq!(model_table_viewport(3, 99, 99, 1, true), 2..3);
+    }
+
+    #[test]
     fn truncate_str_handles_multibyte_utf8() {
         // ASCII — no truncation needed
         assert_eq!(truncate_str("hello", 10), "hello");
@@ -5321,6 +6276,79 @@ mod tests {
         assert_eq!(truncate_str("🚀 hello", 4), "🚀 h~");
         // Exact max length — no truncation
         assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn gguf_source_attributed_marks_every_selected_publisher() {
+        let providers = ["Alibaba", "unsloth", "bartowski"]
+            .map(String::from)
+            .to_vec();
+        // unsloth + bartowski selected, the model's own provider is not: both
+        // publishers are why the row is in the list, so both get marked.
+        let selected = vec![false, true, true];
+        assert!(gguf_source_attributed(
+            Some("unsloth"),
+            "unsloth",
+            &providers,
+            &selected
+        ));
+        assert!(gguf_source_attributed(
+            Some("unsloth"),
+            "bartowski",
+            &providers,
+            &selected
+        ));
+        // A source nobody selected stays unmarked.
+        assert!(!gguf_source_attributed(
+            Some("unsloth"),
+            "mradermacher",
+            &providers,
+            &selected
+        ));
+        // Own provider selected: the row is there on its own merit, mark nothing.
+        assert!(!gguf_source_attributed(
+            None,
+            "unsloth",
+            &providers,
+            &vec![true, true, true]
+        ));
+    }
+
+    #[test]
+    fn provider_cell_leaves_unmatched_rows_untouched() {
+        assert_eq!(
+            provider_cell("Alibaba", None, PROVIDER_COL_WIDTH),
+            "Alibaba"
+        );
+        // Long names keep rendering exactly as they did before the marker
+        // existed — the terminal clips them at the column edge.
+        assert_eq!(
+            provider_cell("optimum-intel-internal-testing", None, PROVIDER_COL_WIDTH),
+            "optimum-intel-internal-testing"
+        );
+    }
+
+    #[test]
+    fn provider_cell_marks_a_gguf_match() {
+        assert_eq!(
+            provider_cell("Alibaba", Some("unsloth"), PROVIDER_COL_WIDTH),
+            "Alibaba*"
+        );
+    }
+
+    #[test]
+    fn provider_cell_keeps_the_marker_inside_the_column() {
+        // `NousResearch` is exactly the column width, so appending the marker
+        // to the raw name would push it past the edge and lose it.
+        for name in [
+            "NousResearch",
+            "mlx-community",
+            "optimum-intel-internal-testing",
+        ] {
+            let cell = provider_cell(name, Some("unsloth"), PROVIDER_COL_WIDTH);
+            assert_eq!(cell.chars().count(), PROVIDER_COL_WIDTH, "{}", name);
+            assert!(cell.ends_with('*'), "{}", cell);
+        }
     }
 
     #[test]
@@ -5381,5 +6409,88 @@ mod tests {
             visible_dm_dir_input(input, input.len(), (DM_MODELS_DIR_LABEL.len() + 8) as u16),
             ("二三四".to_string(), 6)
         );
+    }
+
+    /// Width of the detail pane's label gutter, e.g. `"  Baseline Est:"`.
+    const DETAIL_LABEL_WIDTH: usize = 15;
+
+    /// The left detail pane is 55% of the terminal minus 2 border columns. On
+    /// an 80-column terminal that is 42, leaving 27 columns for a value.
+    const NARROW_DETAIL_VALUE_WIDTH: usize = (80 * 55 / 100) - 2 - DETAIL_LABEL_WIDTH;
+
+    #[test]
+    fn prefill_detail_rows_report_both_figures_when_estimated() {
+        let rows = prefill_detail_rows(Some(512.0), Some(16.0));
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected a prefill row and a TTFT row: {rows:?}"
+        );
+        assert!(rows[0].0.contains("Prefill"), "row 0 mislabelled: {rows:?}");
+        assert!(
+            rows[0].1.contains("512"),
+            "prefill throughput missing: {rows:?}"
+        );
+        assert!(rows[1].0.contains("TTFT"), "row 1 mislabelled: {rows:?}");
+        assert!(rows[1].1.contains("16"), "TTFT value missing: {rows:?}");
+    }
+
+    #[test]
+    fn prefill_detail_rows_say_not_estimated_when_either_figure_is_missing() {
+        // Mirrors display.rs: prefill and TTFT are computed together from
+        // gpu_compute_tflops_fp16, so a half-populated pair is still "unknown",
+        // never a zero that would read as "immeasurably slow" (issue #969).
+        for (prefill, ttft) in [(None, None), (Some(512.0), None), (None, Some(16.0))] {
+            let rows = prefill_detail_rows(prefill, ttft);
+            assert_eq!(rows.len(), 1, "unknown prefill needs one row: {rows:?}");
+            assert_eq!(rows[0].1, "not estimated");
+        }
+    }
+
+    #[test]
+    fn prefill_detail_rows_fit_a_narrow_detail_pane() {
+        // The full CLI sentence is 78 columns and would wrap here, which is
+        // half of what issue #974 is about. Check implausibly large values, so
+        // the budget holds for anything real hardware can produce.
+        for (prefill, ttft) in [
+            (Some(99_999.0), Some(99_999.0)),
+            (Some(512.0), Some(16.0)),
+            (None, None),
+        ] {
+            for (label, value) in prefill_detail_rows(prefill, ttft) {
+                assert_eq!(
+                    label.chars().count(),
+                    DETAIL_LABEL_WIDTH,
+                    "{label:?} must fill the label gutter so the pane stays aligned"
+                );
+                assert!(
+                    value.chars().count() <= NARROW_DETAIL_VALUE_WIDTH,
+                    "{value:?} is {} columns, over the {NARROW_DETAIL_VALUE_WIDTH} \
+                     available in an 80-column terminal",
+                    value.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confidence_labels_fit_a_narrow_detail_pane() {
+        // The detail pane carries the full label (the table carries the short
+        // code), so the widest label must still fit the narrow pane.
+        for variant in [
+            llmfit_core::EstimateConfidence::MeasuredLocal,
+            llmfit_core::EstimateConfidence::MeasuredCommunity,
+            llmfit_core::EstimateConfidence::Calibrated,
+            llmfit_core::EstimateConfidence::Estimated,
+            llmfit_core::EstimateConfidence::Unsupported,
+        ] {
+            let label = variant.label();
+            assert!(
+                label.chars().count() <= NARROW_DETAIL_VALUE_WIDTH,
+                "{label:?} is {} columns, over the {NARROW_DETAIL_VALUE_WIDTH} \
+                 available in an 80-column terminal",
+                label.chars().count()
+            );
+        }
     }
 }

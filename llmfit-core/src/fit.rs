@@ -1,5 +1,12 @@
-use crate::hardware::{GpuBackend, SystemSpecs};
+use crate::hardware::{GpuBackend, QuantKernelSupport, SystemSpecs};
 use crate::models::{self, KvQuant, LlmModel, UseCase};
+
+/// Score deducted when a pre-quantized model's format only runs on the GPU
+/// through a dequantizing fallback kernel rather than natively (e.g. NVFP4
+/// weights on a pre-Blackwell card). Sized so an otherwise-equal GGUF Q6/Q8
+/// build of the same model ranks above the fallback-path repack without
+/// hiding the repack entirely (issue #1084).
+pub const KERNEL_FALLBACK_SCORE_PENALTY: f64 = 8.0;
 
 /// Default context window cap used for memory estimation when no explicit
 /// `--max-context` is provided. Most runtimes (llama.cpp, Ollama) default to
@@ -28,6 +35,25 @@ pub struct CalcConfig {
     /// Scoring weights per use case: (quality, speed, fit, context).
     #[serde(default)]
     pub scoring_weights: ScoringWeights,
+    /// System RAM (DDR) bandwidth in GB/s, used for MoE-offload expert
+    /// streaming and for dense CPU-offload weights that spill out of VRAM.
+    /// None = auto: LLMFIT_DDR_BANDWIDTH env var if set, otherwise measured
+    /// once per process, otherwise a conservative 50 GB/s.
+    #[serde(default)]
+    pub ddr_bandwidth_gbps: Option<f64>,
+    /// GPU memory bandwidth in GB/s, overriding the GPU-name lookup table.
+    /// Set this for a GPU the table doesn't recognize, or to reproduce an
+    /// estimate on hardware you don't have. None = use the name table.
+    /// See [`resolve_gpu_bandwidth`].
+    #[serde(default)]
+    pub gpu_bandwidth_gbps_override: Option<f64>,
+    /// GPU dense fp16 matmul throughput in TFLOP/s, used for the
+    /// prompt-processing (prefill/TTFT) estimate. None = unknown, in which
+    /// case prefill and TTFT are reported as `null` rather than guessed:
+    /// prefill is compute-bound, so there is no bandwidth roofline to fall
+    /// back on.
+    #[serde(default)]
+    pub gpu_compute_tflops_fp16: Option<f64>,
 }
 
 impl Default for CalcConfig {
@@ -37,6 +63,9 @@ impl Default for CalcConfig {
             efficiency: default_efficiency(),
             run_mode_factors: RunModeFactors::default(),
             scoring_weights: ScoringWeights::default(),
+            ddr_bandwidth_gbps: None,
+            gpu_bandwidth_gbps_override: None,
+            gpu_compute_tflops_fp16: None,
         }
     }
 }
@@ -111,6 +140,8 @@ pub enum InferenceRuntime {
     LlamaCpp, // llama.cpp / Ollama
     Mlx,      // Apple MLX framework
     Vllm,     // vLLM (for AWQ/GPTQ/AutoRound pre-quantized models)
+    BitNet,   // bitnet.cpp (native ternary / i2_s CPU inference)
+    Unsupported,
 }
 
 impl InferenceRuntime {
@@ -119,6 +150,8 @@ impl InferenceRuntime {
             InferenceRuntime::LlamaCpp => "llama.cpp",
             InferenceRuntime::Mlx => "MLX",
             InferenceRuntime::Vllm => "vLLM",
+            InferenceRuntime::BitNet => "bitnet.cpp",
+            InferenceRuntime::Unsupported => "unsupported",
         }
     }
 }
@@ -164,6 +197,110 @@ impl SortColumn {
     }
 }
 
+/// Why vLLM refuses a tensor-parallel split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TpSplitError {
+    /// `num_attention_heads % tp != 0`.
+    AttentionHeadsNotDivisible,
+    /// The KV heads neither split evenly across ranks nor replicate evenly.
+    KvHeadsNotDivisible,
+}
+
+/// The layout a refused model would need instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredLayout {
+    /// Layers split across GPUs/nodes; not modelled by llmfit yet.
+    PipelineParallel,
+}
+
+/// A machine-readable reason a cluster layout was refused even though the
+/// memory would fit: the only split big enough is one vLLM will not start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LayoutRefusal {
+    /// Which head-count rule the refused split breaks.
+    pub reason: TpSplitError,
+    /// The refused tensor-parallel size (the cluster's GPU count).
+    pub tp_size: u32,
+    /// What the model needs instead.
+    pub requires: RequiredLayout,
+    /// The same explanation as the note, for display.
+    pub message: String,
+}
+
+/// Whether vLLM will accept a tensor-parallel size for a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TpLayout {
+    /// The split is valid (or there is no split: TP of 0 or 1).
+    Valid,
+    /// vLLM refuses this split; the message names the failing head count.
+    Invalid(TpSplitError, String),
+    /// The model has no attention-head metadata, so the split cannot be
+    /// checked.
+    Unverified,
+}
+
+/// Checks the split against [`models::tp_heads_valid`] using catalog head
+/// counts only. Unlike [`LlmModel::supports_tp`] it does not guess heads
+/// from the model name: a guessed count is reported as unverified rather
+/// than as a valid layout. A missing KV head count means multi-head
+/// attention (KV heads = attention heads), as elsewhere in llmfit.
+pub(crate) fn tensor_parallel_layout(model: &LlmModel, tp: u32) -> TpLayout {
+    if tp <= 1 {
+        return TpLayout::Valid;
+    }
+    let Some(attn) = model.num_attention_heads.filter(|&h| h > 0) else {
+        return TpLayout::Unverified;
+    };
+    if attn % tp != 0 {
+        return TpLayout::Invalid(
+            TpSplitError::AttentionHeadsNotDivisible,
+            format!("{} attention heads not divisible by {}", attn, tp),
+        );
+    }
+    let kv = model.num_key_value_heads.filter(|&h| h > 0).unwrap_or(attn);
+    if !models::tp_heads_valid(attn, kv, tp) {
+        return TpLayout::Invalid(
+            TpSplitError::KvHeadsNotDivisible,
+            format!(
+                "{} KV heads neither divisible by nor a divisor of {}",
+                kv, tp
+            ),
+        );
+    }
+    TpLayout::Valid
+}
+
+/// Extra KV cache (GB) the cluster holds when a TP split replicates KV heads.
+///
+/// vLLM gives each rank `max(kv_heads / tp, 1)` KV heads. With at least as
+/// many KV heads as ranks that is one copy in total; with fewer, each head is
+/// copied onto `tp / kv_heads` ranks, so the cluster holds
+/// `kv_cache * tp / kv_heads`. Returns the amount above one copy (0 when no
+/// replication, for TP=1, or when KV head counts are unknown). MLA's latent
+/// cache is not head-split and is not modelled here.
+pub(crate) fn kv_replication_extra_gb(model: &LlmModel, tp: u32, ctx: u32) -> f64 {
+    model.kv_cache_gb(ctx, KvQuant::Fp16) * (kv_replication_copies(model, tp) - 1.0)
+}
+
+/// How many copies of the KV cache a TP split holds in total: `tp / kv_heads`
+/// when there are fewer KV heads than ranks, else 1 (also for unknown head
+/// counts and MLA models).
+pub(crate) fn kv_replication_copies(model: &LlmModel, tp: u32) -> f64 {
+    let Some(kv) = model
+        .num_key_value_heads
+        .or(model.num_attention_heads)
+        .filter(|&h| h > 0)
+    else {
+        return 1.0;
+    };
+    if tp <= kv || model.mla_kv_width().is_some() {
+        return 1.0;
+    }
+    tp as f64 / kv as f64
+}
+
 /// Memory fit -- does the model fit in the available memory pool?
 /// Perfect requires GPU acceleration. CPU paths cap at Good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -182,7 +319,7 @@ pub enum RunMode {
     MoeOffload,     // MoE: active experts in VRAM, inactive offloaded to RAM
     CpuOffload,     // Partial GPU offload, spills to system RAM -- mixed
     CpuOnly,        // Entirely in system RAM, no GPU -- slow
-    TensorParallel, // Distributed via NCCL across cluster nodes
+    TensorParallel, // Sharded via NCCL across every GPU in a cluster (one shard per GPU)
 }
 
 /// Multi-dimensional score components (0-100 each).
@@ -197,6 +334,131 @@ pub struct ScoreComponents {
     /// Context: context window capability vs reasonable target.
     pub context: f64,
 }
+
+/// The inputs behind `estimated_tps`, exposed so users can see exactly what
+/// the estimate assumes and reproduce it locally (issue #292).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EstimateBasis {
+    /// `"gpu_bandwidth_roofline"` — derived from the GPU's memory bandwidth;
+    /// `"gpu_ddr_offload_roofline"` — dense CPU offload, GPU-resident weights
+    /// at the GPU roofline and spilled weights at system RAM bandwidth;
+    /// `"backend_constant"` — GPU not in the bandwidth table, per-backend
+    /// heuristic constant used; `"cpu_constant"` — CPU-only path;
+    /// `"unsupported"` — no estimate produced.
+    pub method: String,
+    /// GPU memory bandwidth assumed (GB/s), when the roofline path was used.
+    pub gpu_bandwidth_gbps: Option<f64>,
+    /// System RAM bandwidth assumed (GB/s) when the estimate reads DDR:
+    /// MoE expert streaming, or dense weights spilled off the GPU.
+    /// Unset when the estimate does not consult DDR.
+    pub ddr_bandwidth_gbps: Option<f64>,
+    /// Efficiency factor applied to raw bandwidth (default 0.55).
+    pub efficiency: f64,
+    /// The estimate models single-request *generation* throughput at this
+    /// context length. Prompt processing (prefill/TTFT) is not estimated.
+    pub assumed_context: u32,
+    /// Correction factor derived from the user's own `llmfit bench` runs on
+    /// this machine (median measured/estimated across trustworthy anchors),
+    /// already applied to `estimated_tps`. `None` when no local runs matched.
+    #[serde(default)]
+    pub local_calibration: Option<f64>,
+}
+
+/// How much to trust the throughput figure attached to a fit.
+///
+/// A measured number and a formula guess are both a "tok/s", and until now
+/// nothing in the payload told them apart. Ordered most to least trustworthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateConfidence {
+    /// Benchmarked by this user on this machine (`llmfit bench`).
+    MeasuredLocal,
+    /// Benchmarked by someone else on hardware matching this machine.
+    MeasuredCommunity,
+    /// Formula estimate, scaled by a correction factor derived from benchmark
+    /// runs on this hardware.
+    Calibrated,
+    /// Formula estimate with no measurement behind it.
+    #[default]
+    Estimated,
+    /// No estimate produced — the model needs a runtime llmfit can't model.
+    Unsupported,
+}
+
+impl EstimateConfidence {
+    /// Stable machine code, matching the serde representation.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EstimateConfidence::MeasuredLocal => "measured_local",
+            EstimateConfidence::MeasuredCommunity => "measured_community",
+            EstimateConfidence::Calibrated => "calibrated",
+            EstimateConfidence::Estimated => "estimated",
+            EstimateConfidence::Unsupported => "unsupported",
+        }
+    }
+
+    /// Short human-readable label for UI surfaces.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EstimateConfidence::MeasuredLocal => "measured (this machine)",
+            EstimateConfidence::MeasuredCommunity => "measured (community)",
+            EstimateConfidence::Calibrated => "calibrated",
+            EstimateConfidence::Estimated => "estimated",
+            EstimateConfidence::Unsupported => "unsupported — no basis",
+        }
+    }
+
+    /// Compact code for width-constrained surfaces such as the CLI table
+    /// column, where [`EstimateConfidence::label`] would wrap the row on a
+    /// narrow terminal (issue #974).
+    ///
+    /// Display-only. [`EstimateConfidence::code`] remains the stable machine
+    /// identifier and [`EstimateConfidence::label`] the full human label; both
+    /// ship in the API/MCP JSON and neither may change. Detail views should
+    /// keep using `label()`.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            EstimateConfidence::MeasuredLocal => "local",
+            EstimateConfidence::MeasuredCommunity => "comm",
+            EstimateConfidence::Calibrated => "calib",
+            EstimateConfidence::Estimated => "est",
+            EstimateConfidence::Unsupported => "n/a",
+        }
+    }
+}
+
+/// Classify a fit's throughput figure by provenance, first match wins.
+///
+/// Measurement outranks calibration, and calibration outranks a bare formula.
+/// `Unsupported` is checked after calibration because a fit with no estimate
+/// never picks up a calibration factor in the first place
+/// (`apply_local_calibration` skips rows with `estimated_tps <= 0`), so the
+/// order only matters if that invariant is ever broken.
+pub fn derive_estimate_confidence(
+    measured: Option<&crate::benchmarks::MeasuredTps>,
+    basis: &EstimateBasis,
+) -> EstimateConfidence {
+    use crate::benchmarks::MeasuredSource;
+
+    if let Some(m) = measured {
+        return match m.source {
+            MeasuredSource::LocalBench => EstimateConfidence::MeasuredLocal,
+            MeasuredSource::Community | MeasuredSource::CommunityLlmfit => {
+                EstimateConfidence::MeasuredCommunity
+            }
+        };
+    }
+    if basis.local_calibration.is_some() {
+        return EstimateConfidence::Calibrated;
+    }
+    if basis.method == UNSUPPORTED_METHOD {
+        return EstimateConfidence::Unsupported;
+    }
+    EstimateConfidence::Estimated
+}
+
+/// `EstimateBasis::method` value marking a fit with no throughput estimate.
+pub const UNSUPPORTED_METHOD: &str = "unsupported";
 
 #[derive(Clone, serde::Serialize)]
 pub struct ModelFit {
@@ -217,6 +479,51 @@ pub struct ModelFit {
     pub installed: bool,               // model found in a local runtime provider
     pub fits_with_turboquant: bool,    // TooTight at fp16 KV but fits with TurboQuant KV
     pub effective_context_length: u32, // context length used for memory estimation
+    /// Context (tokens) that actually fits in this run mode's memory pool
+    /// after weights and overhead, capped at the model's native window.
+    /// A "Perfect" fit with an 8k usable context out of a 262k window is a
+    /// very different proposition for coding work (issue #621).
+    pub usable_context: u32,
+    /// What the tok/s estimate assumes — method, bandwidths, efficiency —
+    /// so the number can be reproduced and verified (issue #292).
+    pub estimate_basis: EstimateBasis,
+    /// Community-measured throughput on hardware matching this system
+    /// (localmaxxing.com data), when available. Ground truth, displayed
+    /// with priority over `estimated_tps`. Set after analysis, like
+    /// `installed`.
+    pub measured_tps: Option<crate::benchmarks::MeasuredTps>,
+    /// Cluster mode: the tensor-parallel size the fit uses (GPUs the model
+    /// is sharded across, one shard each). `None` outside cluster mode or
+    /// when no layout fits.
+    pub tp_size: Option<u32>,
+    /// Cluster mode: set when the model would fit in memory but the only
+    /// split large enough is one vLLM refuses. The fit is `TooTight`.
+    pub layout_refusal: Option<LayoutRefusal>,
+    /// Cluster mode: the split this fit is judged on is one vLLM refuses,
+    /// either because it would fit (`layout_refusal` is set) or because the
+    /// model is too big for the cluster and the full split is invalid too.
+    /// Such a fit has no speed: `estimated_tps` is 0 and no measurement is
+    /// attached. Not serialized; `estimated_tps` stays in the JSON as before.
+    #[serde(skip)]
+    pub tp_layout_invalid: bool,
+    /// How much to trust `estimated_tps` — measured, calibrated, or a bare
+    /// formula. Derived at construction from the estimate method, then
+    /// refreshed by [`ModelFit::refresh_estimate_confidence`] once
+    /// `measured_tps` and calibration have been filled in (both are set after
+    /// analysis, like `installed`).
+    #[serde(default)]
+    pub estimate_confidence: EstimateConfidence,
+    /// Estimated prompt-processing throughput (tok/s). Prefill is
+    /// compute-bound, not bandwidth-bound, so this is `None` unless
+    /// `CalcConfig::gpu_compute_tflops_fp16` is known — a null here means
+    /// "not estimated", which is different from a slow 0.0.
+    #[serde(default)]
+    pub prefill_tps: Option<f64>,
+    /// Estimated time to first token (ms) for a prompt of
+    /// `effective_context_length` tokens. `None` under the same conditions as
+    /// `prefill_tps`.
+    #[serde(default)]
+    pub ttft_ms: Option<f64>,
 }
 
 impl ModelFit {
@@ -292,43 +599,322 @@ impl ModelFit {
             ));
         }
 
-        // Determine inference runtime up front so path selection can use
-        // the correct quantization hierarchy.
-        // Honour the force_runtime override first if provided; otherwise
-        // pre-quantized models default to vLLM, falling back to auto-detect.
-        let runtime = if let Some(forced) = force_runtime {
-            forced
-        } else if system.cluster_mode {
-            InferenceRuntime::Vllm
-        } else if model.is_prequantized() {
-            InferenceRuntime::Vllm
-        } else if system.backend == GpuBackend::Metal && system.unified_memory {
-            InferenceRuntime::Mlx
+        if model.requires_specialized_runtime() {
+            notes.push(
+                "Requires a specialized TTS runtime; llama.cpp/MLX/vLLM fit is not supported yet"
+                    .to_string(),
+            );
+            return ModelFit {
+                model: model.clone(),
+                fit_level: FitLevel::TooTight,
+                run_mode: RunMode::CpuOnly,
+                memory_required_gb: default_mem_required,
+                memory_available_gb: 0.0,
+                utilization_pct: 0.0,
+                notes,
+                moe_offloaded_gb: None,
+                score: 0.0,
+                score_components: ScoreComponents {
+                    quality: 0.0,
+                    speed: 0.0,
+                    fit: 0.0,
+                    context: 0.0,
+                },
+                estimated_tps: 0.0,
+                best_quant: model.quantization.clone(),
+                use_case,
+                runtime: InferenceRuntime::Unsupported,
+                installed: false,
+                fits_with_turboquant: false,
+                effective_context_length: estimation_ctx,
+                usable_context: 0,
+                estimate_basis: EstimateBasis {
+                    method: UNSUPPORTED_METHOD.to_string(),
+                    ..EstimateBasis::default()
+                },
+                measured_tps: None,
+                tp_size: None,
+                layout_refusal: None,
+                tp_layout_invalid: false,
+                estimate_confidence: EstimateConfidence::Unsupported,
+                prefill_tps: None,
+                ttft_ms: None,
+            };
+        }
+
+        // Determine the inference runtime up front so path selection uses the
+        // correct quantization hierarchy and memory model.
+        //
+        // Hard invariant: bitnet.cpp loads *only* native-ternary (i2_s) weights,
+        // and a native-ternary model loads *only* under bitnet.cpp. So the BitNet
+        // runtime and `is_ternary_native()` must agree — a mismatched
+        // `force_runtime` is corrected here (with a note) rather than advertising
+        // memory/throughput/quant for a config that cannot load the model.
+        // Otherwise: pre-quantized -> vLLM, then auto-detect.
+        let runtime = if model.is_ternary_native() {
+            // Ternary weights run only under bitnet.cpp; a forced non-BitNet
+            // runtime cannot load them, so keep BitNet and explain.
+            if let Some(rt) = force_runtime
+                && rt != InferenceRuntime::BitNet
+            {
+                notes.push(format!(
+                    "Ignoring force_runtime={}: native-ternary models run only under bitnet.cpp",
+                    rt.label()
+                ));
+            }
+            InferenceRuntime::BitNet
         } else {
-            InferenceRuntime::LlamaCpp
+            // Non-ternary model: bitnet.cpp cannot load it, so a forced
+            // bitnet.cpp is dropped back to auto-detection.
+            let forced = match force_runtime {
+                Some(InferenceRuntime::BitNet) => {
+                    notes.push(
+                        "Ignoring force_runtime=bitnet.cpp: this model is not native-ternary"
+                            .to_string(),
+                    );
+                    None
+                }
+                // Cluster mode plans vLLM tensor parallelism across every
+                // GPU, so another runtime's memory and quant choices would
+                // describe a layout that runtime cannot run.
+                Some(rt) if system.cluster_mode && rt != InferenceRuntime::Vllm => {
+                    notes.push(format!(
+                        "Ignoring force_runtime={}: cluster mode plans vLLM tensor parallelism",
+                        rt.label()
+                    ));
+                    None
+                }
+                other => other,
+            };
+            if let Some(rt) = forced {
+                rt
+            } else if system.cluster_mode {
+                InferenceRuntime::Vllm
+            } else if model.is_prequantized() {
+                InferenceRuntime::Vllm
+            } else if system.backend == GpuBackend::Metal && system.unified_memory {
+                InferenceRuntime::Mlx
+            } else {
+                InferenceRuntime::LlamaCpp
+            }
         };
-        let choose_quant =
-            |budget: f64| best_quant_for_runtime_budget(model, runtime, budget, estimation_ctx);
+        let choose_quant = |pool: f64| {
+            best_quant_for_runtime_budget(model, runtime, quant_budget(pool), estimation_ctx)
+        };
+
+        // The quant and offloaded RAM the MoE offload path settled on, if it ran.
+        let mut moe_offload_choice: Option<(&str, f64)> = None;
+
+        // Set when a cluster's tensor-parallel size is one vLLM would refuse
+        // for this model, so it must not be reported as fitting.
+        let mut tp_layout_invalid = false;
+        // Cluster mode: the chosen TP size, and why a fitting model was
+        // refused, for machine-readable output.
+        let mut tp_size: Option<u32> = None;
+        let mut layout_refusal: Option<LayoutRefusal> = None;
+        // Cluster mode: total KV-cache copies the split holds (see
+        // `kv_replication_copies`); 1 everywhere else.
+        let mut kv_copies = 1.0_f64;
+        // Cluster mode: no split has room for the model, so the verdict is
+        // TooTight whatever the default-quant ratio says.
+        let mut cluster_no_fit = false;
 
         // Step 1: pick the best available execution path
         // Step 2: score memory fit purely on headroom in that path's memory pool
-        let (run_mode, mem_required, mem_available) = if system.cluster_mode {
-            // Cluster mode: vLLM with tensor parallelism across multiple nodes.
-            // Total VRAM is the sum across all nodes (NCCL handles distribution).
+        let (run_mode, mem_required, mem_available) = if runtime == InferenceRuntime::BitNet {
+            // Native ternary runs on the CPU via bitnet.cpp, never the GPU, so
+            // score fit against system RAM regardless of any discrete GPU present.
+            cpu_path(model, system, runtime, estimation_ctx, &mut notes)
+        } else if system.cluster_mode {
+            // Cluster mode: vLLM tensor parallelism, one shard per GPU. The
+            // pool is the smallest card's VRAM times the GPU count (see
+            // `ClusterConfig::to_system_specs`), so a TP size of `tp` has
+            // `per_gpu * tp` to work with.
+            //
+            // Pick the largest TP size vLLM accepts for this model whose
+            // shards fit. Splitting over every GPU is often impossible (64
+            // heads do not split 3 ways), but the model may still run on
+            // fewer GPUs, so one invalid size must not refuse it. TP=1 needs
+            // no head metadata, so a model without head counts that fits on
+            // one GPU is a verified fit rather than an unverified split.
+            let gpus = system.gpu_count;
             let pool = system.total_gpu_vram_gb.unwrap_or(0.0);
-            let tp_size = system.cluster_node_count;
-            if let Some((_, best_mem)) = choose_quant(pool) {
-                notes.push(format!(
-                    "Cluster: tensor-parallel across {} nodes via vLLM (TP={})",
-                    tp_size, tp_size
-                ));
-                (RunMode::TensorParallel, best_mem, pool)
+            let per_gpu = if gpus > 0 { pool / gpus as f64 } else { 0.0 };
+            let nodes = system.cluster_node_count;
+            let plural = |n: u32| if n == 1 { "" } else { "s" };
+            let full_layout = tensor_parallel_layout(model, gpus);
+            // The full split, for the fallbacks below when no smaller split
+            // fits: its memory includes any KV copies it would hold. A split
+            // vLLM refuses holds no copies: the pipeline-parallel layout it
+            // needs instead does not replicate KV (and an invalid split's
+            // copy count can be fractional, e.g. 3 KV heads at TP=4).
+            let (full_copies, full_extra) = if matches!(full_layout, TpLayout::Invalid(..)) {
+                (1.0, 0.0)
             } else {
-                notes.push(format!(
-                    "Cluster: {} nodes but model exceeds aggregate VRAM ({:.1} GB)",
-                    tp_size, pool
-                ));
-                (RunMode::TensorParallel, default_mem_required, pool)
+                (
+                    kv_replication_copies(model, gpus),
+                    kv_replication_extra_gb(model, gpus, estimation_ctx),
+                )
+            };
+            let choose_full = || {
+                best_quant_for_runtime_budget(
+                    model,
+                    runtime,
+                    quant_budget(pool) - full_extra,
+                    estimation_ctx,
+                )
+                .map(|(q, mem)| (q, mem + full_extra))
+            };
+            let chosen = (1..=gpus.max(1)).rev().find_map(|tp| {
+                if tensor_parallel_layout(model, tp) != TpLayout::Valid {
+                    return None;
+                }
+                let tp_pool = per_gpu * tp as f64;
+                // With fewer KV heads than ranks, vLLM replicates each KV
+                // head, so the cluster holds more KV than one copy.
+                let extra_kv = kv_replication_extra_gb(model, tp, estimation_ctx);
+                best_quant_for_runtime_budget(
+                    model,
+                    runtime,
+                    quant_budget(tp_pool) - extra_kv,
+                    estimation_ctx,
+                )
+                .map(|(_, mem)| (tp, mem + extra_kv, tp_pool, extra_kv))
+            });
+            match (chosen, full_layout) {
+                (Some((tp, best_mem, tp_pool, extra_kv)), layout) => {
+                    tp_size = Some(tp);
+                    kv_copies = kv_replication_copies(model, tp);
+                    let why_fewer = match layout {
+                        _ if tp == gpus => String::new(),
+                        TpLayout::Invalid(_, reason) => {
+                            format!("; TP={} invalid for this model ({})", gpus, reason)
+                        }
+                        TpLayout::Unverified => format!(
+                            "; TP={} unverified: attention-head counts unknown for this model",
+                            gpus
+                        ),
+                        TpLayout::Valid => String::new(),
+                    };
+                    let span = if tp == gpus {
+                        format!(
+                            "across {} GPU{} on {} node{}",
+                            gpus,
+                            plural(gpus),
+                            nodes,
+                            plural(nodes)
+                        )
+                    } else {
+                        format!("on {} of {} GPUs", tp, gpus)
+                    };
+                    if tp == 1 {
+                        // One GPU holds the whole model: no sharding, so it
+                        // is a plain GPU run, without the TP speed factor.
+                        notes.push(format!(
+                            "Cluster: runs on a single GPU via vLLM (no tensor parallelism), 1 of {} GPU{}{}",
+                            gpus,
+                            plural(gpus),
+                            why_fewer
+                        ));
+                        (RunMode::Gpu, best_mem, tp_pool)
+                    } else {
+                        notes.push(format!(
+                            "Cluster: tensor-parallel via vLLM (TP={}), one shard per GPU {}{}",
+                            tp, span, why_fewer
+                        ));
+                        if extra_kv > 0.0 {
+                            notes.push(format!(
+                                "KV cache replicated: {} KV heads across TP={} ranks adds {:.1} GB",
+                                model.num_key_value_heads.unwrap_or(0),
+                                tp,
+                                extra_kv
+                            ));
+                        }
+                        (RunMode::TensorParallel, best_mem, tp_pool)
+                    }
+                }
+                // No head counts and too big for one GPU: the full split is
+                // the only option, and it cannot be checked.
+                (None, TpLayout::Unverified) => {
+                    notes.push(format!(
+                        "TP={} layout unverified: attention-head counts unknown for this model, so vLLM may refuse this split",
+                        gpus
+                    ));
+                    if let Some((_, best_mem)) = choose_full() {
+                        notes.push(format!(
+                            "Cluster: tensor-parallel via vLLM (TP={}), one shard per GPU across {} GPU{} on {} node{}",
+                            gpus,
+                            gpus,
+                            plural(gpus),
+                            nodes,
+                            plural(nodes)
+                        ));
+                        tp_size = Some(gpus);
+                        kv_copies = full_copies;
+                        (RunMode::TensorParallel, best_mem, pool)
+                    } else {
+                        notes.push(format!(
+                            "Cluster: {} GPU{} on {} node{} but model exceeds aggregate VRAM ({:.1} GB)",
+                            gpus,
+                            plural(gpus),
+                            nodes,
+                            plural(nodes),
+                            pool
+                        ));
+                        cluster_no_fit = true;
+                        kv_copies = full_copies;
+                        (
+                            RunMode::TensorParallel,
+                            default_mem_required + full_extra,
+                            pool,
+                        )
+                    }
+                }
+                // Every valid split is too small, and the one that would
+                // be big enough is refused by vLLM.
+                (None, TpLayout::Invalid(code, reason)) if choose_full().is_some() => {
+                    tp_layout_invalid = true;
+                    let message = format!(
+                        "TP={} invalid for this model ({}) and no smaller valid split fits; pipeline-parallel layout needed (not yet modelled)",
+                        gpus, reason
+                    );
+                    notes.push(message.clone());
+                    layout_refusal = Some(LayoutRefusal {
+                        reason: code,
+                        tp_size: gpus,
+                        requires: RequiredLayout::PipelineParallel,
+                        message,
+                    });
+                    kv_copies = full_copies;
+                    (
+                        RunMode::TensorParallel,
+                        default_mem_required + full_extra,
+                        pool,
+                    )
+                }
+                // Too big even for the whole cluster. If the full split is
+                // also one vLLM refuses, keep it flagged so a KV-compression
+                // (TurboQuant) fit is not offered for it either.
+                (None, layout) => {
+                    if matches!(layout, TpLayout::Invalid(..)) {
+                        tp_layout_invalid = true;
+                    }
+                    cluster_no_fit = true;
+                    notes.push(format!(
+                        "Cluster: {} GPU{} on {} node{} but model exceeds aggregate VRAM ({:.1} GB)",
+                        gpus,
+                        plural(gpus),
+                        nodes,
+                        plural(nodes),
+                        pool
+                    ));
+                    kv_copies = full_copies;
+                    (
+                        RunMode::TensorParallel,
+                        default_mem_required + full_extra,
+                        pool,
+                    )
+                }
             }
         } else if system.has_gpu {
             if system.unified_memory {
@@ -344,9 +930,7 @@ impl ModelFit {
                             model.num_experts.unwrap_or(0)
                         ));
                     }
-                    if model.is_moe {
-                        (RunMode::Gpu, min_vram, pool)
-                    } else if let Some((_, best_mem)) = choose_quant(pool) {
+                    if let Some((_, best_mem)) = choose_quant(pool) {
                         (RunMode::Gpu, best_mem, pool)
                     } else {
                         (RunMode::Gpu, default_mem_required, pool)
@@ -357,28 +941,12 @@ impl ModelFit {
             } else if let Some(system_vram) = system.total_gpu_vram_gb {
                 // Use total VRAM across all same-model GPUs for fit scoring.
                 // Multi-GPU inference (tensor splitting) is supported by llama.cpp, vLLM, etc.
-                if model.is_moe && min_vram <= system_vram {
-                    // Fits in VRAM -- GPU path
-                    notes.push("GPU: model loaded into VRAM".to_string());
-                    if model.is_moe {
-                        notes.push(format!(
-                            "MoE: all {} experts loaded in VRAM (optimal)",
-                            model.num_experts.unwrap_or(0)
-                        ));
-                    }
-                    (RunMode::Gpu, min_vram, system_vram)
-                } else if model.is_moe {
-                    // MoE model doesn't fit at default quant — but check if the full
-                    // model fits at the best available quant before falling to offload.
+                if model.is_moe {
+                    // Load every expert at the best quant that fits, else offload experts.
                     // Many runtimes (llama.cpp, Ollama) load ALL experts into VRAM when
                     // the quantized model file fits, avoiding DDR bandwidth bottleneck.
-                    if let Some((best_q, best_mem)) =
-                        best_quant_for_runtime_budget(model, runtime, system_vram, estimation_ctx)
-                        && best_mem <= system_vram
-                    {
-                        notes.push(
-                            "GPU: all MoE experts loaded into VRAM (quantized fit)".to_string(),
-                        );
+                    if let Some((best_q, best_mem)) = choose_quant(system_vram) {
+                        notes.push("GPU: all MoE experts loaded into VRAM".to_string());
                         notes.push(format!(
                             "MoE: all {} experts in VRAM at {} ({:.1} GB)",
                             model.num_experts.unwrap_or(0),
@@ -388,7 +956,16 @@ impl ModelFit {
                         (RunMode::Gpu, best_mem, system_vram)
                     } else {
                         // Full model doesn't fit — try expert offloading
-                        moe_offload_path(model, system, system_vram, min_vram, runtime, &mut notes)
+                        let (mode, required, available, choice) = moe_offload_path(
+                            model,
+                            system,
+                            system_vram,
+                            min_vram,
+                            runtime,
+                            &mut notes,
+                        );
+                        moe_offload_choice = choice;
+                        (mode, required, available)
                     }
                 } else if let Some((_, best_mem)) = choose_quant(system_vram) {
                     notes.push("GPU: model loaded into VRAM".to_string());
@@ -416,13 +993,14 @@ impl ModelFit {
             cpu_path(model, system, runtime, estimation_ctx, &mut notes)
         };
 
-        // Score fit purely on memory headroom (Perfect requires GPU)
-        let fit_level = score_fit(
-            mem_required,
-            mem_available,
-            model.recommended_ram_gb,
-            run_mode,
-        );
+        // Score fit purely on memory headroom (Perfect requires GPU). A
+        // tensor-parallel split vLLM would refuse to start is not a fit,
+        // however much memory it leaves.
+        let fit_level = if tp_layout_invalid || cluster_no_fit {
+            FitLevel::TooTight
+        } else {
+            score_fit(mem_required, mem_available, run_mode)
+        };
 
         let utilization_pct = if mem_available > 0.0 {
             (mem_required / mem_available) * 100.0
@@ -431,7 +1009,17 @@ impl ModelFit {
         };
 
         // Supplementary notes
-        if run_mode == RunMode::CpuOnly {
+        if model.is_ternary_native() {
+            notes.push(
+                "Native ternary (1.58-bit) model: i2_s weights (~2-bit) run best on CPU via bitnet.cpp".to_string(),
+            );
+        }
+        if runtime == InferenceRuntime::LlamaCpp && model.is_mxfp4_native() {
+            notes.push(
+                "MXFP4-native weights: sized at the released MXFP4 precision, which GGUF builds of this model keep".to_string(),
+            );
+        }
+        if run_mode == RunMode::CpuOnly && !system.has_gpu {
             notes.push("No GPU -- inference will be slow".to_string());
         }
         if matches!(run_mode, RunMode::CpuOffload | RunMode::CpuOnly) && system.total_cpu_cores < 4
@@ -441,7 +1029,9 @@ impl ModelFit {
 
         // Compute MoE offloaded amount if applicable
         let moe_offloaded_gb = if run_mode == RunMode::MoeOffload {
-            model.moe_offloaded_ram_gb()
+            moe_offload_choice
+                .map(|(_, offloaded_gb)| offloaded_gb)
+                .or_else(|| model.moe_offloaded_ram_gb())
         } else {
             None
         };
@@ -450,13 +1040,18 @@ impl ModelFit {
         // Pre-quantized models (AWQ/GPTQ/AutoRound) have a fixed quantization — skip dynamic selection.
         let (best_quant, _best_quant_mem) = if model.is_prequantized() {
             (model.quantization.as_str(), mem_required)
+        } else if let Some((quant, _)) = moe_offload_choice {
+            // The full-model budget below would never fit an offloaded model.
+            (quant, mem_required)
+        } else if system.cluster_mode {
+            // Cluster mode sized the split at the model's own quantization
+            // (vLLM serves it as published) plus any replicated KV copies.
+            // Re-picking against the whole pool would show a different quant,
+            // and a speed and usable context for it, than the memory figure.
+            (model.quantization.as_str(), mem_required)
         } else {
-            let budget = mem_available;
-            let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
-                models::MLX_QUANT_HIERARCHY
-            } else {
-                models::QUANT_HIERARCHY
-            };
+            let budget = quant_budget(mem_available);
+            let hierarchy = quant_hierarchy_for(model, runtime);
             model
                 .best_quant_for_budget_with(budget, estimation_ctx, hierarchy)
                 .or_else(|| {
@@ -480,8 +1075,44 @@ impl ModelFit {
         };
 
         // Speed estimation
-        let estimated_tps =
-            estimate_tps(model, &best_quant_str, system, run_mode, runtime, &config);
+        // A layout vLLM refuses to start has no speed to estimate.
+        let estimated_tps = if tp_layout_invalid {
+            0.0
+        } else {
+            estimate_tps(model, &best_quant_str, system, run_mode, runtime, &config)
+        };
+
+        // Record the estimate's inputs so it can be reproduced (issue #292).
+        // Mirrors the path selection in estimate_tps: bandwidth roofline when
+        // the GPU is recognized, per-backend constant otherwise. Dense
+        // CpuOffload with a known GPU bandwidth is the GPU+DDR split
+        // (`gpu_ddr_offload_roofline`, issue #1085). MoE offload stays on the
+        // GPU roofline and still records DDR. Both read the bandwidth through
+        // resolve_gpu_bandwidth so the reported basis can't drift from the
+        // number the estimate actually used.
+        let estimate_basis = {
+            let gpu_bw = resolve_gpu_bandwidth(system, &config);
+            let dense_ddr_offload =
+                run_mode == RunMode::CpuOffload && !model.is_moe && gpu_bw.is_some();
+            let method = if run_mode == RunMode::CpuOnly {
+                "cpu_constant"
+            } else if dense_ddr_offload {
+                "gpu_ddr_offload_roofline"
+            } else if gpu_bw.is_some() {
+                "gpu_bandwidth_roofline"
+            } else {
+                "backend_constant"
+            };
+            let reads_ddr = run_mode == RunMode::MoeOffload || dense_ddr_offload;
+            EstimateBasis {
+                method: method.to_string(),
+                gpu_bandwidth_gbps: (run_mode != RunMode::CpuOnly).then_some(gpu_bw).flatten(),
+                ddr_bandwidth_gbps: reads_ddr.then(|| ddr_bandwidth_gbps(&config)),
+                efficiency: config.efficiency,
+                assumed_context: estimation_ctx,
+                local_calibration: None,
+            }
+        };
 
         // Add runtime comparison note on Apple Silicon
         if runtime == InferenceRuntime::Mlx {
@@ -513,7 +1144,28 @@ impl ModelFit {
             mem_required,
             mem_available,
         );
-        let score = weighted_score(score_components, use_case, &config);
+        let mut score = weighted_score(score_components, use_case, &config);
+
+        // A fixed-format repack that fits in VRAM can still lack the tensor
+        // cores its format was built for. Keep it in the list (vLLM loads it
+        // through a weight-only fallback) but say so and rank it below a
+        // natively supported build of the same weights (issue #1084).
+        if runtime == InferenceRuntime::Vllm
+            && kernel_support(model, system) == QuantKernelSupport::Fallback
+        {
+            score = (score - KERNEL_FALLBACK_SCORE_PENALTY).max(0.0);
+            let format = crate::hardware::effective_kernel_format(&model.quantization, &model.name);
+            let gpu_name = system.gpu_name.as_deref().unwrap_or("this GPU");
+            let gpu_arch = crate::hardware::gpu_compute_capability(gpu_name)
+                .map(crate::hardware::compute_capability_label)
+                .unwrap_or("an older generation");
+            let native_arch = crate::hardware::quant_native_min_compute_capability(format)
+                .map(crate::hardware::compute_capability_label)
+                .unwrap_or("a newer generation");
+            notes.push(format!(
+                "{format} kernels need {native_arch}; {gpu_name} ({gpu_arch}) runs these weights through vLLM's slower weight-only fallback. A GGUF Q6/Q8 build of the same model will use this GPU natively"
+            ));
+        }
 
         if estimated_tps > 0.0 {
             notes.push(format!(
@@ -522,17 +1174,58 @@ impl ModelFit {
             ));
         }
 
+        // Usable context: how many tokens of KV cache the pool can actually
+        // hold once weights and runtime overhead are resident, within the
+        // budget the verdict accepts (see `quant_budget`). The KV formula
+        // is linear in ctx, so derive a per-token cost from a fixed reference
+        // window. Suggested by @MrMarble in issue #621.
+        let usable_context = {
+            const REF_CTX: u32 = 4096;
+            // Under MoE offload the pool is VRAM and holds only the active
+            // experts; the inactive ones are in system RAM.
+            let fixed_mem = match run_mode {
+                RunMode::MoeOffload => model
+                    .moe_active_vram_gb_at(&best_quant_str)
+                    .unwrap_or_else(|| model.estimate_memory_gb(&best_quant_str, 0)),
+                _ => model.estimate_memory_gb(&best_quant_str, 0),
+            };
+            let leftover = (quant_budget(mem_available) - fixed_mem).max(0.0);
+            // Use the cache slope rather than amortising any future fixed-size
+            // recurrent-state component across the reference window.
+            let kv_at_zero = model.kv_cache_gb(0, KvQuant::Fp16);
+            // A cluster split that replicates KV heads stores every token
+            // `kv_copies` times.
+            let per_token_gb = (model.kv_cache_gb(REF_CTX, KvQuant::Fp16) - kv_at_zero).max(0.0)
+                / f64::from(REF_CTX)
+                * kv_copies;
+            if per_token_gb > 0.0 {
+                ((leftover / per_token_gb) as u32).min(model.context_length)
+            } else {
+                model.context_length
+            }
+        };
+
         // Check if a TooTight model would fit with TurboQuant KV compression.
         // Only compute on CUDA systems — TurboQuant requires vLLM + CUDA.
-        let fits_with_turboquant =
-            fit_level == FitLevel::TooTight && system.backend == GpuBackend::Cuda && {
+        let fits_with_turboquant = fit_level == FitLevel::TooTight
+            && !tp_layout_invalid
+            && system.backend == GpuBackend::Cuda
+            && {
                 let tq_mem = model.estimate_memory_gb_with_kv(
                     best_quant,
                     estimation_ctx,
                     KvQuant::TurboQuant,
-                );
+                ) + model.kv_cache_gb(estimation_ctx, KvQuant::TurboQuant)
+                    * (kv_copies - 1.0);
                 tq_mem <= mem_available
             };
+
+        let (prefill_tps, ttft_ms) = estimate_prefill(model, run_mode, estimation_ctx, &config);
+
+        // No measurement or calibration is available this early — both are
+        // attached after analysis, so callers must call
+        // `refresh_estimate_confidence` once they are.
+        let estimate_confidence = derive_estimate_confidence(None, &estimate_basis);
 
         ModelFit {
             model: model.clone(),
@@ -546,13 +1239,88 @@ impl ModelFit {
             score,
             score_components,
             estimated_tps,
-            best_quant: best_quant_str,
+            // A native NVFP4/MXFP4 repo the catalog files as gguf carries a
+            // placeholder quant label (`Q4_K_M`). Sizing, speed and score above
+            // keep using that label exactly as for any pre-quantized repo; only
+            // the reported format names what vLLM actually runs.
+            best_quant: if model.is_native_fp4_safetensors() {
+                crate::hardware::effective_kernel_format(&model.quantization, &model.name)
+                    .to_string()
+            } else {
+                best_quant_str
+            },
             use_case,
             runtime,
             installed: false, // set later by App after provider detection
             fits_with_turboquant,
             effective_context_length: estimation_ctx,
+            usable_context,
+            estimate_basis,
+            measured_tps: None, // set later, like `installed`
+            tp_size,
+            layout_refusal,
+            tp_layout_invalid,
+            estimate_confidence,
+            prefill_tps,
+            ttft_ms,
         }
+    }
+
+    /// Recompute [`ModelFit::estimate_confidence`] from the fit's current
+    /// `measured_tps` and `estimate_basis.local_calibration`.
+    ///
+    /// Both of those are attached after `analyze`, so the value set at
+    /// construction only reflects the formula. Call this after populating
+    /// measured throughput or applying calibration.
+    pub fn refresh_estimate_confidence(&mut self) {
+        self.estimate_confidence = self.effective_estimate_confidence();
+    }
+
+    /// Whether this fit has a speed to show. A cluster layout vLLM refuses
+    /// does not: displays show `-` rather than its `estimated_tps` of 0.
+    pub fn reports_speed(&self) -> bool {
+        !self.tp_layout_invalid && self.layout_refusal.is_none()
+    }
+
+    /// Attach a measured throughput, unless this is a cluster layout vLLM
+    /// refuses: a refused layout has no speed to report, measured or not.
+    pub fn set_measured_tps(&mut self, measured: Option<crate::benchmarks::MeasuredTps>) {
+        self.measured_tps = if !self.reports_speed() {
+            None
+        } else {
+            measured
+        };
+    }
+
+    /// The confidence implied by the fit's *current* `measured_tps` and
+    /// `estimate_basis`, ignoring the stored field.
+    ///
+    /// [`ModelFit::estimate_confidence`] is only accurate if every writer of
+    /// those two fields remembered to call
+    /// [`ModelFit::refresh_estimate_confidence`]. Display and serialization
+    /// paths ask for the label here instead, so a caller that forgot can't
+    /// make the API report "estimated" next to a measured tok/s figure
+    /// (issue #969).
+    pub fn effective_estimate_confidence(&self) -> EstimateConfidence {
+        derive_estimate_confidence(self.measured_tps.as_ref(), &self.estimate_basis)
+    }
+
+    /// Context column text: `"262k→14k"` when the memory pool constrains
+    /// context below the model's native window, plain `"262k"` otherwise.
+    /// See [`fmt_ctx_tokens`] for the token formatting.
+    pub fn context_display(&self) -> String {
+        let native = fmt_ctx_tokens(self.model.context_length);
+        if self.usable_context < self.model.context_length {
+            format!("{native}\u{2192}{}", fmt_ctx_tokens(self.usable_context))
+        } else {
+            native
+        }
+    }
+
+    /// True when the usable context is too small for real work (below 4k),
+    /// so UIs can highlight the constraint.
+    pub fn context_severely_limited(&self) -> bool {
+        self.usable_context < 4096 && self.usable_context < self.model.context_length
     }
 
     pub fn fit_emoji(&self) -> &str {
@@ -588,52 +1356,71 @@ impl ModelFit {
     }
 }
 
-/// Pure memory headroom scoring.
-/// - GPU (including Apple Silicon unified memory): can reach Perfect.
-/// - CpuOffload: caps at Good.
-/// - CpuOnly: caps at Marginal -- CPU-only inference is always a compromise.
-fn score_fit(
-    mem_required: f64,
-    mem_available: f64,
-    recommended: f64,
-    run_mode: RunMode,
-) -> FitLevel {
-    if mem_required > mem_available {
-        return FitLevel::TooTight;
-    }
+// Memory-ratio ceilings for each verdict, as `mem_required / mem_available`.
+//
+// The verdict is a pure function of this one ratio. `recommended_ram_gb`
+// deliberately plays no part: it is a catalog-wide `model_size * 2.0` heuristic
+// (see AGENTS.md), and gating Perfect on it skewed the answer both ways. It
+// over-promised on tight fits — a 23 GB model on a 24 GB card met its 22 GB
+// recommendation and scored Perfect at 96% utilization, where it does not load
+// — and under-rated roomy ones, scoring a 9 GB model Good at 56% of a 16 GB
+// card but Perfect on a 24 GB card, so the verdict tracked the card's size
+// rather than how tightly the model fits it.
+//
+// The Marginal ceiling stops at 0.98 rather than 1.00 because a pool filled to
+// the last percent has no room for allocator slack or fragmentation, so it does
+// not load in practice.
+pub(crate) const FIT_PERFECT_MAX_RATIO: f64 = 0.60;
+pub(crate) const FIT_GOOD_MAX_RATIO: f64 = 0.85;
+const FIT_MARGINAL_MAX_RATIO: f64 = 0.98;
 
-    match run_mode {
-        RunMode::Gpu | RunMode::TensorParallel => {
-            if recommended <= mem_available {
-                FitLevel::Perfect
-            } else if mem_available >= mem_required * 1.2 {
-                FitLevel::Good
-            } else {
-                FitLevel::Marginal
-            }
-        }
-        RunMode::MoeOffload => {
-            // MoE expert offloading -- GPU handles inference, inactive experts in RAM
-            // Good performance with some latency on expert switching
-            if mem_available >= mem_required * 1.2 {
-                FitLevel::Good
-            } else {
-                FitLevel::Marginal
-            }
-        }
-        RunMode::CpuOffload => {
-            // Mixed GPU/CPU -- decent but not ideal
-            if mem_available >= mem_required * 1.2 {
-                FitLevel::Good
-            } else {
-                FitLevel::Marginal
-            }
-        }
-        RunMode::CpuOnly => {
-            // CPU-only is always a compromise -- cap at Marginal
-            FitLevel::Marginal
-        }
+/// The memory a quant may use in a pool of `pool` GB: the most the verdict
+/// still accepts, so the best quant is never one rated Too Tight when a
+/// smaller one would fit.
+fn quant_budget(pool: f64) -> f64 {
+    pool * FIT_MARGINAL_MAX_RATIO
+}
+
+/// The verdict from memory pressure alone, before any run-mode cap.
+///
+/// A non-finite ratio (an empty or unknown pool) is TooTight: we can't claim a
+/// model fits a pool we couldn't size.
+fn pure_ratio_verdict(memory_ratio: f64) -> FitLevel {
+    if !memory_ratio.is_finite() || memory_ratio > FIT_MARGINAL_MAX_RATIO {
+        FitLevel::TooTight
+    } else if memory_ratio <= FIT_PERFECT_MAX_RATIO {
+        FitLevel::Perfect
+    } else if memory_ratio <= FIT_GOOD_MAX_RATIO {
+        FitLevel::Good
+    } else {
+        FitLevel::Marginal
     }
+}
+
+/// Cap a verdict at what the execution path can actually deliver.
+///
+/// Perfect means "fits with room to spare *and* runs on the GPU", so only the
+/// two fully-GPU-resident paths can reach it. The offload and CPU paths cap at
+/// Good however much headroom they have — they are still genuinely runnable,
+/// which is why they are not pushed down to Marginal.
+fn cap_for_run_mode(level: FitLevel, run_mode: RunMode) -> FitLevel {
+    match run_mode {
+        RunMode::Gpu | RunMode::TensorParallel => level,
+        RunMode::MoeOffload | RunMode::CpuOffload | RunMode::CpuOnly => match level {
+            FitLevel::Perfect => FitLevel::Good,
+            other => other,
+        },
+    }
+}
+
+/// Pure memory headroom scoring: ratio verdict, capped by execution path.
+pub(crate) fn score_fit(mem_required: f64, mem_available: f64, run_mode: RunMode) -> FitLevel {
+    let memory_ratio = if mem_available > 0.0 {
+        mem_required / mem_available
+    } else {
+        f64::INFINITY
+    };
+    cap_for_run_mode(pure_ratio_verdict(memory_ratio), run_mode)
 }
 
 /// Determine memory pool for CPU-only inference.
@@ -650,9 +1437,12 @@ fn cpu_path(
         return (RunMode::CpuOnly, model.min_ram_gb, system.available_ram_gb);
     }
 
-    if let Some((_, best_mem)) =
-        best_quant_for_runtime_budget(model, runtime, system.available_ram_gb, estimation_ctx)
-    {
+    if let Some((_, best_mem)) = best_quant_for_runtime_budget(
+        model,
+        runtime,
+        quant_budget(system.available_ram_gb),
+        estimation_ctx,
+    ) {
         (RunMode::CpuOnly, best_mem, system.available_ram_gb)
     } else {
         (
@@ -665,18 +1455,20 @@ fn cpu_path(
 
 /// Try MoE expert offloading: active experts in VRAM, inactive in RAM.
 /// Falls back to CPU paths if offloading isn't viable.
-fn moe_offload_path(
-    model: &LlmModel,
+fn moe_offload_path<'m>(
+    model: &'m LlmModel,
     system: &SystemSpecs,
     system_vram: f64,
     total_vram: f64,
     runtime: InferenceRuntime,
     notes: &mut Vec<String>,
-) -> (RunMode, f64, f64) {
-    let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
-        models::MLX_QUANT_HIERARCHY
+) -> (RunMode, f64, f64, Option<(&'m str, f64)>) {
+    // vLLM keeps the model's own quantization, as in `best_quant_for_runtime_budget`.
+    let own_quant = [model.quantization.as_str()];
+    let hierarchy: &[&'m str] = if runtime == InferenceRuntime::Vllm {
+        &own_quant
     } else {
-        models::QUANT_HIERARCHY
+        quant_hierarchy_for(model, runtime)
     };
 
     for &quant in hierarchy {
@@ -695,7 +1487,12 @@ fn moe_offload_path(
                 "Inactive experts offloaded to system RAM ({:.1} GB)",
                 offloaded_gb,
             ));
-            return (RunMode::MoeOffload, moe_vram, system_vram);
+            return (
+                RunMode::MoeOffload,
+                moe_vram,
+                system_vram,
+                Some((quant, offloaded_gb)),
+            );
         }
     }
 
@@ -717,7 +1514,12 @@ fn moe_offload_path(
                     "Inactive experts offloaded to system RAM ({:.1} GB)",
                     offloaded_gb,
                 ));
-                return (RunMode::MoeOffload, moe_vram, system_vram);
+                return (
+                    RunMode::MoeOffload,
+                    moe_vram,
+                    system_vram,
+                    Some((quant, offloaded_gb)),
+                );
             }
         }
     }
@@ -731,6 +1533,7 @@ fn moe_offload_path(
             RunMode::CpuOffload,
             model.min_ram_gb,
             system.available_ram_gb,
+            None,
         )
     } else {
         notes.push("Insufficient VRAM and system RAM".to_string());
@@ -739,7 +1542,7 @@ fn moe_offload_path(
             total_vram,
             model.moe_active_vram_gb().unwrap_or(total_vram),
         ));
-        (RunMode::Gpu, total_vram, system_vram)
+        (RunMode::Gpu, total_vram, system_vram, None)
     }
 }
 
@@ -760,21 +1563,41 @@ fn moe_memory_for_quant(model: &LlmModel, quant: &str) -> Option<(f64, f64)> {
     Some((active_vram, offloaded_ram))
 }
 
+/// The quantization ladder to search for a model on a runtime.
+///
+/// One place for the rule so dynamic selection, the run-mode walk and the
+/// runtime budget search cannot disagree about which quants a model has.
+fn quant_hierarchy_for(model: &LlmModel, runtime: InferenceRuntime) -> &'static [&'static str] {
+    if model.format == models::ModelFormat::Onnx {
+        models::ONNX_QUANT_HIERARCHY
+    } else if runtime == InferenceRuntime::Mlx {
+        models::MLX_QUANT_HIERARCHY
+    } else if runtime == InferenceRuntime::BitNet {
+        models::TERNARY_QUANT_HIERARCHY
+    } else if runtime == InferenceRuntime::LlamaCpp && model.is_mxfp4_native() {
+        models::MXFP4_QUANT_HIERARCHY
+    } else {
+        models::QUANT_HIERARCHY
+    }
+}
+
 fn best_quant_for_runtime_budget(
     model: &LlmModel,
     runtime: InferenceRuntime,
     budget: f64,
     estimation_ctx: u32,
-) -> Option<(&'static str, f64)> {
-    // Pre-quantized models (vLLM) don't support dynamic re-quantization
+) -> Option<(String, f64)> {
+    // Pre-quantized models (vLLM) can't be re-quantized, so there is no
+    // hierarchy to search — but they still have one fixed footprint. Report
+    // that footprint when it fits the budget: returning `None` here would tell
+    // callers the model does not fit at all, which is how a 9 GB AWQ model on a
+    // 24 GB card ended up labelled "Perfect" alongside an "Insufficient VRAM
+    // and system RAM" note.
     if runtime == InferenceRuntime::Vllm {
-        return None;
+        let required = model.estimate_memory_gb(model.quantization.as_str(), estimation_ctx);
+        return (required <= budget).then(|| (model.quantization.clone(), required));
     }
-    let hierarchy: &[&str] = if runtime == InferenceRuntime::Mlx {
-        models::MLX_QUANT_HIERARCHY
-    } else {
-        models::QUANT_HIERARCHY
-    };
+    let hierarchy = quant_hierarchy_for(model, runtime);
     model
         .best_quant_for_budget_with(budget, estimation_ctx, hierarchy)
         .or_else(|| {
@@ -784,28 +1607,43 @@ fn best_quant_for_runtime_budget(
                 None
             }
         })
+        .map(|(quant, required)| (quant.to_string(), required))
 }
 
 pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
-    if model.is_mlx_model() {
+    if model.requires_specialized_runtime() {
+        false
+    } else if model.is_mlx_model() {
         system.backend == GpuBackend::Metal && system.unified_memory
     } else if model.is_prequantized() {
         if !matches!(system.backend, GpuBackend::Cuda | GpuBackend::Rocm) {
             return false;
         }
-        // For CUDA GPUs, check that the GPU's compute capability meets the
-        // minimum required by the quantization format (e.g. AWQ needs Turing+).
-        // ROCm and unrecognized NVIDIA GPUs are assumed compatible.
-        if system.backend == GpuBackend::Cuda
-            && let Some(min_cc) = crate::hardware::quant_min_compute_capability(&model.quantization)
-            && let Some(gpu_name) = &system.gpu_name
-            && let Some(gpu_cc) = crate::hardware::gpu_compute_capability(gpu_name)
-        {
-            return gpu_cc >= min_cc;
-        }
-        true
+        // CUDA checks compute capability. ROCm cannot run NVFP4 in vLLM.
+        // A fallback kernel remains compatible and receives a score penalty.
+        kernel_support(model, system) != QuantKernelSupport::Unsupported
     } else {
         true
+    }
+}
+
+/// How the GPU in `system` executes the kernels `model`'s pre-quantized
+/// weights need. CUDA checks compute capability. ROCm excludes NVFP4.
+/// Other combinations return [`QuantKernelSupport::Unknown`].
+pub fn kernel_support(model: &LlmModel, system: &SystemSpecs) -> QuantKernelSupport {
+    if !model.is_prequantized() {
+        return QuantKernelSupport::Unknown;
+    }
+    let format = crate::hardware::effective_kernel_format(&model.quantization, &model.name);
+    match system.backend {
+        GpuBackend::Cuda => system
+            .gpu_name
+            .as_deref()
+            .map_or(QuantKernelSupport::Unknown, |gpu_name| {
+                crate::hardware::quant_kernel_support(format, gpu_name)
+            }),
+        GpuBackend::Rocm if format.eq_ignore_ascii_case("NVFP4") => QuantKernelSupport::Unsupported,
+        _ => QuantKernelSupport::Unknown,
     }
 }
 
@@ -822,6 +1660,28 @@ pub fn rank_models_by_fit_opts_col(
     installed_first: bool,
     sort_column: SortColumn,
 ) -> Vec<ModelFit> {
+    rank_models_by_fit_opts_col_dir(models, installed_first, sort_column, false)
+}
+
+/// Like [`rank_models_by_fit_opts_col`] with an explicit sort direction.
+///
+/// `ascending = false` keeps each column's default direction (Score, tok/s,
+/// Params, Mem%, Ctx: best value first; Date: newest first; UseCase,
+/// Provider: A→Z). `ascending = true` reverses only the sort key — installed
+/// models stay first (when requested) and TooTight entries stay last in both
+/// directions, so toggling direction cannot float unrunnable models to the
+/// top of the list.
+pub fn rank_models_by_fit_opts_col_dir(
+    models: Vec<ModelFit>,
+    installed_first: bool,
+    sort_column: SortColumn,
+    ascending: bool,
+) -> Vec<ModelFit> {
+    // Applies the requested direction to a key comparison that is written in
+    // the column's default (descending-best-first) orientation.
+    let dir = |cmp: std::cmp::Ordering| {
+        if ascending { cmp.reverse() } else { cmp }
+    };
     let mut ranked = models;
     ranked.sort_by(|a, b| {
         // Installed-first: if toggled, installed models sort above non-installed
@@ -842,55 +1702,66 @@ pub fn rank_models_by_fit_opts_col(
             _ => {}
         }
 
-        // Sort by selected column
-        match sort_column {
-            SortColumn::Score => b
+        // Sort by selected column. Each arm compares in the column's default
+        // orientation; `dir` flips it when ascending was requested.
+        let by_column = match sort_column {
+            SortColumn::Score => dir(b
                 .score
                 .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
+                .unwrap_or(std::cmp::Ordering::Equal)),
             SortColumn::Tps => {
                 let cmp = b
                     .estimated_tps
                     .partial_cmp(&a.estimated_tps)
                     .unwrap_or(std::cmp::Ordering::Equal);
                 if cmp == std::cmp::Ordering::Equal {
-                    b.score
+                    dir(b
+                        .score
                         .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal))
                 } else {
-                    cmp
+                    dir(cmp)
                 }
             }
             SortColumn::Params => {
                 let a_params = a.model.params_b();
                 let b_params = b.model.params_b();
-                b_params
+                dir(b_params
                     .partial_cmp(&a_params)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or(std::cmp::Ordering::Equal))
             }
-            SortColumn::MemPct => b
+            SortColumn::MemPct => dir(b
                 .utilization_pct
                 .partial_cmp(&a.utilization_pct)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            SortColumn::Ctx => b.model.context_length.cmp(&a.model.context_length),
+                .unwrap_or(std::cmp::Ordering::Equal)),
+            // Sort by the context that actually fits on this machine, not the
+            // advertised window — that's the number that constrains real work
+            // (issue #621). Native window breaks ties.
+            SortColumn::Ctx => dir(b
+                .usable_context
+                .cmp(&a.usable_context)
+                .then(b.model.context_length.cmp(&a.model.context_length))),
             SortColumn::ReleaseDate => {
                 let a_date = a.model.release_date.as_deref().unwrap_or("");
                 let b_date = b.model.release_date.as_deref().unwrap_or("");
                 match (a_date.is_empty(), b_date.is_empty()) {
-                    (true, false) => std::cmp::Ordering::Greater, // no date = last
+                    // No date stays last in both directions — it is a
+                    // "missing value", not a sortable key.
+                    (true, false) => std::cmp::Ordering::Greater,
                     (false, true) => std::cmp::Ordering::Less,
-                    (true, true) => b
+                    (true, true) => dir(b
                         .score
                         .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal),
+                        .unwrap_or(std::cmp::Ordering::Equal)),
                     (false, false) => {
-                        let cmp = b_date.cmp(a_date); // descending = newest first
+                        let cmp = b_date.cmp(a_date); // default = newest first
                         if cmp == std::cmp::Ordering::Equal {
-                            b.score
+                            dir(b
+                                .score
                                 .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .unwrap_or(std::cmp::Ordering::Equal))
                         } else {
-                            cmp
+                            dir(cmp)
                         }
                     }
                 }
@@ -899,11 +1770,12 @@ pub fn rank_models_by_fit_opts_col(
                 let cmp = a.use_case.label().cmp(b.use_case.label());
                 if cmp == std::cmp::Ordering::Equal {
                     // Secondary sort by score within same use case
-                    b.score
+                    dir(b
+                        .score
                         .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal))
                 } else {
-                    cmp
+                    dir(cmp)
                 }
             }
             SortColumn::Provider => {
@@ -913,14 +1785,20 @@ pub fn rank_models_by_fit_opts_col(
                     .to_lowercase()
                     .cmp(&b.model.provider.to_lowercase());
                 if cmp == std::cmp::Ordering::Equal {
-                    b.score
+                    dir(b
+                        .score
                         .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal))
                 } else {
-                    cmp
+                    dir(cmp)
                 }
             }
-        }
+        };
+        // Scores are rounded and thousands of rows tie, so without a final
+        // key the order of a tie is whatever order the rows arrived in. Name
+        // is unique and direction-independent, which keeps ranks (and any
+        // `-n` cut-off through a tie) identical from run to run.
+        by_column.then_with(|| a.model.name.cmp(&b.model.name))
     });
     ranked
 }
@@ -952,11 +1830,6 @@ pub fn rank_models_by_fit_opts_col(
 ///  - Google, "Efficiently Scaling Transformer Inference" (arXiv:2211.05102)
 ///  - ggerganov, llama.cpp NVIDIA T4 benchmarks (Discussion #4225)
 
-/// Read the system DDR bandwidth (GB/s) from the `LLMFIT_DDR_BANDWIDTH` env var,
-/// falling back to a conservative 50 GB/s default (DDR4-3200 dual-channel).
-///
-/// Override: `export LLMFIT_DDR_BANDWIDTH=90` for DDR5-5600 dual-channel, etc.
-/// Typical values: DDR4-3200 dual-channel ~50 GB/s, DDR5-5600 dual-channel ~90 GB/s.
 /// VRAM utilization threshold above which MoE cache-pressure penalty applies.
 /// Below this, inactive experts don't significantly compete for L2 cache.
 const VRAM_PRESSURE_UTIL_THRESHOLD: f64 = 0.60;
@@ -969,6 +1842,141 @@ const VRAM_PRESSURE_PENALTY_FLOOR: f64 = 0.30;
 /// Conservative 50% — assumes half the experts are inactive on average.
 const VRAM_PRESSURE_DEFAULT_EXPERT_RATIO: f64 = 0.50;
 
+/// Calibration for the Tier-2 (metadata-poor) MoE decode estimate.
+///
+/// Tier 2 approximates per-token traffic as `active_parameters * quant_bpp`,
+/// which is only a proxy: the real read set also covers attention, the router
+/// and any shared expert, at whatever precision those tensors were kept at.
+/// These two factors absorb the difference.
+///
+/// * `efficiency` — fraction of peak memory bandwidth the kernels sustain.
+/// * `overhead` — correction for per-token bytes the proxy mis-counts.
+///   Below 1.0 when more is read than `active_parameters` suggests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MoeTier2Params {
+    pub efficiency: f64,
+    pub overhead: f64,
+}
+
+/// Tier-2 MoE calibration for an architecture.
+///
+/// Architectures absent from the table fall back to `config_efficiency` and the
+/// original `num_experts`-tiered overhead, so adding an entry can only change
+/// the model it names.
+///
+/// The expert-count tiers are a poor proxy for the newest sparse designs:
+/// counting 128+ experts, they assume heavy router and cache overhead (0.40)
+/// and land roughly 2x low on architectures that route to very few experts
+/// through well-optimized kernels. Per-architecture entries below are fitted to
+/// published single-request decode measurements; each cites its source.
+fn moe_tier2_params(
+    architecture: Option<&str>,
+    num_experts: Option<u32>,
+    config_efficiency: f64,
+) -> MoeTier2Params {
+    // Normalize: catalog `architecture` values are HF `model_type` strings
+    // (e.g. "gpt_oss", "deepseek_v3"), but casing varies by source.
+    let arch = architecture.unwrap_or("").to_lowercase();
+
+    // gpt-oss-120b/20b: 128 experts, 4 active, MXFP4-native weights. Geometry
+    // (117B total / 5.1B active, 128 experts, 4 per token, MXFP4) from the
+    // OpenAI gpt-oss model card, `openai/gpt-oss-120b` on HuggingFace.
+    //
+    // Calibration reference: ~50 tok/s decode for the 120B on 256 GB/s-class
+    // unified memory (issue #969). The roofline for its active set is ~87
+    // tok/s, so it sustains a far higher fraction of peak than the K-quant
+    // default — MXFP4 weights are read at ~4.25 bits rather than the 4.6 that
+    // `quant_bpp("Q4_K_M")` assumes, and only 4 of 128 experts are touched.
+    if arch.starts_with("gpt_oss") || arch.starts_with("gptoss") {
+        return MoeTier2Params {
+            efficiency: 0.72,
+            overhead: 0.80,
+        };
+    }
+
+    // DeepSeek V3/V4 line: 256 routed experts + a shared expert, MLA
+    // attention. The shared expert and MLA KV projections are read on every
+    // token regardless of routing, so per-token traffic runs well above
+    // `active_parameters * bpp` — hence the lower overhead — while the large
+    // fused expert matmuls still sustain better than default efficiency.
+    // Geometry from the DeepSeek-V3 technical report (arXiv:2412.19437), which
+    // describes the 256-routed-plus-shared expert layout and MLA; DeepSeek-V2
+    // (arXiv:2405.04434) covers the per-token active-parameter accounting.
+    //
+    // Calibration reference: ~35 tok/s at 13B active on 614 GB/s-class
+    // hardware (issue #969).
+    if arch.starts_with("deepseek_v3") || arch.starts_with("deepseek_v4") {
+        return MoeTier2Params {
+            efficiency: 0.62,
+            overhead: 0.70,
+        };
+    }
+
+    MoeTier2Params {
+        efficiency: config_efficiency,
+        overhead: default_moe_overhead(num_experts),
+    }
+}
+
+/// Bandwidth-equivalent bytes per parameter for the *fixed* component of the
+/// Tier-1 MoE decode estimate.
+///
+/// [`LlmModel::MOE_FIXED_EFFECTIVE_BPP`] is not a storage width. It converts
+/// the attention, router, shared-expert and head parameters into the bandwidth
+/// they cost per token, absorbing their compute time, and K ≈ 3.2 was fitted to
+/// OLMoE-1B-7B on an RX 6900 XT. Two properties of that fit don't carry to
+/// every sparse design, and gpt-oss breaks both:
+///
+/// * [`moe_bandwidth_decomposition`](crate::models::LlmModel::moe_bandwidth_decomposition)
+///   counts the embedding table in the fixed set, but decode reads one row of
+///   it per token, not the whole table. OLMoE's 50k-token vocabulary makes
+///   that a rounding error; gpt-oss's 201k × 2880 table is 0.58B of a 2.13B
+///   fixed set. The published active-parameter figure agrees: 5.1B is the four
+///   routed experts plus attention plus router plus a *single* vocab × hidden
+///   term, not two.
+/// * OLMoE is dense-MHA with 16 heads at 128 dim. gpt-oss is grouped-query
+///   with 8 KV heads at 64 dim on alternating sliding-window layers, so far
+///   less attention work rides on each fixed parameter.
+///
+/// Both push the same way, and no single K fits both models: re-fitting K with
+/// the embedding term removed reproduces OLMoE at 4.07 and still leaves
+/// gpt-oss-120b at ~31 tok/s against a measured ~50. So this mirrors
+/// [`moe_tier2_params`] — a per-architecture entry, fitted to a cited
+/// measurement, that can only change the models it names.
+fn moe_tier1_fixed_bpp(architecture: Option<&str>) -> f64 {
+    let arch = architecture.unwrap_or("").to_lowercase();
+
+    // Calibration reference: ~50 tok/s decode for openai/gpt-oss-120b at a
+    // Q4-class quant on 256 GB/s-class unified memory (issue #969). Applies to
+    // the 20B sibling too, which shares the vocabulary, head geometry and
+    // MXFP4-native weights.
+    //
+    // Fitted at Q4-class only. The scalable half of the Tier-1 sum still reads
+    // gpt-oss weights at `quant_bpp`, which overstates the MXFP4-native
+    // tensors these models actually ship, so a Q8_0 pick stays low.
+    if arch.starts_with("gpt_oss") || arch.starts_with("gptoss") {
+        return 1.43;
+    }
+
+    models::LlmModel::MOE_FIXED_EFFECTIVE_BPP
+}
+
+/// The original `num_experts`-tiered MoE overhead, kept as the default for
+/// architectures without a calibrated entry.
+///
+/// Calibrated against llama-bench on an RX 6900 XT: 0.90 for Mixtral-class,
+/// 0.70 for the OLMoE / Qwen1.5-MoE / DeepSeek-V2-Lite 64-expert group.
+fn default_moe_overhead(num_experts: Option<u32>) -> f64 {
+    match num_experts {
+        Some(n) if n <= 8 => 0.90, // calibrated for Mixtral-class
+        Some(n) if n <= 16 => 0.85,
+        Some(n) if n <= 32 => 0.80,
+        Some(n) if n <= 64 => 0.70, // calibrated: OLMoE, Qwen1.5, DeepSeek
+        Some(_) => 0.40,            // 128+ experts
+        None => 0.60,               // unknown
+    }
+}
+
 /// Print a debug line to stderr when LLMFIT_DEBUG env var is set.
 /// Usage: `LLMFIT_DEBUG=1 llmfit fit ...` to see which estimation path is taken.
 /// Uses a macro to avoid string allocation when debug logging is disabled (hot path).
@@ -980,14 +1988,201 @@ macro_rules! debug_log {
     };
 }
 
-fn ddr_bandwidth_gbps() -> f64 {
-    std::env::var("LLMFIT_DDR_BANDWIDTH")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(50.0)
+/// GPU memory bandwidth (GB/s) to estimate with, or `None` when unknown.
+///
+/// Single source of truth for the bandwidth roofline, so `estimate_tps` and the
+/// `EstimateBasis` it reports can't disagree about what was assumed.
+///
+/// Resolution order:
+///  1. `CalcConfig::gpu_bandwidth_gbps_override`
+///  2. the GPU-name lookup table (`hardware::gpu_memory_bandwidth_gbps`)
+///  3. `None` — caller falls back to the per-backend constant
+///
+/// Non-positive overrides are ignored rather than trusted: a zero would make
+/// the roofline divide to nothing.
+pub fn resolve_gpu_bandwidth(system: &SystemSpecs, config: &CalcConfig) -> Option<f64> {
+    if let Some(bw) = config.gpu_bandwidth_gbps_override.filter(|b| *b > 0.0) {
+        return Some(bw);
+    }
+    system
+        .gpu_name
+        .as_deref()
+        .and_then(crate::hardware::gpu_memory_bandwidth_gbps)
 }
 
-fn estimate_tps(
+/// Fraction of peak fp16 matmul throughput reached during prompt processing.
+///
+/// Prefill is compute-bound and runs at large batch, but still loses time to
+/// attention (quadratic, not a dense matmul), dequantization of the weights,
+/// and pipeline gaps between layers. Published model-FLOPs-utilization figures
+/// for single-request inference land around a third of peak:
+///  - Google, "Efficiently Scaling Transformer Inference" (arXiv:2211.05102)
+///  - Chowdhery et al., "PaLM" (arXiv:2204.02311), §Training efficiency
+const PREFILL_COMPUTE_UTILIZATION: f64 = 0.35;
+
+/// Estimated `(prefill_tps, ttft_ms)` for a prompt of `prompt_tokens`.
+///
+/// Returns `(None, None)` unless the GPU's fp16 throughput is configured, and
+/// on the CPU-only path: prompt processing is limited by compute, not memory
+/// bandwidth, so unlike decode there is no roofline to fall back on and a
+/// guess would be indistinguishable from a measurement. A null says
+/// "not estimated"; 0.0 would wrongly say "immeasurably slow".
+///
+/// Each parameter contributes one multiply-accumulate (2 FLOPs) per token, so
+/// `flops_per_token = 2 * params`. MoE models only route through their active
+/// experts, so active parameters drive the cost when known. Quantization is
+/// ignored deliberately: llama.cpp and vLLM both dequantize to fp16 for the
+/// matmul, so the FLOP count is the same at Q4 as at F16.
+fn estimate_prefill(
+    model: &LlmModel,
+    run_mode: RunMode,
+    prompt_tokens: u32,
+    config: &CalcConfig,
+) -> (Option<f64>, Option<f64>) {
+    let Some(tflops) = config.gpu_compute_tflops_fp16.filter(|t| *t > 0.0) else {
+        return (None, None);
+    };
+    if run_mode == RunMode::CpuOnly {
+        return (None, None);
+    }
+
+    let params = model
+        .active_parameters
+        .filter(|_| model.is_moe)
+        .map(|p| p as f64)
+        .unwrap_or_else(|| model.params_b() * 1_000_000_000.0)
+        .max(1.0);
+
+    let flops_per_token = 2.0 * params;
+    let usable_flops = tflops * 1e12 * PREFILL_COMPUTE_UTILIZATION;
+    let prefill_tps =
+        (usable_flops / flops_per_token) * config.run_mode_factors.for_run_mode(run_mode);
+    if prefill_tps <= 0.0 {
+        return (None, None);
+    }
+
+    let ttft_ms = (f64::from(prompt_tokens) / prefill_tps) * 1000.0;
+    (Some(prefill_tps), Some(ttft_ms))
+}
+
+/// System DDR bandwidth (GB/s) used when an estimate reads system RAM:
+/// MoE-offload expert streaming, and dense CPU-offload weights that do not
+/// fit in VRAM.
+///
+/// Resolution order:
+///  1. `CalcConfig::ddr_bandwidth_gbps` (TUI Advanced Config)
+///  2. `LLMFIT_DDR_BANDWIDTH` env var (e.g. `export LLMFIT_DDR_BANDWIDTH=90`)
+///  3. Measured effective bandwidth (`hardware::measured_ram_bandwidth_gbps`)
+///  4. Conservative 50 GB/s fallback (DDR4-3200 dual-channel)
+fn ddr_bandwidth_gbps(config: &CalcConfig) -> f64 {
+    if let Some(bw) = config.ddr_bandwidth_gbps.filter(|b| *b > 0.0) {
+        return bw;
+    }
+    if let Some(bw) = std::env::var("LLMFIT_DDR_BANDWIDTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|b| *b > 0.0)
+    {
+        return bw;
+    }
+    crate::hardware::measured_ram_bandwidth_gbps().unwrap_or(50.0)
+}
+
+/// Dense `CpuOffload` decode tok/s when GPU bandwidth is known (issue #1085).
+///
+/// Weight bytes are the same `active_gb` the dense GPU roofline uses. VRAM
+/// left after the fp16 KV cache (context capped by [`DEFAULT_ESTIMATION_CTX`]
+/// and [`CalcConfig::context_cap`]) and the 0.5 GB runtime overhead from
+/// [`LlmModel::estimate_memory_gb_with_kv`] holds a prefix of those weights;
+/// the rest streams from DDR. When `num_hidden_layers` is known, the GPU
+/// share snaps down to a whole-layer count — llama.cpp offloads whole layers
+/// via `-ngl`, and the catalog does not separate embeddings from blocks.
+///
+/// Time per token is the sum of the two transfers. The `cpu_offload` run-mode
+/// factor scales only the DDR rate, relative to its default, so the default
+/// estimate is unchanged, a calibrated or user-set factor still moves it, and a
+/// zero RAM share still matches the GPU roofline.
+fn dense_cpu_offload_tps(
+    model: &LlmModel,
+    system: &SystemSpecs,
+    config: &CalcConfig,
+    gpu_bandwidth_gbps: f64,
+    weight_gb: f64,
+) -> f64 {
+    let ctx = model
+        .context_length
+        .min(DEFAULT_ESTIMATION_CTX)
+        .min(config.context_cap.unwrap_or(u32::MAX));
+    // Same 0.5 GB runtime overhead as `LlmModel::estimate_memory_gb_with_kv`.
+    let vram_for_weights =
+        (system.gpu_fit_pool_gb() - model.kv_cache_gb(ctx, KvQuant::Fp16) - 0.5).max(0.0);
+
+    let (gpu_gb, ram_gb) = match model.num_hidden_layers {
+        Some(layers) if layers > 0 => {
+            let layers = f64::from(layers);
+            let slice = weight_gb / layers;
+            let on_gpu = (vram_for_weights / slice).floor().clamp(0.0, layers);
+            if on_gpu == layers {
+                (weight_gb, 0.0)
+            } else {
+                let gpu_gb = on_gpu * slice;
+                (gpu_gb, weight_gb - gpu_gb)
+            }
+        }
+        _ => {
+            let gpu_gb = weight_gb.min(vram_for_weights);
+            (gpu_gb, weight_gb - gpu_gb)
+        }
+    };
+
+    let gpu_factor = config.run_mode_factors.gpu;
+    // Zero RAM bytes is the GPU roofline, written the same way so the two
+    // figures match rather than merely trending together.
+    if ram_gb == 0.0 {
+        if weight_gb <= 0.0 {
+            return 0.1;
+        }
+        let raw_tps = (gpu_bandwidth_gbps / weight_gb) * config.efficiency;
+        return (raw_tps * gpu_factor).max(0.1);
+    }
+
+    let gpu_rate = gpu_bandwidth_gbps * config.efficiency * gpu_factor;
+    let gpu_time = if gpu_gb > 0.0 && gpu_rate > 0.0 {
+        gpu_gb / gpu_rate
+    } else if gpu_gb > 0.0 {
+        return 0.1;
+    } else {
+        0.0
+    };
+    let ddr_bw = ddr_bandwidth_gbps(config);
+    let ddr_rate =
+        ddr_bw * config.run_mode_factors.cpu_offload / RunModeFactors::default().cpu_offload;
+    if ddr_rate <= 0.0 {
+        return 0.1;
+    }
+    let total_time = gpu_time + (ram_gb / ddr_rate);
+    debug_log!(
+        "Dense CPU offload: {} gpu_gb={:.2} ram_gb={:.2} ddr={:.0}GB/s ddr_rate={:.0}GB/s tps={:.1}",
+        model.name,
+        gpu_gb,
+        ram_gb,
+        ddr_bw,
+        ddr_rate,
+        1.0 / total_time
+    );
+    if !total_time.is_finite() || total_time <= 0.0 {
+        return 0.1;
+    }
+    (1.0 / total_time).max(0.1)
+}
+
+/// Estimate decode throughput in tok/s.
+///
+/// This is the single source of truth for speed estimation. `plan.rs` delegates
+/// to it on the bandwidth path rather than reimplementing the model — an earlier
+/// duplicate there silently missed every MoE fix (#133, #464, #475) and
+/// underestimated sparse MoE throughput by ~4x.
+pub(crate) fn estimate_tps(
     model: &LlmModel,
     quant: &str,
     system: &SystemSpecs,
@@ -995,8 +2190,6 @@ fn estimate_tps(
     runtime: InferenceRuntime,
     config: &CalcConfig,
 ) -> f64 {
-    use crate::hardware::gpu_memory_bandwidth_gbps;
-
     // MoE models execute only active experts per token, so speed estimates should
     // use active parameters when known; fit/memory paths still use full model size.
     let params = model
@@ -1015,6 +2208,10 @@ fn estimate_tps(
     // raw_tps     = bandwidth_GB_s / model_bytes_GB
     // estimated   = raw_tps * efficiency * run_mode_factor
     //
+    // Dense CpuOffload is the exception (issue #1085): GPU-resident weight
+    // bytes move at the GPU roofline and the spilled bytes at DDR, with no
+    // extra cpu_offload factor.
+    //
     // The efficiency factor (0.55) accounts for:
     //  - Kernel launch / scheduling overhead
     //  - KV-cache memory reads (not captured in model size)
@@ -1024,8 +2221,7 @@ fn estimate_tps(
     //  - RTX 4090 (1008 GB/s): Qwen3.5-27B Q4 → ~40 tok/s measured
     //  - T4 (320 GB/s): 7B F16 → ~16 tok/s (ggerganov benchmark)
     //  - Apple M1 Max (400 GB/s): 7B Q4_0 → ~61 tok/s (ggerganov benchmark)
-    let gpu_name = system.gpu_name.as_deref().unwrap_or("");
-    let bandwidth = gpu_memory_bandwidth_gbps(gpu_name);
+    let bandwidth = resolve_gpu_bandwidth(system, config);
 
     if run_mode != RunMode::CpuOnly
         && let Some(bw) = bandwidth
@@ -1064,11 +2260,12 @@ fn estimate_tps(
             // ceiling on some systems, but in practice llama.cpp processes
             // offloaded layers on the CPU, so DDR bandwidth is the dominant factor.
             //
-            // Typical DDR bandwidths: DDR4-3200 dual-channel ~50 GB/s,
-            // DDR5-5600 dual-channel ~90 GB/s. We use a conservative 50 GB/s
-            // default which can be overridden via LLMFIT_DDR_BANDWIDTH env var.
+            // DDR bandwidth is resolved per ddr_bandwidth_gbps(): Advanced
+            // Config value, else LLMFIT_DDR_BANDWIDTH env var, else measured
+            // effective bandwidth, else a conservative 50 GB/s (DDR4-3200
+            // dual-channel).
             if run_mode == RunMode::MoeOffload {
-                let ddr_bw = ddr_bandwidth_gbps();
+                let ddr_bw = ddr_bandwidth_gbps(config);
 
                 let expert_read_time = active_gb / ddr_bw; // CPU reads from DDR
                 let gpu_compute_time = active_gb / (bw * efficiency);
@@ -1096,7 +2293,7 @@ fn estimate_tps(
             // 2. FIXED: attention, router, shared experts, lm_head, embedding
             //    These are compute-bound and cost roughly constant time regardless
             //    of quantization. We represent them as bandwidth-equivalent bytes
-            //    using MOE_FIXED_EFFECTIVE_BPP (K ≈ 3.2).
+            //    using moe_tier1_fixed_bpp (K ≈ 3.2 by default).
             //
             // Formula: tps = bw / (active_ffn_bytes + fixed_equivalent_bytes)
             //
@@ -1178,7 +2375,7 @@ fn estimate_tps(
             if let Some((active_ffn_b, fixed_b)) = model.moe_bandwidth_decomposition() {
                 let bpp = models::quant_bpp(quant);
                 let active_ffn_bytes = active_ffn_b * bpp;
-                let fixed_bytes = fixed_b * models::LlmModel::MOE_FIXED_EFFECTIVE_BPP;
+                let fixed_bytes = fixed_b * moe_tier1_fixed_bpp(model.architecture.as_deref());
                 let per_token_bytes = active_ffn_bytes + fixed_bytes;
                 let raw_tps = bw / per_token_bytes;
                 let mode_factor = config.run_mode_factors.for_run_mode(run_mode);
@@ -1193,26 +2390,30 @@ fn estimate_tps(
                 return (raw_tps * mode_factor * vram_pressure).max(0.1);
             }
 
-            // Tier 2: Fallback — active_parameters * quant_bpp with tiered moe_overhead
+            // Tier 2: Fallback — active_parameters * quant_bpp, corrected by the
+            // per-architecture calibration (default reproduces the original
+            // num_experts-tiered overhead).
             let moe_active_gb = params * models::quant_bpp(quant);
-            let moe_overhead = match model.num_experts {
-                Some(n) if n <= 8 => 0.90, // calibrated for Mixtral-class
-                Some(n) if n <= 16 => 0.85,
-                Some(n) if n <= 32 => 0.80,
-                Some(n) if n <= 64 => 0.70, // calibrated: OLMoE, Qwen1.5, DeepSeek
-                Some(_) => 0.40,            // 128+ experts
-                None => 0.60,               // unknown
-            };
-            let raw_tps = (bw / moe_active_gb) * efficiency * moe_overhead;
+            let tier2 =
+                moe_tier2_params(model.architecture.as_deref(), model.num_experts, efficiency);
+            let raw_tps = (bw / moe_active_gb) * tier2.efficiency * tier2.overhead;
             let mode_factor = config.run_mode_factors.for_run_mode(run_mode);
             debug_log!(
-                "MoE GPU Tier2 (fallback): {} moe_overhead={:.2} vram_pressure={:.2} raw_tps={:.1}",
+                "MoE GPU Tier2 (fallback): {} arch={:?} efficiency={:.2} overhead={:.2} vram_pressure={:.2} raw_tps={:.1}",
                 model.name,
-                moe_overhead,
+                model.architecture.as_deref().unwrap_or("?"),
+                tier2.efficiency,
+                tier2.overhead,
                 vram_pressure,
                 raw_tps
             );
             return (raw_tps * mode_factor * vram_pressure).max(0.1);
+        }
+
+        // Known GPU bandwidth, dense model, partial offload. MoE CpuOffload
+        // (the offload-not-viable fallback) keeps the factor below.
+        if run_mode == RunMode::CpuOffload && !model.is_moe {
+            return dense_cpu_offload_tps(model, system, config, bw, active_gb);
         }
 
         let raw_tps = (bw / active_gb) * efficiency;
@@ -1226,6 +2427,10 @@ fn estimate_tps(
     // Used when the GPU is not recognized (custom/unnamed GPUs,
     // synthetic entries from --memory override, etc.).
     let k: f64 = match (system.backend, runtime) {
+        (_, InferenceRuntime::Unsupported) => 0.0,
+        // bitnet.cpp runs native-ternary models on the CPU, never the discrete
+        // GPU, so use a CPU throughput constant regardless of the GPU backend.
+        (_, InferenceRuntime::BitNet) => 75.0,
         (GpuBackend::Metal, InferenceRuntime::Mlx) => 250.0,
         (GpuBackend::Metal, InferenceRuntime::LlamaCpp) => 160.0,
         (GpuBackend::Metal, InferenceRuntime::Vllm) => 160.0,
@@ -1257,7 +2462,7 @@ fn estimate_tps(
         let estimated_gpu_bw = k * models::quant_bytes_per_param(quant) / fallback_efficiency;
         let bytes_per_param = models::quant_bytes_per_param(quant);
         let active_gb = params * bytes_per_param;
-        let ddr_bw = ddr_bandwidth_gbps();
+        let ddr_bw = ddr_bandwidth_gbps(config);
         let expert_read_time = active_gb / ddr_bw;
         let gpu_compute_time = active_gb / (estimated_gpu_bw * fallback_efficiency);
         base = (1.0 / (expert_read_time + gpu_compute_time)).max(0.1);
@@ -1323,18 +2528,27 @@ fn compute_scores(
 fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
     let params = model.params_b();
 
-    // Base quality by parameter count
-    let base = if params < 1.0 {
+    // For the base quality tier, MoE models are scored on their *active*
+    // parameters per token rather than the total across all experts. A model
+    // like Qwen3-Coder-Next (80B total / 3B active) infers at a quality closer
+    // to a small dense model, so using the 80B total would inflate its tier.
+    let quality_params = model
+        .active_parameters
+        .map(|a| a as f64 / 1_000_000_000.0)
+        .unwrap_or(params);
+
+    // Base quality by (active) parameter count
+    let base = if quality_params < 1.0 {
         30.0
-    } else if params < 3.0 {
+    } else if quality_params < 3.0 {
         45.0
-    } else if params < 7.0 {
+    } else if quality_params < 7.0 {
         60.0
-    } else if params < 10.0 {
+    } else if quality_params < 10.0 {
         75.0
-    } else if params < 20.0 {
+    } else if quality_params < 20.0 {
         82.0
-    } else if params < 40.0 {
+    } else if quality_params < 40.0 {
         89.0
     } else {
         95.0
@@ -1364,39 +2578,118 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
     // Generation bonus: newer model generations get a quality bump
     let gen_bonus = models::generation_quality_bonus(model.architecture.as_deref(), &model.name);
 
+    // Recency bonus: same-size models improve over time, so a freshly released
+    // model edges out an identically-sized older one. Uses the catalog
+    // `release_date` (YYYY-MM-DD); models without a date get no bonus.
+    let recency_bonus = model
+        .release_date
+        .as_deref()
+        .and_then(|d| months_since(d, current_year_month()))
+        .map(|months| {
+            if months < 3 {
+                3.0
+            } else if months < 9 {
+                1.5
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+
     // Quantization penalty
     let q_penalty = models::quant_quality_penalty(quant);
 
-    // Task alignment bump
-    let task_bump = match use_case {
-        UseCase::Coding => {
-            if name_lower.contains("code")
-                || name_lower.contains("starcoder")
-                || name_lower.contains("wizard")
+    // Task alignment bump. Curated benchmark aggregates (per-family table in
+    // data/use_case_benchmarks.json) take precedence over name heuristics:
+    // the family's measured task strength, centered on a 72-point baseline,
+    // maps to a bounded adjustment so it composes with the existing quality
+    // machinery instead of replacing it (issue #150). Families without an
+    // entry keep the original heuristics.
+    let bench_task_key = match use_case {
+        UseCase::Coding => Some("coding"),
+        UseCase::Reasoning => Some("reasoning"),
+        UseCase::Chat => Some("chat"),
+        _ => None,
+    };
+    let bench_score = bench_task_key.and_then(|k| crate::task_bench::score(&name_lower, k));
+    let task_bump = match bench_score {
+        Some(bench) => ((bench - 72.0) * 0.4).clamp(-8.0, 9.0),
+        None => match use_case {
+            UseCase::Coding => {
+                if name_lower.contains("code")
+                    || name_lower.contains("starcoder")
+                    || name_lower.contains("wizard")
+                {
+                    6.0
+                } else {
+                    0.0
+                }
+            }
+            UseCase::Reasoning => {
+                if params >= 13.0 {
+                    5.0
+                } else {
+                    0.0
+                }
+            }
+            UseCase::Multimodal
+                if (name_lower.contains("vision")
+                    || model.use_case.to_lowercase().contains("vision")) =>
             {
                 6.0
-            } else {
-                0.0
             }
-        }
-        UseCase::Reasoning => {
-            if params >= 13.0 {
-                5.0
-            } else {
-                0.0
-            }
-        }
-        UseCase::Multimodal => {
-            if name_lower.contains("vision") || model.use_case.to_lowercase().contains("vision") {
-                6.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
+            _ => 0.0,
+        },
     };
 
-    (base + family_bump + gen_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+    (base + family_bump + gen_bonus + recency_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+}
+
+/// Token count as a compact column string: `"32k"` for ≥1000, raw otherwise.
+fn fmt_ctx_tokens(tokens: u32) -> String {
+    if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Whole months elapsed between a `release_date` (`YYYY-MM-DD`, only the year
+/// and month are read) and `now` as a `(year, month)` pair. Returns `None` if
+/// the date can't be parsed; negative spans (future dates) clamp to 0.
+fn months_since(release_date: &str, now: (i32, u32)) -> Option<u32> {
+    let mut parts = release_date.split('-');
+    let year: i32 = parts.next()?.trim().parse().ok()?;
+    let month: i32 = parts.next()?.trim().parse().ok()?;
+    let (now_year, now_month) = now;
+    let diff = (now_year - year) * 12 + (now_month as i32 - month);
+    Some(diff.max(0) as u32)
+}
+
+/// Current `(year, month)` in UTC, derived from the system clock. Falls back to
+/// the Unix epoch if the clock is before 1970 (which only removes the bonus).
+fn current_year_month() -> (i32, u32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86_400) as i64)
+}
+
+/// Convert days since 1970-01-01 to `(year, month)` in the proleptic Gregorian
+/// calendar (Howard Hinnant's `civil_from_days`). Exact — no 365-day/30-day
+/// approximations, so the recency bonus doesn't drift across leap years.
+fn civil_from_days(z: i64) -> (i32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u32)
 }
 
 /// Speed score: normalize estimated TPS against target for the use case.
@@ -1415,19 +2708,15 @@ fn fit_score(required: f64, available: f64) -> f64 {
         return 0.0;
     }
     let ratio = required / available;
-    // Sweet spot: 50-80% utilization scores highest
-    if ratio <= 0.5 {
-        // Under-utilizing: still good but not optimal
-        60.0 + (ratio / 0.5) * 40.0
-    } else if ratio <= 0.8 {
-        100.0
-    } else if ratio <= 0.9 {
-        // Getting tight
-        70.0
-    } else {
-        // Very tight
-        50.0
-    }
+    // Headroom is good: anything that fits with room to spare is a perfect fit,
+    // so the score holds a flat 100 up to a comfortable utilization, then eases
+    // down as memory gets tight via a one-sided Gaussian falloff. This removes
+    // the old step function's 100 -> 70 cliff at 80% (79% scored 100, 81%
+    // scored 70) without penalizing models that leave headroom.
+    const COMFORT: f64 = 0.70;
+    const SIGMA: f64 = 0.20;
+    let z = ((ratio - COMFORT) / SIGMA).max(0.0);
+    (100.0 * (-0.5 * z * z).exp()).clamp(0.0, 100.0)
 }
 
 /// Context score: context window capability vs target for the use case.
@@ -1462,7 +2751,28 @@ mod tests {
 
     /// Test helper: default CalcConfig for direct estimate_tps calls.
     fn test_config() -> CalcConfig {
-        CalcConfig::default()
+        CalcConfig {
+            // Pin DDR bandwidth so MoE-offload estimates don't vary with the
+            // machine running the tests.
+            ddr_bandwidth_gbps: Some(50.0),
+            ..CalcConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_ddr_bandwidth_config_override_wins() {
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(123.0),
+            ..CalcConfig::default()
+        };
+        assert_eq!(ddr_bandwidth_gbps(&config), 123.0);
+
+        // Zero/negative values are invalid and fall through to auto.
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(0.0),
+            ..CalcConfig::default()
+        };
+        assert!(ddr_bandwidth_gbps(&config) > 0.0);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1488,6 +2798,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1512,6 +2823,7 @@ mod tests {
             has_gpu,
             gpu_vram_gb: vram,
             total_gpu_vram_gb: vram, // same as gpu_vram_gb for single-GPU tests
+            gpu_available_gb: None,
             gpu_name: if has_gpu {
                 Some("Test GPU".to_string())
             } else {
@@ -1530,6 +2842,320 @@ mod tests {
         }
     }
 
+    /// A cluster of `nodes` nodes and `gpus` GPUs in total, each card with
+    /// `per_gpu_vram` GB, shaped like `ClusterConfig::to_system_specs`.
+    fn cluster_system(nodes: u32, gpus: u32, per_gpu_vram: f64) -> SystemSpecs {
+        let mut s = test_system(512.0, true, Some(per_gpu_vram));
+        s.total_gpu_vram_gb = Some(per_gpu_vram * gpus as f64);
+        s.gpu_count = gpus;
+        s.cluster_mode = true;
+        s.cluster_node_count = nodes;
+        s
+    }
+
+    #[test]
+    fn cluster_fit_note_reports_one_shard_per_gpu() {
+        // 2 nodes x 4 GPUs: TP spans all 8 GPUs, so the note must say TP=8
+        // and one shard per GPU, not TP=2 (one per node).
+        let mut model = test_model("7B", 16.0, Some(8.0));
+        model.num_attention_heads = Some(32);
+        model.num_key_value_heads = Some(8);
+        let fit = ModelFit::analyze(&model, &cluster_system(2, 8, 80.0));
+        assert_eq!(fit.run_mode, RunMode::TensorParallel);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("TP=8")
+                    && n.contains("one shard per GPU across 8 GPUs on 2 nodes")),
+            "notes: {:?}",
+            fit.notes
+        );
+        assert!(!fit.notes.iter().any(|n| n.contains("TP=2")));
+    }
+
+    #[test]
+    fn cluster_mode_ignores_non_vllm_forced_runtime() {
+        let model = test_model("7B", 16.0, Some(8.0));
+        let system = cluster_system(2, 2, 80.0);
+        for rt in [InferenceRuntime::Mlx, InferenceRuntime::LlamaCpp] {
+            let fit = ModelFit::analyze_with_forced_runtime(&model, &system, None, Some(rt));
+            assert_eq!(fit.runtime, InferenceRuntime::Vllm);
+            assert!(
+                fit.notes.iter().any(|n| n.starts_with("Ignoring force_runtime=")
+                    && n.contains("cluster mode")),
+                "notes: {:?}",
+                fit.notes
+            );
+        }
+    }
+
+    fn headed(name: &str, attn: Option<u32>, kv: Option<u32>) -> LlmModel {
+        let mut m = test_model(name, 16.0, Some(8.0));
+        m.num_attention_heads = attn;
+        m.num_key_value_heads = kv;
+        m
+    }
+
+    /// Smallest per-GPU VRAM (in 0.5 GB steps) at which `model` fits on 3
+    /// GPUs but not 2, found with a model whose heads split 3 ways.
+    fn vram_needing_three_gpus(params: &str) -> f64 {
+        let splits_3 = headed(params, Some(24), Some(6));
+        (1..2000)
+            .map(|i| i as f64 * 0.5)
+            .find(|&v| {
+                ModelFit::analyze(&splits_3, &cluster_system(3, 3, v)).fit_level
+                    != FitLevel::TooTight
+                    && ModelFit::analyze(&splits_3, &cluster_system(2, 2, v)).fit_level
+                        == FitLevel::TooTight
+            })
+            .expect("some VRAM needs exactly 3 GPUs")
+    }
+
+    #[test]
+    fn tp_guard_passes_tp2_but_refuses_tp3() {
+        // 32 attention heads, 8 KV heads: TP=2 shards evenly, TP=3 cannot.
+        let model = headed("7B", Some(32), Some(8));
+        assert_eq!(tensor_parallel_layout(&model, 2), TpLayout::Valid);
+        assert!(matches!(
+            tensor_parallel_layout(&model, 3),
+            TpLayout::Invalid(..)
+        ));
+
+        let two = ModelFit::analyze(&model, &cluster_system(2, 2, 128.0));
+        assert_ne!(two.fit_level, FitLevel::TooTight);
+        assert!(!two.notes.iter().any(|n| n.contains("invalid")));
+        assert_eq!(two.tp_size, Some(2));
+        assert_eq!(two.layout_refusal, None);
+
+        // When the model only fits once spread over all 3 GPUs, vLLM's
+        // refusal of TP=3 means it does not fit.
+        let v = vram_needing_three_gpus("70B");
+        let model = headed("70B", Some(32), Some(8));
+        let three = ModelFit::analyze(&model, &cluster_system(3, 3, v));
+        assert_eq!(three.fit_level, FitLevel::TooTight);
+        assert!(!three.fits_with_turboquant);
+        assert!(
+            three.notes.iter().any(|n| n
+                == "TP=3 invalid for this model (32 attention heads not divisible by 3) and no smaller valid split fits; pipeline-parallel layout needed (not yet modelled)"),
+            "notes: {:?}",
+            three.notes
+        );
+        // The refused split is not also described as the layout.
+        assert!(
+            !three
+                .notes
+                .iter()
+                .any(|n| n.starts_with("Cluster: tensor-parallel"))
+        );
+        // ...and the refusal is machine-readable, not just note text.
+        assert_eq!(three.tp_size, None);
+        let refusal = three.layout_refusal.as_ref().expect("refusal reason");
+        assert_eq!(refusal.reason, TpSplitError::AttentionHeadsNotDivisible);
+        assert_eq!(refusal.tp_size, 3);
+        assert_eq!(refusal.requires, RequiredLayout::PipelineParallel);
+        assert_eq!(
+            serde_json::to_value(refusal).unwrap(),
+            serde_json::json!({
+                "reason": "attention_heads_not_divisible",
+                "tp_size": 3,
+                "requires": "pipeline_parallel",
+                "message": "TP=3 invalid for this model (32 attention heads not divisible by 3) and no smaller valid split fits; pipeline-parallel layout needed (not yet modelled)",
+            })
+        );
+
+        // The KV-head rule is reported under its own code.
+        let v = vram_needing_three_gpus("70B");
+        let kv_bad = headed("70B", Some(24), Some(4));
+        let fit = ModelFit::analyze(&kv_bad, &cluster_system(3, 3, v));
+        assert_eq!(
+            fit.layout_refusal.map(|r| r.reason),
+            Some(TpSplitError::KvHeadsNotDivisible)
+        );
+    }
+
+    #[test]
+    fn invalid_full_split_is_never_a_turboquant_fit() {
+        // A model with real KV metadata, so TurboQuant's KV compression can
+        // matter. `heads` changes only the head split, not the memory.
+        let with_heads = |attn: u32| {
+            let mut m = headed("70B", Some(attn), Some(6));
+            m.num_hidden_layers = Some(80);
+            m.head_dim = Some(128);
+            m.context_length = 131_072;
+            m
+        };
+        // 24 attention heads split 3 ways; 32 do not (but 2 ways they do).
+        let valid = with_heads(24);
+        let invalid = with_heads(32);
+
+        // Find a 3-GPU cluster where the valid model is too tight at normal
+        // KV but fits with TurboQuant across all 3 GPUs. The memory is the
+        // same for both models, so without the layout guard the invalid
+        // model would be offered the same TurboQuant fit.
+        let v = (1..4000)
+            .map(|i| i as f64 * 0.05)
+            .find(|&v| {
+                let fit = ModelFit::analyze(&valid, &cluster_system(3, 3, v));
+                fit.fit_level == FitLevel::TooTight && fit.fits_with_turboquant
+            })
+            .expect("some VRAM fits only with TurboQuant on all 3 GPUs");
+
+        let fit = ModelFit::analyze(&invalid, &cluster_system(3, 3, v));
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert!(
+            !fit.fits_with_turboquant,
+            "TP=3 is refused for 32 heads, so no TurboQuant fit on it"
+        );
+        assert_eq!(fit.estimated_tps, 0.0);
+    }
+
+    #[test]
+    fn kv_heads_replicated_when_tp_exceeds_kv_heads() {
+        // With 2 KV heads at TP=8, vLLM gives every rank a copy of one KV
+        // head: the cluster holds 8 heads' worth of KV, the same as a model
+        // with 8 KV heads, not 2 heads' worth.
+        let with_kv = |kv: u32| {
+            let mut m = headed("7B", Some(32), Some(kv));
+            m.num_hidden_layers = Some(32);
+            m.head_dim = Some(128);
+            m.context_length = 262_144;
+            m
+        };
+        let system = cluster_system(2, 8, 80.0);
+        let gqa = ModelFit::analyze(&with_kv(2), &system);
+        let full = ModelFit::analyze(&with_kv(8), &system);
+        assert_eq!((gqa.tp_size, full.tp_size), (Some(8), Some(8)));
+        assert!(
+            (gqa.memory_required_gb - full.memory_required_gb).abs() < 1e-9,
+            "{} vs {}",
+            gqa.memory_required_gb,
+            full.memory_required_gb
+        );
+        let ctx = gqa.effective_context_length;
+        let one_copy = with_kv(2).kv_cache_gb(ctx, KvQuant::Fp16);
+        assert!(one_copy > 0.0);
+        assert!((kv_replication_extra_gb(&with_kv(2), 8, ctx) - one_copy * 3.0).abs() < 1e-9);
+        assert!(
+            gqa.notes
+                .iter()
+                .any(|n| n.starts_with("KV cache replicated: 2 KV heads across TP=8")),
+            "notes: {:?}",
+            gqa.notes
+        );
+
+        // The usable context follows the replicated per-token cost too:
+        // both hold 8 heads' worth of KV per token.
+        let small_pool = cluster_system(2, 8, 3.0);
+        let gqa_small = ModelFit::analyze(&with_kv(2), &small_pool);
+        let full_small = ModelFit::analyze(&with_kv(8), &small_pool);
+        assert!(gqa_small.usable_context < with_kv(2).context_length);
+        assert_eq!(gqa_small.usable_context, full_small.usable_context);
+
+        // When the copies leave no split with room, the verdict is TooTight
+        // and the memory figure includes them.
+        let tight = cluster_system(1, 8, 0.65);
+        let fit = ModelFit::analyze(&with_kv(2), &tight);
+        assert_eq!(fit.tp_size, None);
+        assert_eq!(fit.fit_level, FitLevel::TooTight, "notes: {:?}", fit.notes);
+        assert!(fit.memory_required_gb > fit.memory_available_gb);
+
+        // No replication when KV heads cover the ranks, or at TP=1.
+        assert_eq!(kv_replication_extra_gb(&with_kv(2), 2, ctx), 0.0);
+        assert_eq!(kv_replication_extra_gb(&with_kv(8), 8, ctx), 0.0);
+        assert_eq!(kv_replication_extra_gb(&with_kv(2), 1, ctx), 0.0);
+        assert!(
+            !full
+                .notes
+                .iter()
+                .any(|n| n.starts_with("KV cache replicated"))
+        );
+    }
+
+    #[test]
+    fn cluster_falls_back_to_largest_valid_tp_that_fits() {
+        // On 3 x 128 GB a 7B model with 32 heads can't use TP=3 but fits
+        // at TP=2, so it must fit, on 2 of the 3 GPUs.
+        let model = headed("7B", Some(32), Some(8));
+        let fit = ModelFit::analyze(&model, &cluster_system(3, 3, 128.0));
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(fit.memory_available_gb, 256.0);
+        assert!(
+            fit.notes.iter().any(|n| n
+                == "Cluster: tensor-parallel via vLLM (TP=2), one shard per GPU on 2 of 3 GPUs; TP=3 invalid for this model (32 attention heads not divisible by 3)"),
+            "notes: {:?}",
+            fit.notes
+        );
+
+        // 7 heads / 1 KV head: only TP=1 (or 7) splits; it fits on one GPU.
+        let odd = headed("7B", Some(7), Some(1));
+        let fit = ModelFit::analyze(&odd, &cluster_system(3, 3, 128.0));
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(fit.memory_available_gb, 128.0);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("single GPU") && n.contains("1 of 3 GPUs")),
+            "notes: {:?}",
+            fit.notes
+        );
+        // TP=1 is a plain single-GPU run: not labelled TP, and no TP speed
+        // factor.
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+        assert_eq!(fit.run_mode_text(), "GPU");
+        assert_eq!(fit.tp_size, Some(1));
+        assert!(!fit.notes.iter().any(|n| n.contains("tensor-parallel")));
+    }
+
+    #[test]
+    fn tp_guard_allows_gqa_kv_replication_when_tp_exceeds_kv_heads() {
+        // 32 attention heads, 2 KV heads: at TP=4 and TP=8 each KV head is
+        // replicated across ranks, which vLLM accepts.
+        let model = headed("7B", Some(32), Some(2));
+        assert_eq!(tensor_parallel_layout(&model, 4), TpLayout::Valid);
+        assert_eq!(tensor_parallel_layout(&model, 8), TpLayout::Valid);
+        let fit = ModelFit::analyze(&model, &cluster_system(2, 8, 80.0));
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+        assert!(fit.notes.iter().any(|n| n.contains("(TP=8)")));
+
+        // 3 KV heads at TP=2: neither divides the other, so it is refused
+        // even though the 12 attention heads split evenly.
+        let odd = headed("7B", Some(12), Some(3));
+        assert!(matches!(
+            tensor_parallel_layout(&odd, 2),
+            TpLayout::Invalid(TpSplitError::KvHeadsNotDivisible, r) if r.contains("KV heads")
+        ));
+    }
+
+    #[test]
+    fn tp_guard_handles_missing_head_metadata() {
+        let small = headed("7B", None, None);
+        assert_eq!(tensor_parallel_layout(&small, 3), TpLayout::Unverified);
+        // A single GPU has no split to check.
+        assert_eq!(tensor_parallel_layout(&small, 1), TpLayout::Valid);
+
+        // Fits on one GPU: a verified TP=1 fit, not an unverified TP=3 one.
+        let fit = ModelFit::analyze(&small, &cluster_system(3, 3, 128.0));
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+        assert!(!fit.notes.iter().any(|n| n.contains("layout unverified")));
+        assert!(fit.notes.iter().any(|n| n.contains("single GPU")
+            && n.contains("TP=3 unverified: attention-head counts unknown")));
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+
+        // Needs every GPU: keep the memory verdict, but say the split is
+        // unchecked.
+        let v = vram_needing_three_gpus("70B");
+        let big = headed("70B", None, None);
+        let fit = ModelFit::analyze(&big, &cluster_system(3, 3, v));
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.starts_with("TP=3 layout unverified")),
+            "notes: {:?}",
+            fit.notes
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // score_fit tests
     // ────────────────────────────────────────────────────────────────────
@@ -1537,54 +3163,309 @@ mod tests {
     #[test]
     fn test_score_fit_too_tight() {
         // Model doesn't fit
-        let fit = score_fit(10.0, 8.0, 16.0, RunMode::Gpu);
+        let fit = score_fit(10.0, 8.0, RunMode::Gpu);
         assert_eq!(fit, FitLevel::TooTight);
     }
 
     #[test]
     fn test_score_fit_gpu_perfect() {
-        // GPU with recommended memory met
-        let fit = score_fit(8.0, 16.0, 12.0, RunMode::Gpu);
+        // GPU at half the pool -> comfortably inside the Perfect band
+        let fit = score_fit(8.0, 16.0, RunMode::Gpu);
         assert_eq!(fit, FitLevel::Perfect);
     }
 
     #[test]
     fn test_score_fit_gpu_good() {
-        // GPU with good headroom but not recommended
-        let fit = score_fit(8.0, 10.0, 16.0, RunMode::Gpu);
+        // GPU at 80% of the pool -> Good
+        let fit = score_fit(8.0, 10.0, RunMode::Gpu);
         assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
     fn test_score_fit_gpu_marginal() {
-        // GPU with minimal headroom
-        let fit = score_fit(8.0, 8.5, 16.0, RunMode::Gpu);
+        // GPU at 94% of the pool -> Marginal
+        let fit = score_fit(8.0, 8.5, RunMode::Gpu);
         assert_eq!(fit, FitLevel::Marginal);
     }
 
     #[test]
-    fn test_score_fit_cpu_caps_at_marginal() {
-        // CPU-only never reaches Perfect
-        let fit = score_fit(4.0, 32.0, 8.0, RunMode::CpuOnly);
+    fn test_score_fit_cpu_comfortable_is_good() {
+        // CPU-only with comfortable headroom (4 GB of 32 GB) is runnable -> Good.
+        // The ratio alone would say Perfect; the run-mode cap holds it at Good.
+        let fit = score_fit(4.0, 32.0, RunMode::CpuOnly);
+        assert_eq!(fit, FitLevel::Good);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_tight_is_marginal() {
+        // CPU-only that only just fits stays Marginal — the cap lowers Perfect
+        // to Good but never lifts a tight fit.
+        let fit = score_fit(8.0, 8.5, RunMode::CpuOnly);
         assert_eq!(fit, FitLevel::Marginal);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_never_perfect() {
+        // Even with enormous headroom, CPU-only caps at Good (no GPU -> not Perfect).
+        let fit = score_fit(1.0, 64.0, RunMode::CpuOnly);
+        assert_ne!(fit, FitLevel::Perfect);
+        assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
     fn test_score_fit_cpu_offload_caps_at_good() {
         // CpuOffload with plenty of headroom caps at Good
-        let fit = score_fit(8.0, 16.0, 12.0, RunMode::CpuOffload);
+        let fit = score_fit(8.0, 16.0, RunMode::CpuOffload);
         assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
     fn test_score_fit_moe_offload() {
-        // MoE offload with good headroom
-        let fit = score_fit(6.0, 8.0, 12.0, RunMode::MoeOffload);
+        // MoE offload at 75% -> Good
+        let fit = score_fit(6.0, 8.0, RunMode::MoeOffload);
         assert_eq!(fit, FitLevel::Good);
 
         // MoE offload with tight fit
-        let fit_tight = score_fit(7.0, 7.5, 14.0, RunMode::MoeOffload);
+        let fit_tight = score_fit(7.0, 7.5, RunMode::MoeOffload);
         assert_eq!(fit_tight, FitLevel::Marginal);
+    }
+
+    // ── verdict = cap_for_run_mode(pure_ratio_verdict(ratio), run_mode) ──
+
+    #[test]
+    fn pure_ratio_verdict_band_boundaries_are_inclusive() {
+        // Each threshold belongs to the better verdict.
+        assert_eq!(pure_ratio_verdict(0.0), FitLevel::Perfect);
+        assert_eq!(
+            pure_ratio_verdict(FIT_PERFECT_MAX_RATIO),
+            FitLevel::Perfect,
+            "0.60 is still Perfect"
+        );
+        assert_eq!(pure_ratio_verdict(0.601), FitLevel::Good);
+        assert_eq!(
+            pure_ratio_verdict(FIT_GOOD_MAX_RATIO),
+            FitLevel::Good,
+            "0.85 is still Good"
+        );
+        assert_eq!(pure_ratio_verdict(0.851), FitLevel::Marginal);
+        assert_eq!(
+            pure_ratio_verdict(FIT_MARGINAL_MAX_RATIO),
+            FitLevel::Marginal,
+            "0.98 is still Marginal"
+        );
+    }
+
+    #[test]
+    fn pure_ratio_verdict_rejects_a_pool_filled_to_the_brim() {
+        // Above 0.98 there is no room for allocator slack, so it does not load
+        // even though required <= available.
+        assert_eq!(pure_ratio_verdict(0.99), FitLevel::TooTight);
+        assert_eq!(pure_ratio_verdict(1.0), FitLevel::TooTight);
+        assert_eq!(pure_ratio_verdict(2.5), FitLevel::TooTight);
+    }
+
+    #[test]
+    fn pure_ratio_verdict_treats_unknown_pool_as_too_tight() {
+        // An empty or unsized pool must not be reported as a fit.
+        assert_eq!(pure_ratio_verdict(f64::INFINITY), FitLevel::TooTight);
+        assert_eq!(pure_ratio_verdict(f64::NAN), FitLevel::TooTight);
+        assert_eq!(score_fit(4.0, 0.0, RunMode::Gpu), FitLevel::TooTight);
+    }
+
+    #[test]
+    fn best_quant_is_one_the_verdict_accepts() {
+        // On 24 GB, Q3_K_M of gemma-4-31B needs 23.7 GB (98.7%), above the
+        // Marginal ceiling. Picking it made a 24 GB card Too Tight while a
+        // 23 GB card got Q2_K / Marginal; 24 GB should get Q2_K too.
+        let db = models::ModelDatabase::embedded();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "google/gemma-4-31B-it")
+            .expect("catalog is missing google/gemma-4-31B-it")
+            .clone();
+
+        let fit_24 = ModelFit::analyze(
+            &model,
+            &test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090"),
+        );
+        assert_eq!(fit_24.run_mode, RunMode::Gpu);
+        assert_eq!(fit_24.best_quant, "Q2_K");
+        assert_eq!(fit_24.fit_level, FitLevel::Good);
+
+        let fit_23 = ModelFit::analyze(
+            &model,
+            &test_system_with_gpu(64.0, 23.0, "NVIDIA GeForce RTX 4090"),
+        );
+        assert_eq!(fit_23.best_quant, "Q2_K");
+        assert_eq!(fit_23.fit_level, FitLevel::Marginal);
+    }
+
+    #[test]
+    fn moe_offload_reports_the_quant_it_chose() {
+        // On 24 GB VRAM / 64 GB RAM (57.6 GB available, as `--ram 64G` sets it)
+        // the offload path fits Qwen3.5-122B-A10B at Q3_K_M (51.4 GB of experts
+        // in RAM). Best quant and the offloaded figure used to fall back to the
+        // default Q4_K_M (62.2 GB), more than the RAM available.
+        let db = models::ModelDatabase::embedded();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "Qwen/Qwen3.5-122B-A10B")
+            .expect("catalog is missing Qwen/Qwen3.5-122B-A10B")
+            .clone();
+        let mut system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        system.available_ram_gb = 57.6;
+
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.run_mode, RunMode::MoeOffload);
+        assert_eq!(fit.best_quant, "Q3_K_M");
+        let offloaded = fit.moe_offloaded_gb.expect("offloaded experts");
+        assert!(
+            offloaded <= system.available_ram_gb,
+            "offloaded {offloaded:.1} GB exceeds {:.1} GB of RAM",
+            system.available_ram_gb
+        );
+    }
+
+    #[test]
+    fn moe_offload_sizes_prequantized_models_at_their_own_quant() {
+        // Shaped like Qwen3.5-122B-A10B-AWQ: 120.5B total, 9.6B active.
+        let mut model = test_model("120.5B", 134.7, Some(123.5));
+        model.is_moe = true;
+        model.num_experts = Some(256);
+        model.active_experts = Some(8);
+        model.parameters_raw = Some(120_547_442_688);
+        model.active_parameters = Some(9_606_124_334);
+        model.format = models::ModelFormat::Awq;
+        let mut system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        system.available_ram_gb = 57.6;
+
+        // AWQ-4bit experts take ~51.6 GB of RAM, which fits.
+        model.quantization = "AWQ-4bit".to_string();
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.run_mode, RunMode::MoeOffload);
+        assert_eq!(fit.best_quant, "AWQ-4bit");
+        let offloaded = fit.moe_offloaded_gb.expect("offloaded experts");
+        let expected = model.moe_offloaded_ram_gb().unwrap();
+        assert!(
+            (offloaded - expected).abs() < 0.01,
+            "offloaded {offloaded:.1} GB, AWQ-4bit experts need {expected:.1} GB"
+        );
+
+        // AWQ-8bit experts need ~103 GB, more than the RAM available.
+        model.quantization = "AWQ-8bit".to_string();
+        let fit = ModelFit::analyze(&model, &system);
+        assert_ne!(fit.run_mode, RunMode::MoeOffload);
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+    }
+
+    #[test]
+    fn moe_gpu_fit_is_sized_at_the_quant_it_reports() {
+        // Qwen3-30B-A3B's catalog min_vram is 15.6 GB (Q4_K_M). The GPU path
+        // charged that figure whatever quant it picked: Q5_K_M on 24 GB and
+        // Q6_K on 28 GB were rated at 15.6 GB, and 15.6 GB itself was 100%.
+        let db = models::ModelDatabase::embedded();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "Qwen/Qwen3-30B-A3B")
+            .expect("catalog is missing Qwen/Qwen3-30B-A3B")
+            .clone();
+
+        for vram in [12.6, 15.6, 24.0, 28.0] {
+            let fit = ModelFit::analyze(
+                &model,
+                &test_system_with_gpu(64.0, vram, "NVIDIA GeForce RTX 4090"),
+            );
+            assert_eq!(fit.run_mode, RunMode::Gpu, "{vram} GB");
+            let need = model.estimate_memory_gb(&fit.best_quant, fit.effective_context_length);
+            let need_half =
+                model.estimate_memory_gb(&fit.best_quant, fit.effective_context_length / 2);
+            assert!(
+                (fit.memory_required_gb - need).abs() < 0.01
+                    || (fit.memory_required_gb - need_half).abs() < 0.01,
+                "{vram} GB: {} rated at {:.2} GB, it needs {need:.2} GB",
+                fit.best_quant,
+                fit.memory_required_gb
+            );
+            assert_ne!(fit.fit_level, FitLevel::TooTight, "{vram} GB");
+        }
+
+        // Unified memory: Qwen3.5-122B-A10B (min_vram 64.1 GB) fits a 64 GB
+        // pool at a lower quant instead of being Too Tight at the catalog figure.
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "Qwen/Qwen3.5-122B-A10B")
+            .expect("catalog is missing Qwen/Qwen3.5-122B-A10B")
+            .clone();
+        let mut system = test_system_with_gpu(64.0, 64.0, "NVIDIA GB10");
+        system.unified_memory = true;
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+        let need = model.estimate_memory_gb(&fit.best_quant, fit.effective_context_length);
+        assert!(
+            (fit.memory_required_gb - need).abs() < 0.01,
+            "{} rated at {:.2} GB, it needs {need:.2} GB",
+            fit.best_quant,
+            fit.memory_required_gb
+        );
+        assert_ne!(fit.fit_level, FitLevel::TooTight);
+    }
+
+    #[test]
+    fn cap_for_run_mode_only_lowers_perfect_on_non_gpu_paths() {
+        for level in [
+            FitLevel::Perfect,
+            FitLevel::Good,
+            FitLevel::Marginal,
+            FitLevel::TooTight,
+        ] {
+            // The two fully-GPU-resident paths pass every verdict through.
+            assert_eq!(cap_for_run_mode(level, RunMode::Gpu), level);
+            assert_eq!(cap_for_run_mode(level, RunMode::TensorParallel), level);
+
+            for mode in [RunMode::MoeOffload, RunMode::CpuOffload, RunMode::CpuOnly] {
+                let capped = cap_for_run_mode(level, mode);
+                assert_ne!(capped, FitLevel::Perfect, "{mode:?} must never be Perfect");
+                let expected = if level == FitLevel::Perfect {
+                    FitLevel::Good
+                } else {
+                    level
+                };
+                assert_eq!(capped, expected, "{mode:?} must not alter {level:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn verdict_ignores_recommended_ram() {
+        // recommended_ram_gb is a catalog-wide `size * 2.0` heuristic. Two
+        // models with the same footprint in the same pool must get the same
+        // verdict however far apart their recommended figures are.
+        let mut lean = test_model("7B", 4.0, Some(4.0));
+        lean.recommended_ram_gb = 4.0;
+        let mut greedy = test_model("7B", 4.0, Some(4.0));
+        greedy.recommended_ram_gb = 999.0;
+
+        let system = test_system(64.0, true, Some(24.0));
+        let lean_fit = ModelFit::analyze(&lean, &system);
+        let greedy_fit = ModelFit::analyze(&greedy, &system);
+
+        assert_eq!(lean_fit.memory_required_gb, greedy_fit.memory_required_gb);
+        assert_eq!(lean_fit.fit_level, greedy_fit.fit_level);
+        assert_eq!(greedy_fit.fit_level, FitLevel::Perfect);
+    }
+
+    #[test]
+    fn a_nearly_full_pool_is_not_perfect_however_low_recommended_is() {
+        // The old rule granted Perfect as soon as `recommended_ram_gb` was met,
+        // so a 23 GB model on a 24 GB card scored Perfect at 96% utilization —
+        // a pool that full does not actually load.
+        assert_eq!(score_fit(23.0, 24.0, RunMode::Gpu), FitLevel::Marginal);
+        // And at 83% it is Good, not Perfect.
+        assert_eq!(score_fit(20.0, 24.0, RunMode::Gpu), FitLevel::Good);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1613,8 +3494,10 @@ mod tests {
 
         // Should use CPU path
         assert_eq!(fit.run_mode, RunMode::CpuOnly);
-        // CPU-only caps at Marginal
-        assert_eq!(fit.fit_level, FitLevel::Marginal);
+        // CPU-only with comfortable headroom (7B in 16 GB) is runnable -> Good,
+        // and never Perfect (that requires a GPU).
+        assert_eq!(fit.fit_level, FitLevel::Good);
+        assert_ne!(fit.fit_level, FitLevel::Perfect);
     }
 
     #[test]
@@ -1658,6 +3541,112 @@ mod tests {
     }
 
     #[test]
+    fn test_prequantized_gpu_fit_has_no_insufficient_note() {
+        // A 4-bit AWQ model needing ~9 GB on a 24 GB card fits comfortably.
+        // Pre-quantized models can't be re-quantized, so the quant search has
+        // nothing to return — that must not be read as "doesn't fit".
+        let mut model = test_model("14B", 8.3, Some(7.6));
+        model.format = models::ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+        let system = test_system(32.0, true, Some(24.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+        assert!(matches!(fit.fit_level, FitLevel::Good | FitLevel::Perfect));
+        assert!(
+            !fit.notes
+                .iter()
+                .any(|n| n.contains("Insufficient VRAM and system RAM")),
+            "model that fits must not be flagged insufficient; notes: {:?}",
+            fit.notes
+        );
+    }
+
+    #[test]
+    fn test_prequantized_too_large_still_reports_insufficient() {
+        // The counterpart: a pre-quantized model that genuinely exceeds both
+        // VRAM and RAM must keep the warning.
+        let mut model = test_model("180B", 200.0, Some(180.0));
+        model.format = models::ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+        let system = test_system(16.0, true, Some(8.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("Insufficient VRAM and system RAM")),
+            "genuinely oversized model must keep the warning; notes: {:?}",
+            fit.notes
+        );
+    }
+
+    #[test]
+    fn test_prequantized_quant_budget_reports_own_footprint() {
+        let mut model = test_model("14B", 8.3, Some(7.6));
+        model.format = models::ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+
+        // Fits the budget -> reports the model's own fixed quant.
+        let got = best_quant_for_runtime_budget(&model, InferenceRuntime::Vllm, 24.0, 8192);
+        assert!(
+            got.is_some(),
+            "fitting pre-quantized model must report a quant"
+        );
+        assert_eq!(got.unwrap().0, "AWQ-4bit");
+
+        // Exceeds the budget -> None, as before.
+        assert!(best_quant_for_runtime_budget(&model, InferenceRuntime::Vllm, 1.0, 8192).is_none());
+    }
+
+    #[test]
+    fn test_autoround_fixed_quant_respects_memory_budget() {
+        let mut model = test_model("8B", 4.5, Some(4.5));
+        model.format = models::ModelFormat::Autoround;
+        for (quant, required_gb) in [("AutoRound-4bit", 4.5), ("AutoRound-8bit", 8.5)] {
+            model.quantization = quant.to_string();
+            // Full weights plus 0.5 GB overhead, without context-scaled KV cache.
+            let fitting =
+                best_quant_for_runtime_budget(&model, InferenceRuntime::Vllm, required_gb, 0)
+                    .expect("fixed quant fits at its required capacity");
+            assert_eq!(fitting, (quant.to_string(), required_gb));
+            assert!(
+                best_quant_for_runtime_budget(
+                    &model,
+                    InferenceRuntime::Vllm,
+                    required_gb - 0.1,
+                    0,
+                )
+                .is_none(),
+                "{quant} cannot fall back to a smaller quantization"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tts_requires_unsupported_runtime() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.quantization = "F16".to_string();
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+        let system = test_system(16.0, true, Some(8.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(fit.score, 0.0);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("specialized TTS runtime"))
+        );
+    }
+
+    #[test]
     fn test_moe_offload_tries_lower_quantization() {
         let model = LlmModel {
             name: "MoE Quant Test".to_string(),
@@ -1677,6 +3666,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1721,6 +3711,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1793,6 +3784,46 @@ mod tests {
         }
     }
 
+    // Scores are rounded and most of the catalog ties, so a tie must resolve
+    // the same way whatever order the rows arrive in. The database used to
+    // arrive in a per-process random order, which made `llmfit fit` swap
+    // ranks between two identical runs.
+    #[test]
+    fn test_rank_models_breaks_ties_by_name_regardless_of_input_order() {
+        let system = test_system(16.0, true, Some(10.0));
+        let fits: Vec<ModelFit> = ["org/zeta", "org/alpha", "org/mid"]
+            .iter()
+            .map(|name| {
+                let mut model = test_model("7B", 4.0, Some(4.0));
+                model.name = name.to_string();
+                ModelFit::analyze(&model, &system)
+            })
+            .collect();
+        assert!(
+            fits.windows(2).all(|w| w[0].score == w[1].score),
+            "fixture must tie on score"
+        );
+
+        let names =
+            |v: Vec<ModelFit>| -> Vec<String> { v.into_iter().map(|f| f.model.name).collect() };
+        let forward = names(rank_models_by_fit(fits.clone()));
+        let mut reversed_input = fits.clone();
+        reversed_input.reverse();
+        let reversed = names(rank_models_by_fit(reversed_input));
+
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, vec!["org/alpha", "org/mid", "org/zeta"]);
+
+        // Flipping the direction must not reshuffle a tie either.
+        let ascending = names(rank_models_by_fit_opts_col_dir(
+            fits,
+            false,
+            SortColumn::Score,
+            true,
+        ));
+        assert_eq!(ascending, forward);
+    }
+
     #[test]
     fn test_rank_models_separates_runnable_from_too_tight() {
         let model1 = test_model("7B", 4.0, Some(4.0));
@@ -1818,34 +3849,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_ascending_sort_keeps_too_tight_last() {
+        // Toggling direction must flip only the sort key. The TUI used to
+        // reverse the whole ranked list, which floated TooTight models to the
+        // top whenever ascending was selected.
+        let model1 = test_model("7B", 4.0, Some(4.0));
+        let model2 = test_model("70B", 40.0, Some(40.0));
+        let model3 = test_model("13B", 8.0, Some(8.0));
+
+        let system = test_system(16.0, true, Some(10.0));
+
+        let fits = vec![
+            ModelFit::analyze(&model2, &system), // TooTight
+            ModelFit::analyze(&model1, &system),
+            ModelFit::analyze(&model3, &system),
+        ];
+
+        let ranked = rank_models_by_fit_opts_col_dir(fits, false, SortColumn::Score, true);
+
+        assert_eq!(ranked.last().unwrap().fit_level, FitLevel::TooTight);
+        let runnable: Vec<_> = ranked
+            .iter()
+            .filter(|f| f.fit_level != FitLevel::TooTight)
+            .collect();
+        for i in 0..runnable.len() - 1 {
+            assert!(
+                runnable[i].score <= runnable[i + 1].score,
+                "ascending score violated: {} then {}",
+                runnable[i].score,
+                runnable[i + 1].score
+            );
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Scoring function tests
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_fit_score_sweet_spot() {
-        // Sweet spot: 50-80% utilization
-        let score = fit_score(6.0, 10.0);
-        assert!(score >= 95.0); // Should be near perfect
+        // Comfortable utilization (room to spare) is a perfect fit.
+        assert!((fit_score(6.5, 10.0) - 100.0).abs() < 0.01); // 65%
+        assert!((fit_score(6.0, 10.0) - 100.0).abs() < 0.01); // 60%
 
-        let score2 = fit_score(8.0, 10.0);
-        assert_eq!(score2, 100.0);
+        // Past the comfort point the smooth curve eases down instead of holding
+        // a flat 100 right up to the old 80% cliff.
+        let score2 = fit_score(8.0, 10.0); // 80%
+        assert!(score2 > 70.0 && score2 < 100.0);
     }
 
     #[test]
     fn test_fit_score_under_utilized() {
-        // Under-utilizing: still good but not optimal
-        let score = fit_score(2.0, 10.0);
-        assert!(score >= 60.0);
-        assert!(score < 100.0);
+        // Plenty of headroom is a good thing, not waste -- it stays a perfect
+        // fit rather than being penalized.
+        assert!((fit_score(2.0, 10.0) - 100.0).abs() < 0.01); // 20%
+        assert!((fit_score(5.0, 10.0) - 100.0).abs() < 0.01); // 50%
     }
 
     #[test]
     fn test_fit_score_tight() {
-        // Very tight fit
-        let score = fit_score(9.5, 10.0);
-        assert!(score >= 50.0);
-        assert!(score < 80.0);
+        // Very tight fit: still positive but well off the peak, and no longer
+        // pinned to the old flat 50 floor.
+        let score = fit_score(9.5, 10.0); // 95% utilization
+        assert!(score > 0.0 && score < 50.0);
+        // Smoothly monotonic as it tightens past the peak.
+        assert!(score < fit_score(8.5, 10.0));
+    }
+
+    #[test]
+    fn test_fit_score_smooth_no_cliffs() {
+        // Across the old 80% step boundary, neighbouring ratios stay close
+        // together instead of jumping 100 -> 70.
+        // Old step: 79% -> 100, 81% -> 70 (a 30-point cliff). The smooth curve
+        // keeps neighbours within a few points of each other.
+        let below = fit_score(7.9, 10.0);
+        let above = fit_score(8.1, 10.0);
+        assert!((below - above).abs() < 8.0);
     }
 
     #[test]
@@ -1972,6 +4052,77 @@ mod tests {
     }
 
     #[test]
+    fn test_quality_score_moe_uses_active_params() {
+        // 80B total / 3B active MoE: the base tier should follow the 3B active
+        // count (45 tier), not the 80B total (95 tier).
+        let mut moe = test_model("80B", 48.0, Some(48.0));
+        moe.active_parameters = Some(3_000_000_000);
+        let moe_score = quality_score(&moe, "Q4_K_M", UseCase::General);
+
+        // A plain 80B dense model (no active_parameters) keeps the top tier.
+        let dense = test_model("80B", 48.0, Some(48.0));
+        let dense_score = quality_score(&dense, "Q4_K_M", UseCase::General);
+
+        assert!(
+            dense_score > moe_score + 30.0,
+            "MoE (active 3B) {} should be far below dense 80B {}",
+            moe_score,
+            dense_score
+        );
+
+        // And it should land near a real 3B dense model's tier.
+        let small = test_model("3B", 2.0, Some(2.0));
+        let small_score = quality_score(&small, "Q4_K_M", UseCase::General);
+        assert!(
+            (moe_score - small_score).abs() < 0.01,
+            "MoE active-3B {} should match dense 3B {}",
+            moe_score,
+            small_score
+        );
+    }
+
+    #[test]
+    fn test_quality_score_recency_bonus() {
+        // Two otherwise-identical models; the newer one scores higher purely on
+        // its release date. months_since/current_year_month back the bonus, so
+        // we exercise the pure helper directly for determinism below.
+        let mut fresh = test_model("7B", 4.0, Some(4.0));
+        fresh.release_date = Some("2099-01-01".to_string()); // far future -> 0 months
+        let mut old = test_model("7B", 4.0, Some(4.0));
+        old.release_date = Some("2000-01-01".to_string()); // ancient -> no bonus
+
+        let fresh_score = quality_score(&fresh, "Q4_K_M", UseCase::General);
+        let old_score = quality_score(&old, "Q4_K_M", UseCase::General);
+        assert!(
+            fresh_score > old_score,
+            "fresh {} should beat old {}",
+            fresh_score,
+            old_score
+        );
+        // Fresh gets the full +3 on top of the no-bonus baseline of 70.
+        assert!((fresh_score - 73.0).abs() < 0.01, "Got {}", fresh_score);
+        assert!((old_score - 70.0).abs() < 0.01, "Got {}", old_score);
+    }
+
+    #[test]
+    fn test_months_since_is_deterministic() {
+        // Pure date math — no dependency on the system clock.
+        assert_eq!(months_since("2026-06-01", (2026, 6)), Some(0));
+        assert_eq!(months_since("2026-04-01", (2026, 6)), Some(2)); // < 3 -> +3
+        assert_eq!(months_since("2025-12-01", (2026, 6)), Some(6)); // < 9 -> +1.5
+        assert_eq!(months_since("2024-06-01", (2026, 6)), Some(24)); // old -> 0
+        assert_eq!(months_since("2099-01-01", (2026, 6)), Some(0)); // future clamps
+        assert_eq!(months_since("not-a-date", (2026, 6)), None);
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1)); // epoch
+        assert_eq!(civil_from_days(59), (1970, 3)); // 1970-03-01
+        assert_eq!(civil_from_days(20_454), (2026, 1)); // 2026-01-01
+    }
+
+    #[test]
     fn test_weighted_score_composition() {
         let components = ScoreComponents {
             quality: 80.0,
@@ -2061,6 +4212,352 @@ mod tests {
         assert!(capped.notes.iter().any(|n| n.contains("Context capped at")));
     }
 
+    // ── Estimate calibration against measured community benchmarks ──────
+
+    /// Build simulated SystemSpecs for a leaderboard hardware preset label
+    /// like "RTX 3090 (24 GB)" or "Apple M4 Max (128 GB)". Returns None for
+    /// presets the calibration can't model faithfully (e.g. "CPU Only",
+    /// where the CPU model — and thus memory bandwidth — is unknown).
+    fn specs_for_preset_label(label: &str) -> Option<SystemSpecs> {
+        let (name, rest) = label.split_once(" (")?;
+        let vram_gb: f64 = rest
+            .trim_end_matches(')')
+            .trim_end_matches(" GB")
+            .trim()
+            .parse()
+            .ok()?;
+        if name == "CPU Only" {
+            return None;
+        }
+        let unified = name.starts_with("Apple");
+        let backend = if unified {
+            GpuBackend::Metal
+        } else if name.starts_with("RX ") || name.contains("Radeon") {
+            GpuBackend::Rocm
+        } else {
+            GpuBackend::Cuda
+        };
+        // The estimator is bandwidth-driven: without a bandwidth entry for
+        // this GPU the replay would exercise the generic fallback and tell
+        // us nothing about the preset.
+        crate::hardware::gpu_memory_bandwidth_gbps(name)?;
+        let total_ram_gb = if unified {
+            vram_gb
+        } else {
+            (2.0 * vram_gb).max(32.0)
+        };
+        Some(SystemSpecs {
+            total_ram_gb,
+            available_ram_gb: total_ram_gb * 0.85,
+            total_cpu_cores: 16,
+            cpu_name: "calibration".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(vram_gb),
+            total_gpu_vram_gb: Some(vram_gb),
+            gpu_available_gb: None,
+            gpu_name: Some(name.to_string()),
+            gpu_count: 1,
+            unified_memory: unified,
+            backend,
+            gpus: vec![crate::hardware::GpuInfo {
+                name: name.to_string(),
+                vram_gb: Some(vram_gb),
+                backend,
+                count: 1,
+                unified_memory: unified,
+                free_vram_gb: None,
+                free_vram_per_card_gb: Vec::new(),
+                pcie_links: Vec::new(),
+            }],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        })
+    }
+
+    /// Replay every usable measurement in the embedded localmaxxing cache
+    /// through estimate_tps and check the estimator's overall accuracy.
+    ///
+    /// This is the estimate↔reality feedback loop (#112/#119): the cache is
+    /// refreshed weekly, so a drift in either the estimator or the real
+    /// world shows up here. The bounds are deliberately generous — the test
+    /// exists to catch egregious regressions (e.g. a 3× systematic bias like
+    /// #449), not to enforce per-row precision.
+    #[test]
+    fn test_estimate_tps_calibration_against_leaderboard() {
+        let db = crate::models::ModelDatabase::embedded();
+        let models = db.get_all_models();
+        let config = CalcConfig::default();
+
+        // (preset label, est/measured ratio)
+        let mut ratios: Vec<(String, f64)> = Vec::new();
+        let mut skipped_unknown_model = 0usize;
+
+        for label in crate::benchmarks::cached_preset_labels() {
+            let Some(specs) = specs_for_preset_label(label) else {
+                continue;
+            };
+            let Some(resp) = crate::benchmarks::cached_leaderboard_for_preset(label) else {
+                continue;
+            };
+            for row in &resp.rows {
+                let Some(measured) = row.tok_s_out.filter(|t| *t > 0.5) else {
+                    continue;
+                };
+                // Single-request generation throughput only: batched serving
+                // measures a different quantity than estimate_tps models.
+                if row.batch_size.unwrap_or(1) > 1 {
+                    continue;
+                }
+                // Draft-accelerated runs (speculative decoding / MTP) exceed
+                // the memory-bandwidth roofline plain autoregressive
+                // estimates model — e.g. 577 tok/s for a 9B on an 800 GB/s
+                // card. Comparing against them reads as a 3-4× estimator
+                // "bias" that isn't one.
+                if row.engine_flags.as_ref().is_some_and(|f| {
+                    f.spec_decoding.unwrap_or(false) || f.mtp_enabled.unwrap_or(false)
+                }) {
+                    continue;
+                }
+                let hf_id = row.hf_id();
+                if hf_id.is_empty() {
+                    continue;
+                }
+                let slug = crate::models::canonical_slug(hf_id);
+                let Some(model) = models
+                    .iter()
+                    .find(|m| crate::models::canonical_slug(&m.name) == slug)
+                else {
+                    skipped_unknown_model += 1;
+                    continue;
+                };
+                let quant = {
+                    let q = row.quantization();
+                    if q.is_empty() {
+                        model.quantization.clone()
+                    } else {
+                        q.to_string()
+                    }
+                };
+                let engine = row.engine_name().to_lowercase();
+                let runtime = if engine.contains("mlx") {
+                    InferenceRuntime::Mlx
+                } else if engine.contains("vllm") {
+                    InferenceRuntime::Vllm
+                } else {
+                    InferenceRuntime::LlamaCpp
+                };
+                // Pure-GPU rows only: offload splits depend on unknown
+                // per-run layer placement, so estimates aren't comparable.
+                let ctx = row
+                    .context_length
+                    .unwrap_or(4096)
+                    .min(DEFAULT_ESTIMATION_CTX);
+                let mem = model.estimate_memory_gb(&quant, ctx);
+                let fits_gpu =
+                    specs.unified_memory || specs.gpu_vram_gb.map(|v| mem <= v).unwrap_or(false);
+                if !fits_gpu {
+                    continue;
+                }
+                let est = estimate_tps(model, &quant, &specs, RunMode::Gpu, runtime, &config);
+                if est <= 0.0 {
+                    continue;
+                }
+                ratios.push((label.to_string(), est / measured));
+            }
+        }
+
+        assert!(
+            ratios.len() >= 15,
+            "calibration needs a workable sample; got {} rows \
+             ({skipped_unknown_model} skipped as not in catalog) — did the \
+             cache or catalog shrink drastically?",
+            ratios.len()
+        );
+
+        let mut sorted: Vec<f64> = ratios.iter().map(|(_, r)| *r).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        let (p10, median, p90) = (pct(0.10), pct(0.50), pct(0.90));
+
+        // Per-preset medians for the report.
+        let mut by_preset: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+        for (label, r) in &ratios {
+            by_preset.entry(label.clone()).or_default().push(*r);
+        }
+        println!(
+            "calibration: {} rows across {} presets ({} rows skipped: model not in catalog)",
+            ratios.len(),
+            by_preset.len(),
+            skipped_unknown_model
+        );
+        println!("  est/measured overall: p10={p10:.2} median={median:.2} p90={p90:.2}");
+        for (label, mut rs) in by_preset {
+            rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  {label}: n={} median={:.2}",
+                rs.len(),
+                rs[(rs.len() - 1) / 2]
+            );
+        }
+
+        // Guardrails: a median outside this band means a systematic bias
+        // approaching the #449 bug — investigate before loosening. Baseline
+        // when set (2026-07, 152 rows): median 0.87, per-preset 0.67–1.19.
+        assert!(
+            (0.5..=2.0).contains(&median),
+            "estimate_tps median est/measured ratio {median:.2} is outside \
+             [0.5, 2.0] — systematic estimator bias against {} measured runs",
+            ratios.len()
+        );
+    }
+
+    // ── Usable context (issue #621) ─────────────────────────────────────
+
+    #[test]
+    fn test_usable_context_constrained_by_tight_pool() {
+        // 7B model on a 10 GB card: weights leave a few GB for KV cache, so
+        // the usable context must land strictly below a 200k native window.
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 200_000;
+        let system = test_system(32.0, true, Some(10.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+        assert!(
+            fit.usable_context < model.context_length,
+            "usable {} should be below native {}",
+            fit.usable_context,
+            model.context_length
+        );
+        assert!(fit.usable_context > 0);
+        assert!(
+            fit.context_display().contains('\u{2192}'),
+            "{}",
+            fit.context_display()
+        );
+    }
+
+    #[test]
+    fn test_usable_context_stays_within_the_marginal_ceiling() {
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 200_000;
+        let system = test_system(32.0, true, Some(10.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+        let at_usable = model.estimate_memory_gb(&fit.best_quant, fit.usable_context);
+        let ratio = at_usable / fit.memory_available_gb;
+        assert!(
+            ratio <= FIT_MARGINAL_MAX_RATIO && ratio > 0.97,
+            "{} tokens use {ratio:.4} of the pool",
+            fit.usable_context
+        );
+        assert_ne!(
+            score_fit(at_usable, fit.memory_available_gb, fit.run_mode),
+            FitLevel::TooTight
+        );
+    }
+
+    #[test]
+    fn test_usable_context_uncapped_when_pool_is_ample() {
+        // Small window + huge pool: the full native window fits.
+        let mut model = test_model("7B", 4.0, Some(4.0));
+        model.context_length = 8192;
+        let system = test_system(128.0, true, Some(80.0));
+
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.usable_context, 8192);
+        assert_eq!(fit.context_display(), "8k");
+        assert!(!fit.context_severely_limited());
+    }
+
+    #[test]
+    fn test_usable_context_under_moe_offload_charges_only_active_experts() {
+        // 30B-A3B shape: 48 layers x 4 KV heads x 128 head dim, so FP16 KV is
+        // 2 * 4 * 128 * 48 * 2 B = 98,304 B (9.1553e-5 GiB) per token.
+        let mut model = test_model("30B", 17.0, Some(17.0));
+        model.is_moe = true;
+        model.num_experts = Some(128);
+        model.active_experts = Some(8);
+        model.parameters_raw = Some(30_000_000_000);
+        model.active_parameters = Some(3_000_000_000);
+        model.num_hidden_layers = Some(48);
+        model.num_key_value_heads = Some(4);
+        model.head_dim = Some(128);
+        model.context_length = 131_072;
+        let system = test_system_with_gpu(64.0, 8.0, "NVIDIA GeForce RTX 4090");
+
+        // Q8_0 experts (26.4 GB) sit in RAM; only the 3B active parameters
+        // are in VRAM: 3e9 * 1.05 B / 2^30 * 1.1 = 3.2270 GiB. KV gets the rest
+        // of 98% of the 8 GiB pool: (7.84 - 3.2270) / 9.1553e-5 = 50,385.9
+        // from unrounded inputs, floored to 50,385 tokens.
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.run_mode, RunMode::MoeOffload);
+        assert_eq!(fit.best_quant, "Q8_0");
+        assert_eq!(fit.usable_context, 50_385);
+
+        // The same model in a pool that holds every weight keeps charging the
+        // whole model: Q5_K_M is 30 * 0.68 = 20.4 GB of weights + 0.5 of
+        // overhead, so (23.52 - 20.9) / 9.1553e-5 = 28,617.
+        let system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+        assert_eq!(fit.best_quant, "Q5_K_M");
+        assert_eq!(fit.usable_context, 28_617);
+    }
+
+    #[test]
+    fn test_hybrid_layout_increases_usable_context_from_attention_fraction() {
+        let mut dense = test_model("7B", 4.0, Some(4.0));
+        dense.context_length = 200_000;
+        dense.num_hidden_layers = Some(40);
+        dense.num_key_value_heads = Some(8);
+        dense.head_dim = Some(128);
+
+        let mut hybrid = dense.clone();
+        hybrid.attention_layout = Some(models::AttentionLayout {
+            full: 10,
+            linear: 30,
+        });
+        let system = test_system(32.0, true, Some(8.0));
+
+        let dense_fit = ModelFit::analyze(&dense, &system);
+        let hybrid_fit = ModelFit::analyze(&hybrid, &system);
+        assert!(
+            hybrid_fit.usable_context >= dense_fit.usable_context.saturating_mul(3),
+            "hybrid usable context {} should be much larger than dense {}",
+            hybrid_fit.usable_context,
+            dense_fit.usable_context
+        );
+    }
+
+    #[test]
+    fn test_ctx_sort_uses_usable_context() {
+        // Big-window model that can't use it vs small-window model that can:
+        // on a tight system the honest ranking puts the achievable context
+        // first when sorting by Ctx.
+        let mut big_window = test_model("13B", 8.0, Some(8.0));
+        big_window.context_length = 262_144;
+        big_window.name = "big-window".into();
+        let mut small_window = test_model("1B", 1.0, Some(1.0));
+        small_window.context_length = 32_768;
+        small_window.name = "small-window".into();
+        let system = test_system(16.0, true, Some(10.0));
+
+        let fits = rank_models_by_fit_opts_col(
+            vec![
+                ModelFit::analyze(&big_window, &system),
+                ModelFit::analyze(&small_window, &system),
+            ],
+            false,
+            SortColumn::Ctx,
+        );
+        assert!(
+            fits[0].usable_context >= fits[1].usable_context,
+            "sorted by usable: {} then {}",
+            fits[0].usable_context,
+            fits[1].usable_context
+        );
+    }
+
     #[test]
     fn test_estimate_tps_run_mode_penalties() {
         let model = test_model("7B", 4.0, Some(4.0));
@@ -2098,6 +4595,231 @@ mod tests {
         // All should be positive
         assert!(tps_gpu > 0.0);
         assert!(tps_cpu > 0.0);
+    }
+
+    #[test]
+    fn dense_cpu_offload_tracks_ddr_bandwidth() {
+        // 30B Q4 weights are 15 GB; 8 GB VRAM cannot hold them after KV and
+        // the 0.5 GB overhead, so part of each token is read from DDR.
+        let model = test_model("30B", 20.0, Some(20.0));
+        let system = test_system_with_gpu(128.0, 8.0, "NVIDIA GeForce RTX 4090");
+        let slow = CalcConfig {
+            ddr_bandwidth_gbps: Some(20.0),
+            ..test_config()
+        };
+        let fast = CalcConfig {
+            ddr_bandwidth_gbps: Some(80.0),
+            ..test_config()
+        };
+
+        let tps_slow = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::CpuOffload,
+            InferenceRuntime::LlamaCpp,
+            &slow,
+        );
+        let tps_fast = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::CpuOffload,
+            InferenceRuntime::LlamaCpp,
+            &fast,
+        );
+        assert!(
+            tps_fast > tps_slow,
+            "faster DDR should raise dense offload tok/s: slow={tps_slow} fast={tps_fast}"
+        );
+    }
+
+    #[test]
+    fn dense_cpu_offload_applies_calibrated_cpu_offload_factor() {
+        // Same split as `dense_cpu_offload_tracks_ddr_bandwidth`: part of each
+        // token is read from DDR on a known GPU.
+        let model = test_model("30B", 20.0, Some(20.0));
+        let system = test_system_with_gpu(128.0, 8.0, "NVIDIA GeForce RTX 4090");
+        let with_factor = |cpu_offload: f64| {
+            let config = CalcConfig {
+                ddr_bandwidth_gbps: Some(40.0),
+                run_mode_factors: RunModeFactors {
+                    cpu_offload,
+                    ..RunModeFactors::default()
+                },
+                ..test_config()
+            };
+            estimate_tps(
+                &model,
+                "Q4_K_M",
+                &system,
+                RunMode::CpuOffload,
+                InferenceRuntime::LlamaCpp,
+                &config,
+            )
+        };
+
+        let default_tps = with_factor(RunModeFactors::default().cpu_offload);
+        let low_tps = with_factor(0.25);
+        let high_tps = with_factor(1.0);
+        assert!(
+            low_tps < default_tps && default_tps < high_tps,
+            "a calibrated cpu_offload factor must move the known-GPU estimate: \
+             low={low_tps} default={default_tps} high={high_tps}"
+        );
+    }
+
+    #[test]
+    fn dense_cpu_offload_matches_gpu_when_weights_fit() {
+        // No layer count, so the split is exact bytes. 24 GB holds every
+        // weight byte of a 7B Q4 model after KV and the 0.5 GB overhead.
+        let model = test_model("7B", 4.0, Some(4.0));
+        assert!(model.num_hidden_layers.is_none());
+        let system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let config = test_config();
+
+        let gpu = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &config,
+        );
+        let offload = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::CpuOffload,
+            InferenceRuntime::LlamaCpp,
+            &config,
+        );
+        assert!(
+            (gpu - offload).abs() < 1e-9,
+            "a zero RAM share must match the GPU roofline: gpu={gpu} offload={offload}"
+        );
+    }
+
+    #[test]
+    fn dense_cpu_offload_layer_floor_leaves_more_on_ram() {
+        let mut byte_model = test_model("40B", 24.0, Some(24.0));
+        byte_model.context_length = 4096;
+        let mut layer_model = byte_model.clone();
+        layer_model.num_hidden_layers = Some(10);
+
+        let weight_gb = byte_model.params_b() * models::quant_bytes_per_param("Q4_K_M");
+        let ctx = byte_model.context_length.min(DEFAULT_ESTIMATION_CTX);
+        let kv = byte_model.kv_cache_gb(ctx, KvQuant::Fp16);
+        // 2.5 layer-slices of weight budget after the KV and 0.5 GB reservation.
+        let vram = 2.5 * (weight_gb / 10.0) + kv + 0.5;
+        let system = test_system_with_gpu(128.0, vram, "NVIDIA GeForce RTX 4090");
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(40.0),
+            ..test_config()
+        };
+
+        let byte_tps = estimate_tps(
+            &byte_model,
+            "Q4_K_M",
+            &system,
+            RunMode::CpuOffload,
+            InferenceRuntime::LlamaCpp,
+            &config,
+        );
+        let layer_tps = estimate_tps(
+            &layer_model,
+            "Q4_K_M",
+            &system,
+            RunMode::CpuOffload,
+            InferenceRuntime::LlamaCpp,
+            &config,
+        );
+        assert!(
+            layer_tps < byte_tps,
+            "flooring to whole layers should leave more bytes on RAM: \
+             layer={layer_tps} byte={byte_tps}"
+        );
+    }
+
+    #[test]
+    fn gpu_resident_estimate_ignores_ddr() {
+        let model = test_model("7B", 4.0, Some(4.0));
+        let system = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let slow = CalcConfig {
+            ddr_bandwidth_gbps: Some(20.0),
+            ..test_config()
+        };
+        let fast = CalcConfig {
+            ddr_bandwidth_gbps: Some(80.0),
+            ..test_config()
+        };
+
+        let gpu_slow = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &slow,
+        );
+        let gpu_fast = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &system,
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &fast,
+        );
+        assert!(
+            (gpu_slow - gpu_fast).abs() < 1e-9,
+            "GPU-resident tok/s must not move with DDR: slow={gpu_slow} fast={gpu_fast}"
+        );
+
+        let fit = ModelFit::analyze_with_config(&model, &system, slow);
+        assert_eq!(fit.run_mode, RunMode::Gpu);
+        assert_eq!(fit.estimate_basis.method, "gpu_bandwidth_roofline");
+        assert_eq!(fit.estimate_basis.ddr_bandwidth_gbps, None);
+    }
+
+    #[test]
+    fn moe_offload_basis_stays_on_the_gpu_roofline() {
+        let model = test_moe_model(3.3);
+        let system = test_system_with_gpu(64.0, 8.0, "NVIDIA GeForce RTX 4090");
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(50.0),
+            ..CalcConfig::default()
+        };
+        let fit = ModelFit::analyze_with_config(&model, &system, config);
+
+        assert_eq!(fit.run_mode, RunMode::MoeOffload);
+        assert_eq!(fit.estimate_basis.method, "gpu_bandwidth_roofline");
+        assert_eq!(fit.estimate_basis.ddr_bandwidth_gbps, Some(50.0));
+    }
+
+    #[test]
+    fn dense_spill_records_gpu_ddr_offload_basis() {
+        let model = test_model("30B", 20.0, Some(20.0));
+        let system = test_system_with_gpu(128.0, 8.0, "NVIDIA GeForce RTX 4090");
+        let config = CalcConfig {
+            ddr_bandwidth_gbps: Some(64.0),
+            ..CalcConfig::default()
+        };
+        let fit = ModelFit::analyze_with_config(&model, &system, config);
+
+        assert_eq!(fit.run_mode, RunMode::CpuOffload);
+        assert_eq!(fit.estimate_basis.method, "gpu_ddr_offload_roofline");
+        assert_eq!(fit.estimate_basis.ddr_bandwidth_gbps, Some(64.0));
+    }
+
+    #[test]
+    fn unknown_gpu_dense_offload_stays_on_the_constant_fallback() {
+        let model = test_model("13B", 8.0, Some(8.0));
+        let system = test_system(32.0, true, Some(4.0));
+        let fit = ModelFit::analyze_with_config(&model, &system, test_config());
+
+        assert_eq!(fit.run_mode, RunMode::CpuOffload);
+        assert_eq!(fit.estimate_basis.method, "backend_constant");
+        assert_eq!(fit.estimate_basis.ddr_bandwidth_gbps, None);
     }
 
     #[test]
@@ -2227,6 +4949,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(vram),
             total_gpu_vram_gb: Some(vram),
+            gpu_available_gb: None,
             gpu_name: Some(gpu_name.to_string()),
             gpu_count: 1,
             unified_memory: false,
@@ -2389,6 +5112,32 @@ mod tests {
     }
 
     #[test]
+    fn test_mlx_community_repo_is_apple_only() {
+        // mlx-community conversions carry no "-MLX" marker in their names.
+        let mut model = test_model("3B", 2.0, Some(2.0));
+        model.name = "mlx-community/Llama-3.2-3B-Instruct-4bit".to_string();
+        assert!(model.is_mlx_only());
+
+        let cuda_sys = test_system(64.0, true, Some(24.0));
+        assert!(!backend_compatible(&model, &cuda_sys));
+
+        let mut metal_sys = test_system(64.0, true, Some(64.0));
+        metal_sys.backend = GpuBackend::Metal;
+        metal_sys.unified_memory = true;
+        assert!(backend_compatible(&model, &metal_sys));
+    }
+
+    #[test]
+    fn test_tts_backend_incompatible_until_runtime_supported() {
+        let mut model = test_model("82M", 1.0, Some(0.5));
+        model.format = models::ModelFormat::Safetensors;
+        model.capabilities = vec![models::Capability::Audio, models::Capability::Tts];
+
+        let cuda_sys = test_system(64.0, true, Some(24.0));
+        assert!(!backend_compatible(&model, &cuda_sys));
+    }
+
+    #[test]
     fn test_awq_incompatible_on_volta_v100() {
         // V100 is Volta (cc 7.0) — AWQ requires cc >= 7.5
         let mut model = test_model("7B", 4.0, Some(4.0));
@@ -2433,8 +5182,8 @@ mod tests {
     }
 
     #[test]
-    fn test_awq_on_rocm_always_compatible() {
-        // ROCm GPUs don't have NVIDIA compute capability — assume compatible
+    fn test_awq_on_rocm_discrete_gpu_compatible() {
+        // ROCm does not use the CUDA compute capability check.
         let mut model = test_model("7B", 4.0, Some(4.0));
         model.format = models::ModelFormat::Awq;
         model.quantization = "AWQ-4bit".to_string();
@@ -2442,6 +5191,55 @@ mod tests {
         let mut rocm_sys = test_system_with_gpu(64.0, 24.0, "AMD Instinct MI300X");
         rocm_sys.backend = GpuBackend::Rocm;
         assert!(backend_compatible(&model, &rocm_sys));
+    }
+
+    #[test]
+    fn test_nvfp4_on_rocm_is_unsupported_for_all_gpu_names() {
+        let model = nvfp4_named_awq_model();
+        for gpu_name in [
+            "AMD Radeon 780M Graphics",
+            "AMD Radeon(TM) Graphics",
+            "AMD Instinct MI300X",
+            "AMD Instinct MI350X",
+            "AMD Radeon RX 7900 XTX",
+        ] {
+            let mut machine = test_system_with_gpu(32.0, 4.0, gpu_name);
+            machine.backend = GpuBackend::Rocm;
+            assert_eq!(
+                kernel_support(&model, &machine),
+                QuantKernelSupport::Unsupported
+            );
+            assert!(!backend_compatible(&model, &machine));
+        }
+        let mut high_uma = test_system_with_gpu(64.0, 16.0, "AMD Radeon 780M Graphics");
+        high_uma.backend = GpuBackend::Rocm;
+        assert!(!backend_compatible(&model, &high_uma));
+        high_uma.gpu_name = None;
+        assert!(!backend_compatible(&model, &high_uma));
+    }
+
+    #[test]
+    fn test_other_prequantized_formats_on_rocm_remain_eligible() {
+        // These assertions check that the NVFP4 gate leaves other formats unchanged.
+        // They do not establish ROCm runtime support for every AWQ or GPTQ implementation.
+        let model = nvfp4_named_awq_model();
+        let mut rocm = test_system_with_gpu(64.0, 24.0, "AMD Instinct MI300X");
+        rocm.backend = GpuBackend::Rocm;
+        let mut awq = model.clone();
+        awq.name = "example/standard-awq".to_string();
+        assert_eq!(kernel_support(&awq, &rocm), QuantKernelSupport::Unknown);
+        assert!(backend_compatible(&awq, &rocm));
+
+        let mut gptq = awq.clone();
+        gptq.format = models::ModelFormat::Gptq;
+        gptq.quantization = "GPTQ-Int4".to_string();
+        assert_eq!(kernel_support(&gptq, &rocm), QuantKernelSupport::Unknown);
+        assert!(backend_compatible(&gptq, &rocm));
+
+        let mut mxfp4 = awq;
+        mxfp4.name = "amd/example-MXFP4-AWQ".to_string();
+        assert_eq!(kernel_support(&mxfp4, &rocm), QuantKernelSupport::Unknown);
+        assert!(backend_compatible(&mxfp4, &rocm));
     }
 
     #[test]
@@ -2453,6 +5251,230 @@ mod tests {
 
         let p100_sys = test_system_with_gpu(64.0, 16.0, "Tesla P100");
         assert!(!backend_compatible(&model, &p100_sys));
+    }
+
+    /// The issue #1084 repo: catalog quantization `AWQ-4bit`, but the name
+    /// declares NVFP4, whose kernels need Blackwell.
+    fn nvfp4_named_awq_model() -> LlmModel {
+        let mut model = test_model("27B", 16.0, Some(16.0));
+        model.name = "TelperionAI/Qwen3.8-27B-NVFP4-AWQ-AutoRound".to_string();
+        model.format = models::ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+        model
+    }
+
+    #[test]
+    fn test_nvfp4_named_repo_uses_fp4_requirement_not_catalog_awq() {
+        let model = nvfp4_named_awq_model();
+
+        // Ampere passes the AWQ gate (Turing+) but is only an FP4 fallback.
+        let ampere = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 3080 Ti");
+        assert!(backend_compatible(&model, &ampere));
+        assert_eq!(
+            kernel_support(&model, &ampere),
+            QuantKernelSupport::Fallback
+        );
+
+        // Blackwell runs NVFP4 natively.
+        let blackwell = test_system_with_gpu(64.0, 32.0, "NVIDIA GeForce RTX 5090");
+        assert!(backend_compatible(&model, &blackwell));
+        assert_eq!(
+            kernel_support(&model, &blackwell),
+            QuantKernelSupport::Native
+        );
+
+        // Volta is below the Marlin FP4 floor: dropped like AWQ already is.
+        let volta = test_system_with_gpu(64.0, 32.0, "Tesla V100-PCIE-16GB");
+        assert!(!backend_compatible(&model, &volta));
+        assert_eq!(
+            kernel_support(&model, &volta),
+            QuantKernelSupport::Unsupported
+        );
+    }
+
+    /// The v1.1.19 Framework repro: a native NVFP4 safetensors repo the
+    /// catalog records as `gguf` / `Q4_K_M` with no GGUF sources ranked #1 on
+    /// ROCm as a llama.cpp GGUF fit. It is a vLLM pre-quantized repo: hidden
+    /// where NVFP4 cannot run, vLLM (never llama.cpp) where it can.
+    fn nvfp4_repo_catalogued_as_gguf() -> LlmModel {
+        let mut model = test_model("4.7B", 2.6, Some(2.4));
+        model.name = "PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor".to_string();
+        model.format = models::ModelFormat::Gguf;
+        model.quantization = "Q4_K_M".to_string();
+        model.gguf_sources.clear();
+        model
+    }
+
+    #[test]
+    fn test_nvfp4_repo_catalogued_as_gguf_is_not_a_llamacpp_fit() {
+        let model = nvfp4_repo_catalogued_as_gguf();
+        assert!(model.is_prequantized());
+
+        let mut strix = test_system_with_gpu(126.0, 126.0, "AMD Radeon 8060S");
+        strix.backend = GpuBackend::Rocm;
+        strix.unified_memory = true;
+        assert!(
+            !backend_compatible(&model, &strix),
+            "NVFP4 cannot run on ROCm"
+        );
+
+        let blackwell = test_system_with_gpu(64.0, 32.0, "NVIDIA GeForce RTX 5090");
+        assert!(backend_compatible(&model, &blackwell));
+        let fit = ModelFit::analyze(&model, &blackwell);
+        assert_eq!(fit.runtime, InferenceRuntime::Vllm);
+        assert!(
+            !models::is_gguf_quant_label(&fit.best_quant),
+            "no GGUF quant label for an NVFP4 repo: {}",
+            fit.best_quant
+        );
+        assert_eq!(fit.best_quant, "NVFP4");
+        // Only the reported format changes: nothing was chosen, so no
+        // "best quantization" note, and sizing/speed/score match the same
+        // weights filed as any other pre-quantized repo.
+        assert!(
+            !fit.notes.iter().any(|n| n.starts_with("Best quantization")),
+            "{:?}",
+            fit.notes
+        );
+        let mut as_autoround = model.clone();
+        as_autoround.format = models::ModelFormat::Autoround;
+        let reference = ModelFit::analyze(&as_autoround, &blackwell);
+        assert_eq!(fit.memory_required_gb, reference.memory_required_gb);
+        assert_eq!(fit.estimated_tps, reference.estimated_tps);
+
+        // A scraped config-only NVFP4 label (name without the tag) counts too.
+        let mut labelled = model.clone();
+        labelled.name = "example/Qwen3-8B-PreTensor".to_string();
+        labelled.quantization = "NVFP4".to_string();
+        assert!(labelled.is_prequantized());
+        assert!(!backend_compatible(&labelled, &strix));
+    }
+
+    #[test]
+    fn test_real_gguf_and_mlx_fp4_repos_keep_their_runtime() {
+        let base = nvfp4_repo_catalogued_as_gguf();
+        let mut strix = test_system_with_gpu(126.0, 126.0, "AMD Radeon 8060S");
+        strix.backend = GpuBackend::Rocm;
+
+        // A llama.cpp MXFP4 GGUF repo stays a llama.cpp fit.
+        let mut gguf = base.clone();
+        gguf.name = "example/gpt-oss-120b-MXFP4_MOE-GGUF".to_string();
+        assert!(!gguf.is_prequantized());
+        assert!(backend_compatible(&gguf, &strix));
+        assert_eq!(
+            ModelFit::analyze(&gguf, &strix).runtime,
+            InferenceRuntime::LlamaCpp
+        );
+
+        // So does an FP4-named entry that lists GGUF conversions.
+        let mut sourced = base.clone();
+        sourced.gguf_sources = vec![models::GgufSource {
+            repo: "example/Qwen3-8B-GGUF".to_string(),
+            provider: "example".to_string(),
+        }];
+        assert!(!sourced.is_prequantized());
+
+        // gpt-oss fine-tunes named MXFP4 keep OpenAI's checkpoint format,
+        // which llama.cpp converts natively, like openai/gpt-oss-20b itself.
+        let mut gpt_oss = base.clone();
+        gpt_oss.name = "DavidAU/OpenAI-gpt-oss-20B-INSTRUCT-Heretic-Uncensored-MXFP4".to_string();
+        gpt_oss.architecture = Some("gpt_oss".to_string());
+        assert!(!gpt_oss.is_prequantized());
+        assert!(backend_compatible(&gpt_oss, &strix));
+
+        // ...but an explicit NVFP4 config on a gpt-oss repack is vLLM-only.
+        let mut gpt_oss_nvfp4 = gpt_oss.clone();
+        gpt_oss_nvfp4.name = "owner/gpt-oss-20b-modelopt".to_string();
+        gpt_oss_nvfp4.quantization = "NVFP4".to_string();
+        assert!(!gpt_oss_nvfp4.is_mxfp4_native());
+        assert!(gpt_oss_nvfp4.is_prequantized());
+        assert!(!backend_compatible(&gpt_oss_nvfp4, &strix));
+
+        // MLX builds are left to the MLX gate.
+        let mut mlx = base;
+        mlx.name = "mlx-community/Qwen3-8B-mxfp4".to_string();
+        mlx.format = models::ModelFormat::Mlx;
+        assert!(!mlx.is_prequantized());
+    }
+
+    #[test]
+    fn test_mxfp4_named_prequantized_repo_dropped_on_turing() {
+        // Marlin MXFP4 excludes Turing, so unlike NVFP4 a T4 cannot load it.
+        let mut model = nvfp4_named_awq_model();
+        model.name = "amd/MiniMax-M2.1-MXFP4-AWQ".to_string();
+        let turing = test_system_with_gpu(64.0, 16.0, "Tesla T4");
+        assert!(!backend_compatible(&model, &turing));
+        let ampere = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 3090");
+        assert!(backend_compatible(&model, &ampere));
+        assert_eq!(
+            kernel_support(&model, &ampere),
+            QuantKernelSupport::Fallback
+        );
+    }
+
+    #[test]
+    fn test_kernel_support_unknown_without_a_known_gpu_restriction() {
+        let mut model = nvfp4_named_awq_model();
+        model.name = "example/standard-awq".to_string();
+        let mut rocm = test_system_with_gpu(64.0, 24.0, "AMD Instinct MI300X");
+        rocm.backend = GpuBackend::Rocm;
+        assert_eq!(kernel_support(&model, &rocm), QuantKernelSupport::Unknown);
+        assert!(backend_compatible(&model, &rocm));
+
+        // A GGUF repo whose name mentions MXFP4 (gpt-oss builds) runs through
+        // llama.cpp and never reaches the vLLM kernel gate.
+        let mut gguf = test_model("20B", 12.0, Some(12.0));
+        gguf.name = "ggml-org/gpt-oss-20b-MXFP4-GGUF".to_string();
+        let turing = test_system_with_gpu(64.0, 16.0, "Tesla T4");
+        assert_eq!(kernel_support(&gguf, &turing), QuantKernelSupport::Unknown);
+        assert!(backend_compatible(&gguf, &turing));
+    }
+
+    #[test]
+    fn test_fallback_kernel_path_is_penalized_and_annotated() {
+        let model = nvfp4_named_awq_model();
+        // Same weights, same catalog quant, same family, same GPU: the only
+        // difference is the FP4 token in the name, so the score gap is exactly
+        // the kernel penalty rather than anything the GPU bandwidth table adds.
+        let mut plain_awq = model.clone();
+        plain_awq.name = "TelperionAI/Qwen3.8-27B-AWQ-AutoRound".to_string();
+        let ampere = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 3080 Ti");
+        let blackwell = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 5090");
+
+        let fallback = ModelFit::analyze_with_config(&model, &ampere, test_config());
+        let awq_native = ModelFit::analyze_with_config(&plain_awq, &ampere, test_config());
+        let native = ModelFit::analyze_with_config(&model, &blackwell, test_config());
+
+        assert_eq!(fallback.runtime, InferenceRuntime::Vllm);
+        assert_eq!(
+            kernel_support(&plain_awq, &ampere),
+            QuantKernelSupport::Native
+        );
+        assert!(
+            (awq_native.score - fallback.score - KERNEL_FALLBACK_SCORE_PENALTY).abs() < 1e-9,
+            "fallback {} should be exactly {} below the plain AWQ copy {}",
+            fallback.score,
+            KERNEL_FALLBACK_SCORE_PENALTY,
+            awq_native.score
+        );
+        let note = fallback
+            .notes
+            .iter()
+            .find(|n| n.contains("weight-only fallback"))
+            .expect("fallback path should explain itself in notes");
+        assert!(note.contains("NVFP4"), "note names the format: {note}");
+        assert!(
+            note.contains("Blackwell"),
+            "note names the native arch: {note}"
+        );
+        assert!(note.contains("RTX 3080 Ti"), "note names the GPU: {note}");
+        assert!(
+            !native
+                .notes
+                .iter()
+                .any(|n| n.contains("weight-only fallback")),
+            "native path must not carry the fallback note"
+        );
     }
 
     #[test]
@@ -2487,6 +5509,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2716,7 +5739,9 @@ mod tests {
         // Small VRAM to force MoE offload path
         let system = test_system_with_gpu(64.0, 8.0, "NVIDIA GeForce RTX 4090");
 
-        let fit = ModelFit::analyze(&model, &system);
+        // Pinned DDR bandwidth: the auto-measured value would make this
+        // machine-dependent.
+        let fit = ModelFit::analyze_with_config(&model, &system, test_config());
 
         assert!(
             matches!(fit.run_mode, RunMode::MoeOffload),
@@ -2772,6 +5797,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2797,6 +5823,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(16.0),
             total_gpu_vram_gb: Some(16.0),
+            gpu_available_gb: None,
             gpu_name: Some("AMD Radeon RX 6900 XT".to_string()),
             gpu_count: 1,
             unified_memory: false,
@@ -3055,6 +6082,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: models::ModelFormat::default(),
             num_attention_heads: Some(num_attention_heads),
             num_key_value_heads: Some(num_key_value_heads),
@@ -3178,5 +6206,1044 @@ mod tests {
                 ratio,
             );
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // resolve_gpu_bandwidth
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_gpu_bandwidth_prefers_the_config_override() {
+        // The override exists so an unrecognized GPU can still get a roofline
+        // estimate, and so a fixture can pin bandwidth without naming hardware.
+        let system = rx6900xt_system();
+        let table_value = resolve_gpu_bandwidth(&system, &CalcConfig::default());
+        assert_eq!(table_value, Some(512.0), "RX 6900 XT is in the name table");
+
+        let config = CalcConfig {
+            gpu_bandwidth_gbps_override: Some(256.0),
+            ..CalcConfig::default()
+        };
+        assert_eq!(resolve_gpu_bandwidth(&system, &config), Some(256.0));
+    }
+
+    #[test]
+    fn resolve_gpu_bandwidth_falls_back_to_the_name_table_then_none() {
+        // Unknown GPU with no override -> None, so the caller drops to the
+        // per-backend constant rather than inventing a bandwidth.
+        let unknown = test_system(16.0, true, Some(8.0));
+        assert_eq!(
+            resolve_gpu_bandwidth(&unknown, &CalcConfig::default()),
+            None
+        );
+
+        // No GPU at all -> None.
+        let headless = test_system(16.0, false, None);
+        assert_eq!(
+            resolve_gpu_bandwidth(&headless, &CalcConfig::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_gpu_bandwidth_ignores_a_non_positive_override() {
+        // A zero would make the roofline divide to nothing, so it must not be
+        // trusted over the table.
+        let system = rx6900xt_system();
+        for bad in [0.0, -1.0] {
+            let config = CalcConfig {
+                gpu_bandwidth_gbps_override: Some(bad),
+                ..CalcConfig::default()
+            };
+            assert_eq!(
+                resolve_gpu_bandwidth(&system, &config),
+                Some(512.0),
+                "override of {bad} must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_basis_reports_the_bandwidth_the_estimate_used() {
+        // The basis exists to make an estimate reproducible (issue #292), so it
+        // must record the override rather than the name-table value.
+        let model = test_model("7B", 4.0, Some(4.0));
+        let mut system = rx6900xt_system();
+        system.gpu_vram_gb = Some(24.0);
+        system.total_gpu_vram_gb = Some(24.0);
+
+        let config = CalcConfig {
+            gpu_bandwidth_gbps_override: Some(300.0),
+            ..test_config()
+        };
+        let fit = ModelFit::analyze_with_config(&model, &system, config);
+
+        assert_eq!(fit.estimate_basis.gpu_bandwidth_gbps, Some(300.0));
+        assert_eq!(fit.estimate_basis.method, "gpu_bandwidth_roofline");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // MoE Tier-2 per-architecture calibration
+    // ────────────────────────────────────────────────────────────────────
+
+    /// `bench_moe_model` plus an `architecture`, so a fixture can select a
+    /// calibrated table entry. Carries no Tier-1 metadata, so estimates run
+    /// through the Tier-2 fallback.
+    fn tier2_moe_model(
+        name: &str,
+        architecture: &str,
+        total_params_b: f64,
+        active_params_b: f64,
+        num_experts: u32,
+        active_experts: u32,
+        quant: &str,
+    ) -> LlmModel {
+        let mut model = bench_moe_model(
+            name,
+            total_params_b,
+            active_params_b,
+            num_experts,
+            active_experts,
+            quant,
+        );
+        model.architecture = Some(architecture.to_string());
+        model
+    }
+
+    /// System with a pinned bandwidth and deliberately unknown VRAM.
+    ///
+    /// `gpu_vram_gb: None` disables the VRAM cache-pressure penalty (which has
+    /// its own tests), so these fixtures measure the Tier-2 bandwidth
+    /// calibration alone instead of the product of two models.
+    fn tier2_system() -> SystemSpecs {
+        SystemSpecs {
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            ..rx6900xt_system()
+        }
+    }
+
+    fn tier2_config(bandwidth_gbps: f64) -> CalcConfig {
+        CalcConfig {
+            gpu_bandwidth_gbps_override: Some(bandwidth_gbps),
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn moe_tier2_default_reproduces_the_expert_count_tiers() {
+        // Requirement: adding architecture entries must not move any model that
+        // isn't named. For an unlisted architecture the calibration must be
+        // exactly the config efficiency and the original tiered overhead.
+        let config_efficiency = 0.55;
+        let tiers = [
+            (Some(8u32), 0.90),
+            (Some(16), 0.85),
+            (Some(32), 0.80),
+            (Some(64), 0.70),
+            (Some(128), 0.40),
+            (Some(256), 0.40),
+            (None, 0.60),
+        ];
+
+        for (num_experts, expected_overhead) in tiers {
+            for architecture in [None, Some("llama4"), Some("qwen3_moe")] {
+                let params = moe_tier2_params(architecture, num_experts, config_efficiency);
+                assert_eq!(
+                    params,
+                    MoeTier2Params {
+                        efficiency: config_efficiency,
+                        overhead: expected_overhead,
+                    },
+                    "arch={architecture:?} num_experts={num_experts:?} must use the default tier"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moe_tier2_default_tracks_a_custom_config_efficiency() {
+        // The default path must keep honouring the user's efficiency setting
+        // (Advanced Config, issue #449) rather than hardcoding 0.55.
+        let params = moe_tier2_params(None, Some(64), 0.42);
+        assert_eq!(params.efficiency, 0.42);
+        assert_eq!(params.overhead, 0.70);
+    }
+
+    #[test]
+    fn moe_tier2_gpt_oss_120b_class_lands_near_measured() {
+        // gpt-oss-120b: 116.8B total, 5.1B active, 128 experts / 4 active,
+        // MXFP4 weights. Reference point: ~50.2 tok/s decode on 256 GB/s-class
+        // unified memory.
+        const MEASURED_TPS: f64 = 50.2;
+        let model = tier2_moe_model("gpt-oss-120b", "gpt_oss", 116.8, 5.1, 128, 4, "Q4_K_M");
+
+        let estimated = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+
+        let ratio = estimated / MEASURED_TPS;
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "gpt-oss-120b: estimate {estimated:.1} tok/s vs measured {MEASURED_TPS:.1} tok/s \
+             (ratio={ratio:.2}), expected within 25%"
+        );
+
+        // The generic 128+-expert tier is what the entry exists to correct:
+        // counting inactive experts as overhead, it lands ~2.6x low and well
+        // outside the tolerance above.
+        let mut unlisted = model.clone();
+        unlisted.architecture = Some("some_new_moe".to_string());
+        let default_tier = estimate_tps(
+            &unlisted,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+        assert!(
+            default_tier / MEASURED_TPS < 0.75,
+            "default tier should be the low outlier this entry fixes \
+             (got {default_tier:.1} tok/s)"
+        );
+    }
+
+    /// The Tier-2 calibration above is fitted to the *published* 5.1B active
+    /// figure, so it is only correct if the catalog actually serves that
+    /// number. This walks the real `openai/gpt-oss-120b` entry through the
+    /// Tier-2 path and pins the ~50 tok/s reference to catalog data rather
+    /// than to a literal in the test (issue #969, problem 2).
+    ///
+    /// Tier 2 has to be forced: the catalog entry carries full MoE geometry,
+    /// so the live sweep takes the architecture-aware Tier-1 path instead.
+    /// `catalog_gpt_oss_120b_lands_near_measured_on_the_live_tier1_path`
+    /// covers that route against the same reference.
+    #[test]
+    fn catalog_gpt_oss_120b_active_params_reproduce_the_measured_tier2_estimate() {
+        const MEASURED_TPS: f64 = 50.2;
+        let db = models::ModelDatabase::embedded();
+        let catalog_entry = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "openai/gpt-oss-120b")
+            .expect("catalog is missing openai/gpt-oss-120b");
+        let active_params_b = catalog_entry
+            .active_parameters
+            .expect("MoE entry has active params") as f64
+            / 1e9;
+
+        let mut model = tier2_moe_model(
+            &catalog_entry.name,
+            "gpt_oss",
+            catalog_entry.params_b(),
+            active_params_b,
+            catalog_entry.num_experts.expect("MoE entry has experts"),
+            catalog_entry
+                .active_experts
+                .expect("MoE entry has active experts"),
+            "Q4_K_M",
+        );
+        model.hidden_size = None; // force the Tier-2 fallback
+
+        let estimated = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+
+        let ratio = estimated / MEASURED_TPS;
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "catalog active_parameters ({active_params_b:.2}B) put the estimate at \
+             {estimated:.1} tok/s against a measured {MEASURED_TPS:.1} tok/s (ratio={ratio:.2})"
+        );
+    }
+
+    /// The issue's own repro: the real catalog entry, on the real route it
+    /// takes (Tier 1, architecture-aware), against 256 GB/s-class unified
+    /// memory. `--profile ryzen-ai-max-plus-395 plan openai/gpt-oss-120b
+    /// --quant Q4_K_M` reads out of exactly this call (issue #969, problem 2).
+    ///
+    /// Q4-class. `best_quant` used to pick Q8_0 for this model on a 128 GB
+    /// machine and land near 23 tok/s, because the K-quant ladder priced
+    /// gpt-oss's MXFP4-native weights at `quant_bpp("Q8_0")` (#973); see
+    /// `gpt_oss_120b_is_sized_and_priced_at_native_mxfp4` for the dynamic path.
+    /// #973: dynamic `fit` on a 128 GB unified-memory machine. The model must
+    /// be selected at MXFP4, sized near its real ~63 GB, and estimated near
+    /// the ~50 tok/s measured in #969 rather than the ~23 a Q8_0 pick gave.
+    #[test]
+    fn gpt_oss_120b_is_sized_and_priced_at_native_mxfp4() {
+        const MEASURED_TPS: f64 = 50.2;
+        let db = models::ModelDatabase::embedded();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "openai/gpt-oss-120b")
+            .expect("catalog is missing openai/gpt-oss-120b")
+            .clone();
+        assert!(model.is_mxfp4_native());
+        assert_eq!(
+            quant_hierarchy_for(&model, InferenceRuntime::LlamaCpp),
+            models::MXFP4_QUANT_HIERARCHY
+        );
+        // MLX and vLLM builds are different artifacts with their own formats.
+        assert_eq!(
+            quant_hierarchy_for(&model, InferenceRuntime::Mlx),
+            models::MLX_QUANT_HIERARCHY
+        );
+
+        let (quant, mem) =
+            best_quant_for_runtime_budget(&model, InferenceRuntime::LlamaCpp, 110.0, 8192)
+                .expect("fits in 110 GB");
+        assert_eq!(quant, "MXFP4");
+        let q8 = model.estimate_memory_gb("Q8_0", 8192);
+        assert!(
+            (60.0..=75.0).contains(&mem),
+            "MXFP4 footprint {mem:.1} GB should sit near the 63.4 GB GGUF (Q8_0 pricing: {q8:.1} GB)"
+        );
+
+        let estimated = estimate_tps(
+            &model,
+            "MXFP4",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+        let ratio = estimated / MEASURED_TPS;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "gpt-oss-120b at MXFP4 on 256 GB/s: estimate {estimated:.1} tok/s vs \
+             measured {MEASURED_TPS:.1} tok/s (ratio={ratio:.2})"
+        );
+        let at_q8 = estimate_tps(
+            &model,
+            "Q8_0",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+        // The K-quant pick this replaces is materially pessimistic.
+        assert!(
+            at_q8 < estimated * 0.8,
+            "Q8_0 pricing {at_q8:.1} vs MXFP4 {estimated:.1}"
+        );
+    }
+
+    #[test]
+    fn catalog_gpt_oss_120b_lands_near_measured_on_the_live_tier1_path() {
+        const MEASURED_TPS: f64 = 50.2;
+        let db = models::ModelDatabase::embedded();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "openai/gpt-oss-120b")
+            .expect("catalog is missing openai/gpt-oss-120b")
+            .clone();
+        assert!(
+            model.moe_bandwidth_decomposition().is_some(),
+            "this test is only meaningful while the entry still routes to Tier 1"
+        );
+
+        let estimated = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+
+        let ratio = estimated / MEASURED_TPS;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "gpt-oss-120b at Q4_K_M on 256 GB/s: estimate {estimated:.1} tok/s vs \
+             measured {MEASURED_TPS:.1} tok/s (ratio={ratio:.2})"
+        );
+
+        // Without the per-architecture entry the same geometry lands ~1.7x
+        // low, which is the reading the issue reported.
+        let mut unlisted = model.clone();
+        unlisted.architecture = Some("some_new_moe".to_string());
+        let default_bpp = estimate_tps(
+            &unlisted,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+        assert!(
+            default_bpp / MEASURED_TPS < 0.75,
+            "the default fixed-component constant should be the low outlier this \
+             entry fixes (got {default_bpp:.1} tok/s)"
+        );
+    }
+
+    #[test]
+    fn moe_tier2_deepseek_v4_flash_class_lands_near_measured() {
+        // DeepSeek-V4-Flash class: 13B active over 256 routed experts plus a
+        // shared expert, MLA attention. Reference point: ~35 tok/s decode on
+        // 614 GB/s-class hardware.
+        const MEASURED_TPS: f64 = 35.0;
+        let model = tier2_moe_model(
+            "DeepSeek-V4-Flash",
+            "deepseek_v4",
+            235.0,
+            13.0,
+            256,
+            8,
+            "Q4_K_M",
+        );
+
+        let estimated = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(614.0),
+        );
+
+        let ratio = estimated / MEASURED_TPS;
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "DeepSeek-V4-Flash: estimate {estimated:.1} tok/s vs measured {MEASURED_TPS:.1} tok/s \
+             (ratio={ratio:.2}), expected within 25%"
+        );
+    }
+
+    #[test]
+    fn moe_tier2_architecture_lookup_is_case_insensitive() {
+        // Catalog `architecture` values come from several scrapers, so casing
+        // varies. "GPT_OSS" must not silently fall back to the default tier.
+        let calibrated = moe_tier2_params(Some("gpt_oss"), Some(128), 0.55);
+        for spelling in ["GPT_OSS", "Gpt_Oss", "gpt_oss_120b"] {
+            assert_eq!(
+                moe_tier2_params(Some(spelling), Some(128), 0.55),
+                calibrated,
+                "{spelling} must resolve to the gpt-oss entry"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_tier2_only_applies_to_the_tier2_path() {
+        // Tier 1 (full architecture metadata) is strictly better than the
+        // calibrated fallback, so an entry in the table must not divert a model
+        // that has enough metadata for the two-component decomposition.
+        let mut model = tier2_moe_model("gpt-oss-120b", "gpt_oss", 116.8, 5.1, 128, 4, "Q4_K_M");
+        assert!(
+            model.moe_bandwidth_decomposition().is_none(),
+            "fixture must lack Tier-1 metadata"
+        );
+
+        let tier2 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+
+        // Supply the metadata Tier 1 needs; the estimate must change path.
+        model.hidden_size = Some(2880);
+        model.num_hidden_layers = Some(36);
+        model.moe_intermediate_size = Some(2880);
+        model.vocab_size = Some(201_088);
+        model.num_attention_heads = Some(64);
+        model.num_key_value_heads = Some(8);
+        model.head_dim = Some(64);
+        assert!(
+            model.moe_bandwidth_decomposition().is_some(),
+            "Tier-1 metadata must now resolve"
+        );
+
+        let tier1 = estimate_tps(
+            &model,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+
+        // Both tiers are calibrated to the same ~50 tok/s reference, so their
+        // outputs agreeing proves nothing about which one ran. Widen the
+        // expert FFN instead: Tier 1 reads `moe_intermediate_size`, Tier 2
+        // cannot see it at all.
+        let mut wider = model.clone();
+        wider.moe_intermediate_size = Some(5760);
+        let tier1_wider = estimate_tps(
+            &wider,
+            "Q4_K_M",
+            &tier2_system(),
+            RunMode::Gpu,
+            InferenceRuntime::LlamaCpp,
+            &tier2_config(256.0),
+        );
+        assert!(
+            tier1_wider < tier1 * 0.9,
+            "Tier 1 must take over once its metadata resolves — doubling the \
+             expert FFN should slow the estimate (tier2={tier2:.1}, \
+             tier1={tier1:.1}, tier1_wider={tier1_wider:.1})"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // EstimateConfidence
+    // ────────────────────────────────────────────────────────────────────
+
+    fn measured(source: crate::benchmarks::MeasuredSource) -> crate::benchmarks::MeasuredTps {
+        crate::benchmarks::MeasuredTps {
+            tok_s: 42.0,
+            sample_count: 3,
+            hardware_label: "this machine".to_string(),
+            source,
+            match_grade: None,
+        }
+    }
+
+    #[test]
+    fn cluster_best_quant_is_the_one_memory_was_sized_at() {
+        // The split is sized at the model's own quantization plus any KV
+        // copies; the reported quant, and the speed and context that follow
+        // it, must be that one, not a bigger quant re-picked for the pool.
+        let mut m = headed("7B", Some(32), Some(2));
+        m.num_hidden_layers = Some(32);
+        m.head_dim = Some(128);
+        for system in [cluster_system(2, 2, 128.0), cluster_system(2, 8, 80.0)] {
+            let fit = ModelFit::analyze(&m, &system);
+            assert_ne!(fit.fit_level, FitLevel::TooTight);
+            assert_eq!(fit.best_quant, m.quantization, "notes: {:?}", fit.notes);
+            let tp = fit.tp_size.expect("a split");
+            let ctx = fit.effective_context_length;
+            let expected =
+                m.estimate_memory_gb(&fit.best_quant, ctx) + kv_replication_extra_gb(&m, tp, ctx);
+            assert!(
+                (fit.memory_required_gb - expected).abs() < 1e-9,
+                "{} vs {}",
+                fit.memory_required_gb,
+                expected
+            );
+            assert!(
+                !fit.notes
+                    .iter()
+                    .any(|n| n.starts_with("Best quantization for hardware"))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_full_split_holds_no_phantom_kv_copies() {
+        // 3 KV heads on 4 GPUs: TP=4 is invalid (3 and 4 don't divide), as
+        // are TP=3 (4 attention heads) and TP=2 (3 KV heads). Under the
+        // pipeline-parallel layout it needs, KV is not replicated, so the
+        // refusal must be judged on one KV copy, not 4/3 of one.
+        let mut m = headed("7B", Some(4), Some(3));
+        m.num_hidden_layers = Some(32);
+        m.head_dim = Some(128);
+        m.context_length = 8192;
+        let probe = ModelFit::analyze(&m, &cluster_system(2, 4, 128.0));
+        let ctx = probe.effective_context_length;
+        let one_copy = m.estimate_memory_gb(&m.quantization, ctx);
+        let kv = m.kv_cache_gb(ctx, KvQuant::Fp16);
+        assert!(kv > 0.0);
+        // Room for one copy, not for 4/3 of the KV cache.
+        let v = (one_copy + kv / 6.0) / FIT_MARGINAL_MAX_RATIO / 4.0;
+        let fit = ModelFit::analyze(&m, &cluster_system(2, 4, v));
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(
+            fit.layout_refusal.as_ref().map(|r| r.reason),
+            Some(TpSplitError::KvHeadsNotDivisible),
+            "notes: {:?}",
+            fit.notes
+        );
+        assert!(
+            !fit.notes
+                .iter()
+                .any(|n| n.contains("exceeds aggregate VRAM"))
+        );
+        assert!((fit.memory_required_gb - one_copy).abs() < 1e-9);
+    }
+
+    #[test]
+    fn too_big_and_invalid_split_never_carries_a_measured_tps() {
+        use crate::benchmarks::MeasuredSource;
+        // Too big for the whole cluster, and TP=3 is invalid: no refusal
+        // (memory is the reason), but still a layout vLLM would not start.
+        let mut fit = ModelFit::analyze(
+            &headed("70B", Some(32), Some(8)),
+            &cluster_system(3, 3, 4.0),
+        );
+        assert!(fit.layout_refusal.is_none());
+        assert!(fit.tp_layout_invalid);
+        assert!(!fit.reports_speed());
+        fit.set_measured_tps(Some(measured(MeasuredSource::LocalBench)));
+        assert!(fit.measured_tps.is_none());
+    }
+
+    #[test]
+    fn refused_cluster_layout_never_carries_a_measured_tps() {
+        use crate::benchmarks::MeasuredSource;
+        let v = vram_needing_three_gpus("70B");
+        let mut refused =
+            ModelFit::analyze(&headed("70B", Some(32), Some(8)), &cluster_system(3, 3, v));
+        assert!(refused.layout_refusal.is_some());
+        refused.set_measured_tps(Some(measured(MeasuredSource::LocalBench)));
+        assert!(refused.measured_tps.is_none());
+
+        refused.refresh_estimate_confidence();
+        assert_ne!(
+            refused.estimate_confidence,
+            EstimateConfidence::MeasuredLocal
+        );
+
+        // A layout that fits keeps its measurement.
+        let mut ok = ModelFit::analyze(
+            &headed("7B", Some(32), Some(8)),
+            &cluster_system(2, 2, 128.0),
+        );
+        ok.set_measured_tps(Some(measured(MeasuredSource::LocalBench)));
+        assert!(ok.measured_tps.is_some());
+    }
+
+    #[test]
+    fn derive_estimate_confidence_ranks_measurement_above_calibration() {
+        use crate::benchmarks::MeasuredSource;
+
+        let plain = EstimateBasis {
+            method: "gpu_bandwidth_roofline".to_string(),
+            ..EstimateBasis::default()
+        };
+        let calibrated = EstimateBasis {
+            local_calibration: Some(1.4),
+            ..plain.clone()
+        };
+
+        assert_eq!(
+            derive_estimate_confidence(Some(&measured(MeasuredSource::LocalBench)), &plain),
+            EstimateConfidence::MeasuredLocal
+        );
+        assert_eq!(
+            derive_estimate_confidence(Some(&measured(MeasuredSource::Community)), &plain),
+            EstimateConfidence::MeasuredCommunity
+        );
+        assert_eq!(
+            derive_estimate_confidence(Some(&measured(MeasuredSource::CommunityLlmfit)), &plain),
+            EstimateConfidence::MeasuredCommunity
+        );
+
+        // A measured row that also carries a calibration factor stays measured:
+        // the real number outranks the corrected formula.
+        assert_eq!(
+            derive_estimate_confidence(Some(&measured(MeasuredSource::LocalBench)), &calibrated),
+            EstimateConfidence::MeasuredLocal
+        );
+
+        assert_eq!(
+            derive_estimate_confidence(None, &calibrated),
+            EstimateConfidence::Calibrated
+        );
+        assert_eq!(
+            derive_estimate_confidence(None, &plain),
+            EstimateConfidence::Estimated
+        );
+    }
+
+    #[test]
+    fn derive_estimate_confidence_marks_an_unsupported_method() {
+        let basis = EstimateBasis {
+            method: UNSUPPORTED_METHOD.to_string(),
+            ..EstimateBasis::default()
+        };
+        assert_eq!(
+            derive_estimate_confidence(None, &basis),
+            EstimateConfidence::Unsupported
+        );
+
+        // Calibration is checked first, so a calibrated row is never reported
+        // as unsupported even if the method string says so.
+        let calibrated = EstimateBasis {
+            local_calibration: Some(0.9),
+            ..basis
+        };
+        assert_eq!(
+            derive_estimate_confidence(None, &calibrated),
+            EstimateConfidence::Calibrated
+        );
+    }
+
+    #[test]
+    fn analyze_defaults_confidence_to_estimated() {
+        // Nothing is measured or calibrated at construction time.
+        let model = test_model("7B", 4.0, Some(4.0));
+        let system = test_system(32.0, true, Some(24.0));
+        let fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.estimate_confidence, EstimateConfidence::Estimated);
+    }
+
+    #[test]
+    fn analyze_marks_a_specialized_runtime_model_unsupported() {
+        // The early-return path produces no estimate at all.
+        let mut model = test_model("1B", 2.0, Some(2.0));
+        model.capabilities = vec![models::Capability::Tts];
+        let system = test_system(32.0, true, Some(24.0));
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+        assert_eq!(fit.estimate_confidence, EstimateConfidence::Unsupported);
+        assert_eq!(fit.prefill_tps, None);
+        assert_eq!(fit.ttft_ms, None);
+    }
+
+    #[test]
+    fn refresh_estimate_confidence_picks_up_post_analysis_data() {
+        use crate::benchmarks::MeasuredSource;
+
+        let model = test_model("7B", 4.0, Some(4.0));
+        let system = test_system(32.0, true, Some(24.0));
+        let mut fit = ModelFit::analyze(&model, &system);
+        assert_eq!(fit.estimate_confidence, EstimateConfidence::Estimated);
+
+        // Calibration is attached after analysis (analysis::apply_local_calibration).
+        fit.estimate_basis.local_calibration = Some(1.1);
+        fit.refresh_estimate_confidence();
+        assert_eq!(fit.estimate_confidence, EstimateConfidence::Calibrated);
+
+        // So is measured throughput, which outranks it.
+        fit.measured_tps = Some(measured(MeasuredSource::LocalBench));
+        fit.refresh_estimate_confidence();
+        assert_eq!(fit.estimate_confidence, EstimateConfidence::MeasuredLocal);
+    }
+
+    #[test]
+    fn estimate_confidence_codes_are_stable() {
+        // These strings reach API and MCP consumers; changing one is a breaking
+        // change, so pin them.
+        for (variant, code) in [
+            (EstimateConfidence::MeasuredLocal, "measured_local"),
+            (EstimateConfidence::MeasuredCommunity, "measured_community"),
+            (EstimateConfidence::Calibrated, "calibrated"),
+            (EstimateConfidence::Estimated, "estimated"),
+            (EstimateConfidence::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(variant.code(), code);
+            assert_eq!(
+                serde_json::to_value(variant).expect("confidence serializes"),
+                serde_json::json!(code),
+                "serde representation must match code()"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_confidence_short_labels_stay_table_narrow() {
+        // The CLI table column is sized by its widest cell. `label()` peaks at
+        // 23 columns ("measured (this machine)"), which wraps the row on an
+        // 80-column terminal (issue #974). The short form caps the column at
+        // the 4-column "Conf" header instead.
+        for variant in [
+            EstimateConfidence::MeasuredLocal,
+            EstimateConfidence::MeasuredCommunity,
+            EstimateConfidence::Calibrated,
+            EstimateConfidence::Estimated,
+            EstimateConfidence::Unsupported,
+        ] {
+            let short = variant.short_label();
+            assert!(
+                !short.is_empty() && short.len() <= 5,
+                "{short:?} must be 1-5 columns to keep the table narrow"
+            );
+            assert!(
+                short.is_ascii(),
+                "{short:?} must be ASCII \u{2014} this column renders in Windows terminals"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_confidence_short_labels_are_distinct() {
+        // A table cell is the only confidence signal in the row, so two
+        // confidences must never collapse to the same code.
+        let shorts = [
+            EstimateConfidence::MeasuredLocal.short_label(),
+            EstimateConfidence::MeasuredCommunity.short_label(),
+            EstimateConfidence::Calibrated.short_label(),
+            EstimateConfidence::Estimated.short_label(),
+            EstimateConfidence::Unsupported.short_label(),
+        ];
+        let unique: std::collections::HashSet<&str> = shorts.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            shorts.len(),
+            "short labels collide: {shorts:?}"
+        );
+    }
+
+    #[test]
+    fn estimate_confidence_short_labels_do_not_disturb_the_api_contract() {
+        // `code()` ships as `estimate_confidence` and `label()` as
+        // `estimate_confidence_label` in the API/MCP JSON. `short_label()` is
+        // display-only and additive: it must not become a third spelling that
+        // callers mistake for either.
+        assert_eq!(EstimateConfidence::MeasuredLocal.code(), "measured_local");
+        assert_eq!(
+            EstimateConfidence::MeasuredLocal.label(),
+            "measured (this machine)"
+        );
+        assert_eq!(EstimateConfidence::MeasuredLocal.short_label(), "local");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Prefill / TTFT
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn prefill_is_null_when_gpu_compute_is_unknown() {
+        // Prefill is compute-bound, so without a TFLOP/s figure there is no
+        // roofline to fall back on. A null must not be flattened to 0.0, which
+        // would read as "immeasurably slow".
+        let model = test_model("7B", 4.0, Some(4.0));
+        let system = test_system(32.0, true, Some(24.0));
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.prefill_tps, None);
+        assert_eq!(fit.ttft_ms, None);
+
+        let json = serde_json::to_value(&fit).expect("fit serializes");
+        assert!(json["prefill_tps"].is_null());
+        assert!(json["ttft_ms"].is_null());
+    }
+
+    #[test]
+    fn prefill_is_estimated_when_gpu_compute_is_known() {
+        // RTX 4090: 165 TFLOP/s dense fp16. An 8B model costs 2*8e9 = 16 GFLOP
+        // per token, so prefill lands in the low thousands of tok/s — orders of
+        // magnitude above decode, which is the point of reporting it.
+        let model = test_model("8B", 4.0, Some(4.0));
+        let system = test_system(64.0, true, Some(24.0));
+        let config = CalcConfig {
+            gpu_compute_tflops_fp16: Some(165.0),
+            ..test_config()
+        };
+        let fit = ModelFit::analyze_with_config(&model, &system, config);
+
+        let prefill = fit.prefill_tps.expect("prefill estimated");
+        let ttft = fit.ttft_ms.expect("ttft estimated");
+
+        assert!(
+            (1_000.0..=20_000.0).contains(&prefill),
+            "prefill {prefill:.0} tok/s outside the plausible band for 8B on a 4090"
+        );
+        assert!(
+            prefill > fit.estimated_tps * 10.0,
+            "prefill ({prefill:.0}) must far exceed decode ({:.0})",
+            fit.estimated_tps
+        );
+
+        // TTFT is just the prompt divided by prefill throughput.
+        let expected_ttft = (f64::from(fit.effective_context_length) / prefill) * 1000.0;
+        assert!((ttft - expected_ttft).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ttft_scales_with_the_assumed_prompt_length() {
+        // Halving the assumed context must halve TTFT while prefill throughput,
+        // a per-token rate, stays put.
+        let model = test_model("8B", 4.0, Some(4.0));
+        let system = test_system(64.0, true, Some(24.0));
+        let base = CalcConfig {
+            gpu_compute_tflops_fp16: Some(165.0),
+            ..test_config()
+        };
+
+        let long = ModelFit::analyze_with_config(
+            &model,
+            &system,
+            CalcConfig {
+                context_cap: Some(4096),
+                ..base.clone()
+            },
+        );
+        let short = ModelFit::analyze_with_config(
+            &model,
+            &system,
+            CalcConfig {
+                context_cap: Some(2048),
+                ..base
+            },
+        );
+
+        assert_eq!(long.prefill_tps, short.prefill_tps);
+        let ratio = long.ttft_ms.expect("long ttft") / short.ttft_ms.expect("short ttft");
+        assert!(
+            (ratio - 2.0).abs() < 1e-6,
+            "TTFT must be linear in prompt length (ratio={ratio:.3})"
+        );
+    }
+
+    #[test]
+    fn prefill_is_not_estimated_on_the_cpu_only_path() {
+        // The TFLOP/s figure describes the GPU, so it says nothing about a
+        // CPU-only run.
+        let model = test_model("8B", 4.0, Some(4.0));
+        let system = test_system(32.0, false, None);
+        let config = CalcConfig {
+            gpu_compute_tflops_fp16: Some(165.0),
+            ..test_config()
+        };
+        let fit = ModelFit::analyze_with_config(&model, &system, config);
+
+        assert_eq!(fit.run_mode, RunMode::CpuOnly);
+        assert_eq!(fit.prefill_tps, None);
+        assert_eq!(fit.ttft_ms, None);
+    }
+
+    #[test]
+    fn prefill_uses_active_parameters_for_moe() {
+        // Prefill FLOPs scale with the parameters actually routed through, so a
+        // sparse MoE must prefill far faster than its total size implies.
+        let system = test_system(64.0, true, Some(24.0));
+        let config = CalcConfig {
+            gpu_compute_tflops_fp16: Some(165.0),
+            ..test_config()
+        };
+
+        let sparse = tier2_moe_model("sparse", "qwen3_moe", 30.0, 3.0, 128, 8, "Q4_K_M");
+        let dense = test_model("30B", 16.0, Some(16.0));
+
+        let sparse_fit = ModelFit::analyze_with_config(&sparse, &system, config.clone());
+        let dense_fit = ModelFit::analyze_with_config(&dense, &system, config);
+
+        let sparse_prefill = sparse_fit.prefill_tps.expect("moe prefill");
+        let dense_prefill = dense_fit.prefill_tps.expect("dense prefill");
+        assert!(
+            sparse_prefill > dense_prefill * 5.0,
+            "3B-active MoE ({sparse_prefill:.0}) must prefill far faster than \
+             a 30B dense model ({dense_prefill:.0})"
+        );
+    }
+
+    #[test]
+    fn prefill_ignores_a_non_positive_compute_figure() {
+        let model = test_model("8B", 4.0, Some(4.0));
+        let system = test_system(64.0, true, Some(24.0));
+        for bad in [0.0, -10.0] {
+            let config = CalcConfig {
+                gpu_compute_tflops_fp16: Some(bad),
+                ..test_config()
+            };
+            let fit = ModelFit::analyze_with_config(&model, &system, config);
+            assert_eq!(fit.prefill_tps, None, "tflops={bad} must not estimate");
+            assert_eq!(fit.ttft_ms, None);
+        }
+    }
+
+    #[test]
+    fn test_ternary_model_uses_bitnet_runtime_and_i2s_quant() {
+        let mut model = test_model("2.7B", 1.5, Some(1.4));
+        model.name = "microsoft/bitnet-b1.58-2B-4T".to_string();
+        model.architecture = Some("bitnet".to_string());
+
+        let system = test_system(32.0, true, Some(16.0));
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::BitNet);
+        assert_eq!(fit.best_quant, "I2_S");
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("ternary") || n.contains("bitnet.cpp")),
+            "expected a native-ternary note, got: {:?}",
+            fit.notes
+        );
+    }
+
+    #[test]
+    fn test_non_ternary_model_keeps_llamacpp_runtime() {
+        let mut model = test_model("8B", 5.0, Some(5.0));
+        model.name = "meta-llama/Llama-3.1-8B-Instruct".to_string();
+        model.architecture = Some("llama".to_string());
+
+        let system = test_system(32.0, true, Some(16.0));
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::LlamaCpp);
+        assert_ne!(fit.best_quant, "I2_S");
+    }
+
+    #[test]
+    fn test_ternary_model_runs_on_cpu_even_with_gpu() {
+        // Native ternary runs on the CPU via bitnet.cpp, so even on a machine
+        // with a discrete GPU the fit must be CPU-only (scored against RAM),
+        // never a VRAM-based GPU run.
+        let mut model = test_model("2.7B", 1.5, Some(1.4));
+        model.name = "microsoft/bitnet-b1.58-2B-4T".to_string();
+        model.architecture = Some("bitnet".to_string());
+
+        let system = test_system(32.0, true, Some(16.0));
+        let fit = ModelFit::analyze(&model, &system);
+
+        assert_eq!(fit.runtime, InferenceRuntime::BitNet);
+        assert_eq!(fit.run_mode, RunMode::CpuOnly);
+    }
+
+    #[test]
+    fn test_forced_bitnet_on_non_ternary_is_ignored() {
+        // Forcing bitnet.cpp on an ordinary model must NOT produce a BitNet
+        // (i2_s CPU) analysis — bitnet.cpp cannot load non-ternary weights.
+        let mut model = test_model("8B", 5.0, Some(5.0));
+        model.name = "meta-llama/Llama-3.1-8B-Instruct".to_string();
+        model.architecture = Some("llama".to_string());
+        let system = test_system(32.0, true, Some(16.0));
+        let fit = ModelFit::analyze_with_forced_runtime(
+            &model,
+            &system,
+            None,
+            Some(InferenceRuntime::BitNet),
+        );
+        assert_ne!(fit.runtime, InferenceRuntime::BitNet);
+        assert!(
+            fit.notes.iter().any(|n| n.contains("not native-ternary")),
+            "expected an ignored-force note, got: {:?}",
+            fit.notes
+        );
+    }
+
+    #[test]
+    fn test_forced_non_bitnet_on_ternary_stays_bitnet() {
+        // A native-ternary model has only i2_s weights, so a forced general
+        // runtime is overridden back to bitnet.cpp rather than advertising a
+        // runtime that cannot load it.
+        let mut model = test_model("2.7B", 1.5, Some(1.4));
+        model.name = "microsoft/bitnet-b1.58-2B-4T".to_string();
+        model.architecture = Some("bitnet".to_string());
+        let system = test_system(32.0, true, Some(16.0));
+        let fit = ModelFit::analyze_with_forced_runtime(
+            &model,
+            &system,
+            None,
+            Some(InferenceRuntime::LlamaCpp),
+        );
+        assert_eq!(fit.runtime, InferenceRuntime::BitNet);
+        assert!(
+            fit.notes
+                .iter()
+                .any(|n| n.contains("only under bitnet.cpp")),
+            "expected an ignored-force note, got: {:?}",
+            fit.notes
+        );
     }
 }

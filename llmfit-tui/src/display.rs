@@ -2,11 +2,12 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use colored::*;
-use llmfit_core::fit::{FitLevel, ModelFit, RunMode, SortColumn};
+use llmfit_core::fit::{FitLevel, InferenceRuntime, ModelFit, RunMode, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::LlmModel;
 use llmfit_core::plan::PlanEstimate;
-use llmfit_core::providers::ollama_pull_tag as ollama_name_for;
+use llmfit_core::providers::LlamaCppBinaryStyle;
+use llmfit_core::storage::{StorageEstimate, StorageSelection};
 use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Tabled)]
@@ -25,6 +26,8 @@ struct ModelRow {
     tps: String,
     #[tabled(rename = "Quant")]
     quant: String,
+    #[tabled(rename = "Conf")]
+    confidence: String,
     #[tabled(rename = "Runtime")]
     runtime: String,
     #[tabled(rename = "Mode")]
@@ -35,6 +38,16 @@ struct ModelRow {
     context: String,
     #[tabled(rename = "Added to HF")]
     release_date: String,
+}
+
+/// Confidence cell for the fit table.
+///
+/// The table uses the short code so the column stays narrow on an 80-column
+/// terminal; the full label lives in the detail view below (issue #974).
+/// Derived rather than read from `fit.estimate_confidence`, which is stale
+/// unless its writer called `refresh_estimate_confidence` (issue #969).
+fn confidence_cell(fit: &ModelFit) -> &'static str {
+    fit.effective_estimate_confidence().short_label()
 }
 
 pub fn display_all_models(models: &[LlmModel], sort: SortColumn) {
@@ -86,6 +99,7 @@ pub fn display_all_models(models: &[LlmModel], sort: SortColumn) {
             score: "-".to_string(),
             tps: "-".to_string(),
             quant: m.quantization.clone(),
+            confidence: "-".to_string(),
             runtime: "-".to_string(),
             mode: "-".to_string(),
             mem_use: "-".to_string(),
@@ -111,13 +125,30 @@ pub fn display_model_fits(fits: &[ModelFit]) {
     }
 
     println!("\n{}", "=== Model Compatibility Analysis ===".bold().cyan());
-    println!("Found {} compatible model(s)\n", fits.len());
+    let incompatible = fits
+        .iter()
+        .filter(|fit| fit.runtime == InferenceRuntime::Unsupported)
+        .count();
+    if incompatible > 0 {
+        println!(
+            "Found {} model(s), including {incompatible} backend-incompatible (non-runnable)\n",
+            fits.len()
+        );
+    } else {
+        println!("Found {} compatible model(s)\n", fits.len());
+    }
 
     let rows: Vec<ModelRow> = fits
         .iter()
         .map(|fit| {
             let status_prefix = if fit.installed { "✓ " } else { "" };
-            let status_text = format!("{}{} {}", status_prefix, fit.fit_emoji(), fit.fit_text());
+            let unsupported = fit.runtime == InferenceRuntime::Unsupported;
+            let label = if unsupported {
+                "Non-runnable"
+            } else {
+                fit.fit_text()
+            };
+            let status_text = format!("{}{} {}", status_prefix, fit.fit_emoji(), label);
 
             ModelRow {
                 status: status_text,
@@ -125,12 +156,17 @@ pub fn display_model_fits(fits: &[ModelFit]) {
                 provider: fit.model.provider.clone(),
                 size: fit.model.parameter_count.clone(),
                 score: format!("{:.0}", fit.score),
-                tps: format!("{:.1}", fit.estimated_tps),
-                quant: fit.best_quant.clone(),
+                tps: tps_cell(fit),
+                quant: display_best_quant(fit).to_string(),
+                confidence: confidence_cell(fit).to_string(),
                 runtime: fit.runtime_text().to_string(),
-                mode: fit.run_mode_text().to_string(),
+                mode: if unsupported {
+                    "-".to_string()
+                } else {
+                    fit.run_mode_text().to_string()
+                },
                 mem_use: format!("{:.1}%", fit.utilization_pct),
-                context: format!("{}k", fit.model.context_length / 1000),
+                context: fit.context_display(),
                 release_date: fit
                     .model
                     .release_date
@@ -145,6 +181,12 @@ pub fn display_model_fits(fits: &[ModelFit]) {
     println!(
         "  Note: tok/s values are baseline estimates; real runtime depends on engine/runtime."
     );
+    if fits.iter().any(|f| f.measured_tps.is_some()) {
+        println!(
+            "  ✓ = measured, not estimated: your own benchmarks, llmfit community submissions \
+             with matching CPU/GPU, or localmaxxing.com data for matching hardware."
+        );
+    }
 }
 
 pub fn display_model_detail(fit: &ModelFit) {
@@ -153,7 +195,7 @@ pub fn display_model_detail(fit: &ModelFit) {
     println!("{}: {}", "Provider".bold(), fit.model.provider);
     println!("{}: {}", "Parameters".bold(), fit.model.parameter_count);
     println!("{}: {}", "Quantization".bold(), fit.model.quantization);
-    println!("{}: {}", "Best Quant".bold(), fit.best_quant);
+    println!("{}: {}", "Best Quant".bold(), display_best_quant(fit));
     println!(
         "{}: {} tokens",
         "Context Length".bold(),
@@ -169,12 +211,16 @@ pub fn display_model_detail(fit: &ModelFit) {
         "License".bold(),
         fit.model.license.as_deref().unwrap_or("Unknown")
     );
-    println!(
-        "{}: {} (baseline est. ~{:.1} tok/s)",
-        "Runtime".bold(),
-        fit.runtime_text(),
-        fit.estimated_tps
-    );
+    if fit.reports_speed() {
+        println!(
+            "{}: {} (baseline est. ~{:.1} tok/s)",
+            "Runtime".bold(),
+            fit.runtime_text(),
+            fit.estimated_tps
+        );
+    } else {
+        println!("{}: {}", "Runtime".bold(), fit.runtime_text());
+    }
     println!();
 
     println!("{}", "Score Breakdown:".bold().underline());
@@ -186,8 +232,14 @@ pub fn display_model_detail(fit: &ModelFit) {
         fit.score_components.fit,
         fit.score_components.context
     );
-    println!("  Baseline Est. Speed: {:.1} tok/s", fit.estimated_tps);
+    if fit.reports_speed() {
+        println!("  Baseline Est. Speed: {:.1} tok/s", fit.estimated_tps);
+    } else {
+        println!("  Baseline Est. Speed: - (layout refused)");
+    }
     println!();
+
+    display_estimate_basis(fit);
 
     println!("{}", "Resource Requirements:".bold().underline());
     if let Some(vram) = fit.model.min_vram_gb {
@@ -198,7 +250,7 @@ pub fn display_model_detail(fit: &ModelFit) {
     println!(
         "  Disk (est): {:.1} GB (at {})",
         fit.model.estimate_disk_gb(&fit.best_quant),
-        fit.best_quant
+        display_best_quant(fit)
     );
     let quants: &[&str] = if fit.best_quant.starts_with("mlx") {
         &["mlx-8bit", "mlx-4bit"]
@@ -273,27 +325,37 @@ pub fn display_model_detail(fit: &ModelFit) {
         println!();
     }
 
-    if !fit.notes.is_empty() {
+    let mut notes: Vec<String> = fit.notes.clone();
+    if let Some(note) = crate::serve_shared::best_quant_mismatch_note(fit) {
+        notes.push(note);
+    }
+    if !notes.is_empty() {
         println!("{}", "Notes:".bold().underline());
-        for note in &fit.notes {
+        for note in &notes {
             println!("  {}", note);
         }
         println!();
     }
 }
 
-pub fn display_model_diff(fits: &[ModelFit], sort_label: &str) {
+/// How the `diff` table is ordered. Named pairs keep the order given
+/// (a model that cannot run is moved second), so they must not claim a sort.
+pub fn diff_order_label(named: bool, sort_label: &str) -> String {
+    if named {
+        "in the order named; deltas are against M1".to_string()
+    } else {
+        format!("sorted by {}", sort_label)
+    }
+}
+
+pub fn display_model_diff(fits: &[ModelFit], order_label: &str) {
     if fits.len() < 2 {
         println!("\n{}", "Need at least 2 models to compare.".yellow());
         return;
     }
 
     println!("\n{}", "=== Model Diff ===".bold().cyan());
-    println!(
-        "Comparing {} model(s) (sorted by {})\n",
-        fits.len(),
-        sort_label
-    );
+    println!("Comparing {} model(s) ({})\n", fits.len(), order_label);
 
     let metric_width = 20usize;
     let col_width = 32usize;
@@ -331,14 +393,7 @@ pub fn display_model_diff(fits: &[ModelFit], sort_label: &str) {
     );
     print_metric_row(
         "Baseline tok/s",
-        fits.iter()
-            .map(|f| {
-                format_with_delta(
-                    format!("{:.1}", f.estimated_tps),
-                    f.estimated_tps - base.estimated_tps,
-                )
-            })
-            .collect(),
+        fits.iter().map(|f| diff_tps_cell(f, base)).collect(),
         metric_width,
         col_width,
     );
@@ -413,6 +468,19 @@ fn print_metric_row(metric: &str, values: Vec<String>, metric_width: usize, col_
     println!();
 }
 
+/// A `diff` tok/s cell with its delta from `base`: `-` for a refused cluster
+/// layout (no speed), and no delta when `base` has no speed to compare with.
+fn diff_tps_cell(fit: &ModelFit, base: &ModelFit) -> String {
+    if !fit.reports_speed() {
+        return "-".to_string();
+    }
+    let value = format!("{:.1}", fit.estimated_tps);
+    if !base.reports_speed() {
+        return value;
+    }
+    format_with_delta(value, fit.estimated_tps - base.estimated_tps)
+}
+
 fn format_with_delta(value: String, delta: f64) -> String {
     if delta.abs() < 0.05 {
         return value;
@@ -459,6 +527,7 @@ pub fn display_search_results(models: &[&LlmModel], query: &str) {
             score: "-".to_string(),
             tps: "-".to_string(),
             quant: m.quantization.clone(),
+            confidence: "-".to_string(),
             runtime: "-".to_string(),
             mode: "-".to_string(),
             mem_use: "-".to_string(),
@@ -491,10 +560,27 @@ pub fn display_json_system(specs: &SystemSpecs) {
 
 /// Serialize system specs + model fits to JSON and print to stdout.
 pub fn display_json_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
-    let models: Vec<serde_json::Value> = fits.iter().map(fit_to_json).collect();
+    let models: Vec<serde_json::Value> = fits
+        .iter()
+        .map(|fit| fit_to_json_for_specs(fit, specs))
+        .collect();
     let output = serde_json::json!({
         "system": system_json(specs),
         "models": models,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Serialize a CLI error for machine consumers.
+pub fn display_json_error(kind: &str, message: &str) {
+    let output = serde_json::json!({
+        "error": {
+            "kind": kind,
+            "message": message,
+        },
     });
     println!(
         "{}",
@@ -509,7 +595,7 @@ pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
     let models: Vec<serde_json::Value> = fits
         .iter()
         .map(|fit| {
-            let mut json = fit_to_json(fit);
+            let mut json = fit_to_json_for_specs(fit, specs);
 
             // Add suggested llama.cpp command for llama.cpp-compatible models
             if fit.runtime == InferenceRuntime::LlamaCpp
@@ -535,6 +621,140 @@ pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
     );
 }
 
+/// Print how the tok/s estimate was derived and how to verify it locally.
+/// Reproducibility ask from issue #292: no number without its inputs.
+fn display_estimate_basis(fit: &ModelFit) {
+    let basis = &fit.estimate_basis;
+
+    if let Some(m) = &fit.measured_tps {
+        match m.source {
+            llmfit_core::benchmarks::MeasuredSource::LocalBench => {
+                println!("{}", "Local Benchmark:".bold().underline());
+                println!(
+                    "  {:.1} tok/s from your own `llmfit bench` run(s) ({} stored)",
+                    m.tok_s, m.sample_count
+                );
+                println!("  Your measurement — trust this over the formula estimate below.");
+            }
+            llmfit_core::benchmarks::MeasuredSource::CommunityLlmfit => {
+                println!("{}", "Community Benchmark:".bold().underline());
+                println!(
+                    "  {:.1} tok/s median across {} llmfit community submission(s) \
+                     (`llmfit bench --share`)",
+                    m.tok_s, m.sample_count
+                );
+                println!("  Real runs with matching CPU and GPU names.");
+            }
+            llmfit_core::benchmarks::MeasuredSource::Community => {
+                println!("{}", "Measured on Matching Hardware:".bold().underline());
+                println!(
+                    "  {:.1} tok/s median across {} community run(s) on {} (localmaxxing.com)",
+                    m.tok_s, m.sample_count, m.hardware_label
+                );
+                println!("  Real user data — trust this over the formula estimate below.");
+            }
+        }
+        if let Some(grade) = m.match_grade {
+            println!("  PCIe match: {}", grade.label());
+        }
+        println!();
+    }
+
+    println!("{}", "Estimate Basis:".bold().underline());
+    println!(
+        "  Confidence: {}",
+        fit.effective_estimate_confidence().label()
+    );
+
+    if basis.method == "unsupported" || fit.estimated_tps <= 0.0 {
+        println!();
+        return;
+    }
+
+    if let Some(c) = basis.local_calibration {
+        println!(
+            "  Calibrated x{:.2} from benchmark run(s) on this exact hardware \
+             (yours and/or the llmfit community's)",
+            c
+        );
+    }
+    match basis.method.as_str() {
+        "gpu_bandwidth_roofline" => {
+            let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);
+            println!(
+                "  Method: GPU bandwidth roofline — {:.0} GB/s x {:.2} efficiency",
+                bw, basis.efficiency
+            );
+            if let Some(ddr) = basis.ddr_bandwidth_gbps {
+                println!(
+                    "  MoE offload: expert streaming bounded by ~{:.0} GB/s system RAM bandwidth",
+                    ddr
+                );
+            }
+        }
+        "gpu_ddr_offload_roofline" => {
+            let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);
+            let ddr = basis.ddr_bandwidth_gbps.unwrap_or(0.0);
+            println!(
+                "  Method: GPU/RAM offload roofline — {:.0} GB/s GPU x {:.2} efficiency, \
+                 {:.0} GB/s system RAM",
+                bw, basis.efficiency, ddr
+            );
+        }
+        "cpu_constant" => {
+            println!("  Method: CPU heuristic constant (no GPU acceleration assumed)");
+        }
+        _ => {
+            println!("  Method: per-backend heuristic constant — GPU not in the bandwidth table,");
+            println!("          so expect a wide error band. Please report your GPU model so we");
+            println!(
+                "          can add real bandwidth data (github.com/AlexsJones/llmfit/issues)."
+            );
+        }
+    }
+    println!(
+        "  Models single-request generation at ctx <= {} tokens.",
+        basis.assumed_context
+    );
+    match (fit.prefill_tps, fit.ttft_ms) {
+        (Some(prefill), Some(ttft)) => {
+            println!(
+                "  Prefill (est.): ~{:.0} tok/s -> ~{:.0} ms time-to-first-token at {} prompt tokens",
+                prefill, ttft, fit.effective_context_length
+            );
+        }
+        _ => {
+            println!(
+                "  Prompt processing (prefill/TTFT) is not estimated for this model/hardware."
+            );
+        }
+    }
+    println!("  Baseline error band is roughly +/-30%.");
+    println!("{}", "  Verify on this machine:".bold());
+    println!(
+        "    llmfit bench \"{}\"    (against a running provider)",
+        fit.model.name
+    );
+    if let Some(bench_cmd) = crate::serve_shared::generate_llamabench_command(fit) {
+        println!(
+            "    {}    (compare the tg128 row; get the path via `llmfit download`)",
+            bench_cmd
+        );
+    }
+    println!();
+}
+
+/// The table's tok/s cell: a measurement (marked ✓), else the estimate, else
+/// `-` for a cluster layout vLLM refuses, which has no speed. JSON keeps
+/// `estimated_tps` as a number (0.0 for such a fit).
+fn tps_cell(fit: &ModelFit) -> String {
+    match &fit.measured_tps {
+        Some(m) => format!("{:.1} ✓", m.tok_s),
+        None if !fit.reports_speed() => "-".to_string(),
+        None => format!("{:.1}", fit.estimated_tps),
+    }
+}
+
 /// Generate a llama.cpp command string for a model fit.
 fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
     if fit.run_mode == RunMode::TensorParallel {
@@ -553,14 +773,15 @@ fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
         ""
     };
 
-    // Use the -hf option with HuggingFace repo to let llama-cli handle model
+    // Use the -hf option with HuggingFace repo to let llama.cpp handle model
     // downloading/caching. This avoids path guessing issues and works for both
-    // installed and non-installed models. llama-cli automatically downloads
+    // installed and non-installed models. llama.cpp automatically downloads
     // to its own cache if the model isn't present locally.
+    let prefix = llamacpp_cli_invocation().1.cli_command();
     repo.map(|repo| {
         format!(
-            "llama-cli -hf {}:{} {} -c {}{}",
-            repo, quant, ngl_args, context, conversation_arg
+            "{} -hf {}:{} {} -c {}{}",
+            prefix, repo, quant, ngl_args, context, conversation_arg
         )
     })
 }
@@ -601,8 +822,9 @@ fn llamacpp_supports_fit_arg() -> bool {
     static SUPPORTS_FIT_ARG: OnceLock<bool> = OnceLock::new();
 
     *SUPPORTS_FIT_ARG.get_or_init(|| {
-        let candidate = llamacpp_binary_arg();
-        let Ok(output) = std::process::Command::new(&candidate)
+        let (binary, style) = llamacpp_cli_invocation();
+        let Ok(output) = std::process::Command::new(binary)
+            .args(style.cli_args())
             .arg("--help")
             .output()
         else {
@@ -614,15 +836,20 @@ fn llamacpp_supports_fit_arg() -> bool {
     })
 }
 
-fn llamacpp_binary_arg() -> PathBuf {
-    let name = format!("llama-cli{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(dir) = std::env::var("LLAMA_CPP_PATH") {
-        let candidate = PathBuf::from(dir).join(&name);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from(name)
+/// The detected llama.cpp CLI binary and how to invoke it (`llama cli` vs
+/// the classic `llama-cli`). Falls back to a bare `llama-cli` name on PATH
+/// when nothing was detected, matching the previous probing behavior.
+fn llamacpp_cli_invocation() -> &'static (PathBuf, LlamaCppBinaryStyle) {
+    static INVOCATION: OnceLock<(PathBuf, LlamaCppBinaryStyle)> = OnceLock::new();
+    INVOCATION.get_or_init(|| {
+        // Binary detection only: constructing a full `LlamaCppProvider` would
+        // also probe for a running llama-server over HTTP.
+        let (cli, _, style) = llmfit_core::providers::detect_llamacpp_binaries();
+        let binary = cli
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("llama-cli{}", std::env::consts::EXE_SUFFIX)));
+        (binary, style)
+    })
 }
 
 /// Best-effort heuristic: checks use_case and name substrings to guess whether
@@ -672,78 +899,58 @@ pub fn display_json_diff_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
 }
 
 fn system_json(specs: &SystemSpecs) -> serde_json::Value {
-    let gpus_json: Vec<serde_json::Value> = specs
-        .gpus
-        .iter()
-        .map(|g| {
-            serde_json::json!({
-                "name": g.name,
-                "vram_gb": g.vram_gb.map(round2),
-                "backend": g.backend.label(),
-                "count": g.count,
-                "unified_memory": g.unified_memory,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "total_ram_gb": round2(specs.total_ram_gb),
-        "available_ram_gb": round2(specs.available_ram_gb),
-        "cpu_cores": specs.total_cpu_cores,
-        "cpu_name": specs.cpu_name,
-        "has_gpu": specs.has_gpu,
-        "gpu_vram_gb": specs.gpu_vram_gb.map(round2),
-        "gpu_name": specs.gpu_name,
-        "gpu_count": specs.gpu_count,
-        "unified_memory": specs.unified_memory,
-        "backend": specs.backend.label(),
-        "gpus": gpus_json,
-    })
+    crate::serve_shared::system_json(specs)
 }
 
+/// `fit.best_quant` for CLI display, cleared to an em dash when it's a
+/// GGUF-style label that doesn't apply to a native NVFP4/MXFP4-named repo
+/// (issue #969, problem 3). Mirrors `serve_shared::sanitized_best_quant`,
+/// the JSON-facing version of the same check.
+fn display_best_quant(fit: &ModelFit) -> &str {
+    crate::serve_shared::sanitized_best_quant(fit).unwrap_or("\u{2014}")
+}
+
+/// CLI `fit --json` envelope: the shared serializer plus this frontend's legacy
+/// overlays. The overlaid keys carry human-readable strings the API/MCP side
+/// expresses as machine codes (with the human string under a `*_label` key);
+/// the CLI's overloaded values are load-bearing for existing scripts, so they
+/// stay put here until a future PR deprecates them (see #759).
 fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
-    serde_json::json!({
-        "name": fit.model.name,
-        "provider": fit.model.provider,
-        "parameter_count": fit.model.parameter_count,
-        "params_b": round2(fit.model.params_b()),
-        "context_length": fit.model.context_length,
-        "effective_context_length": fit.effective_context_length,
-        "use_case": fit.model.use_case,
-        "category": fit.use_case.label(),
-        "release_date": fit.model.release_date,
-        "license": fit.model.license,
-        "is_moe": fit.model.is_moe,
-        "fit_level": fit.fit_text(),
-        "run_mode": fit.run_mode_text(),
-        "score": round1(fit.score),
-        "score_components": {
-            "quality": round1(fit.score_components.quality),
-            "speed": round1(fit.score_components.speed),
-            "fit": round1(fit.score_components.fit),
-            "context": round1(fit.score_components.context),
-        },
-        "estimated_tps": round1(fit.estimated_tps),
-        "runtime": fit.runtime_text(),
-        "runtime_label": fit.runtime.label(),
-        "best_quant": fit.best_quant,
-        "disk_size_gb": round2(fit.model.estimate_disk_gb(&fit.best_quant)),
-        "memory_required_gb": round2(fit.memory_required_gb),
-        "memory_available_gb": round2(fit.memory_available_gb),
-        "moe_offloaded_gb": fit.moe_offloaded_gb.map(round2),
-        "total_memory_gb": round2(fit.memory_required_gb + fit.moe_offloaded_gb.unwrap_or(0.0)),
-        "utilization_pct": round1(fit.utilization_pct),
-        "notes": fit.notes,
-        "gguf_sources": fit.model.gguf_sources,
-        "installed": fit.installed,
-        "capabilities": fit.model.capabilities.iter().map(|c| c.label()).collect::<Vec<_>>(),
-        "capability_ids": serde_json::to_value(&fit.model.capabilities).unwrap(),
-        "ollama_name": ollama_name_for(&fit.model.name),
-    })
+    let mut value = crate::serve_shared::fit_to_json(fit);
+    let obj = value
+        .as_object_mut()
+        .expect("fit_to_json returns an object");
+    obj.insert("fit_level".to_string(), serde_json::json!(fit.fit_text()));
+    obj.insert(
+        "run_mode".to_string(),
+        serde_json::json!(fit.run_mode_text()),
+    );
+    obj.insert("runtime".to_string(), serde_json::json!(fit.runtime_text()));
+    obj.insert(
+        "capabilities".to_string(),
+        serde_json::json!(
+            fit.model
+                .capabilities
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+        ),
+    );
+    value
 }
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
+}
+
+fn fit_to_json_for_specs(fit: &ModelFit, specs: &SystemSpecs) -> serde_json::Value {
+    let mut value = fit_to_json(fit);
+    value["runnable"] = serde_json::json!(
+        llmfit_core::fit::backend_compatible(&fit.model, specs)
+            && fit.fit_level != FitLevel::TooTight
+            && fit.runtime != InferenceRuntime::Unsupported
+    );
+    value
 }
 
 fn round2(v: f64) -> f64 {
@@ -756,6 +963,11 @@ pub fn display_model_plan(plan: &PlanEstimate) {
     println!("{} {}", "Provider:".bold(), plan.provider);
     println!("{} {}", "Context:".bold(), plan.context);
     println!("{} {}", "Quantization:".bold(), plan.quantization);
+    println!(
+        "{} {:.2} GB (weights only)",
+        "Disk (est):".bold(),
+        plan.disk_size_gb
+    );
     println!("{} {}", "KV cache:".bold(), plan.kv_quant.label());
     if let Some(tps) = plan.target_tps {
         println!("{} {:.1} tok/s", "Target TPS:".bold(), tps);
@@ -854,6 +1066,76 @@ pub fn display_json_plan(plan: &PlanEstimate) {
     );
 }
 
+pub fn display_json_storage(specs: &SystemSpecs, storage: &StorageEstimate) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Output<'a> {
+        system: serde_json::Value,
+        storage: &'a StorageEstimate,
+    }
+    let output = serde_json::to_string_pretty(&Output {
+        system: system_json(specs),
+        storage,
+    })
+    .map_err(|err| format!("Could not serialize storage estimate: {err}"))?;
+    println!("{output}");
+    Ok(())
+}
+
+pub fn display_storage(storage: &StorageEstimate) {
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "Model")]
+        name: String,
+        #[tabled(rename = "Quant")]
+        quant: String,
+        #[tabled(rename = "Fit")]
+        fit: String,
+        #[tabled(rename = "Runtime")]
+        runtime: &'static str,
+        #[tabled(rename = "Score")]
+        score: String,
+        #[tabled(rename = "Disk (GB)")]
+        disk: String,
+    }
+    let selection = match storage.selection {
+        StorageSelection::Score => "highest score",
+        StorageSelection::Largest => "largest weight storage",
+    };
+    println!(
+        "Library: {} of {} requested models ({} eligible; {selection})",
+        storage.selected_count, storage.keep_requested, storage.eligible_count
+    );
+    if !storage.models.is_empty() {
+        let rows = storage.models.iter().map(|model| Row {
+            name: model.name.clone(),
+            quant: model.best_quant.clone(),
+            fit: format!("{:?}", model.fit_level),
+            runtime: model.runtime.label(),
+            score: format!("{:.1}", model.score),
+            disk: format!("{:.2}", model.disk_size_gb),
+        });
+        println!("{}", Table::new(rows).with(Style::rounded()));
+    }
+    println!("Library weights: {:.2} GB", storage.library_gb);
+    println!("OS/apps reserve: {:.2} GB", storage.os_reserve_gb);
+    println!("Scratch: {:.2} GB", storage.download_scratch_gb);
+    println!("Required: {:.2} GB", storage.need_gb);
+    println!(
+        "Capacity target ({}% free): {:.2} GB",
+        storage.headroom_percent, storage.target_capacity_gb
+    );
+    let tier = |gb: Option<u32>| {
+        gb.map(|gb| format!("{gb} GB"))
+            .unwrap_or_else(|| "No recommendation".to_string())
+    };
+    println!("Minimum SSD: {}", tier(storage.minimum_ssd_gb));
+    println!("Suggested SSD: {}", tier(storage.suggested_ssd_gb));
+    println!("{}", storage.estimate_notice);
+    for warning in &storage.warnings {
+        println!("Warning: {warning}");
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // CSV export for spreadsheet / data analysis
 // ────────────────────────────────────────────────────────────────────
@@ -886,6 +1168,7 @@ struct CsvFitRow {
     license: Option<String>,
     is_moe: bool,
     installed: bool,
+    runnable: bool,
 }
 
 /// Serialize model fits as CSV to stdout.
@@ -919,6 +1202,8 @@ pub fn display_csv_fits(fits: &[ModelFit]) {
                 license: fit.model.license.clone(),
                 is_moe: fit.model.is_moe,
                 installed: fit.installed,
+                runnable: fit.fit_level != FitLevel::TooTight
+                    && fit.runtime != InferenceRuntime::Unsupported,
             })
             .expect("CSV serialization failed");
     }
@@ -929,8 +1214,56 @@ pub fn display_csv_fits(fits: &[ModelFit]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_json_does_not_mark_backend_incompatible_info_as_runnable() {
+        use llmfit_core::hardware::GpuBackend;
+        use llmfit_core::models::UseCase;
+        let specs = SystemSpecs {
+            total_ram_gb: 64.0,
+            available_ram_gb: 64.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuX86,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+        let mut fit = mock_fit(RunMode::CpuOnly, UseCase::General, "general");
+        assert_eq!(fit_to_json_for_specs(&fit, &specs)["runnable"], true);
+        fit.model.name = "mlx-community/test-7B".to_string();
+        assert_eq!(fit_to_json_for_specs(&fit, &specs)["runnable"], false);
+    }
     use llmfit_core::fit::{FitLevel, InferenceRuntime, ScoreComponents};
     use llmfit_core::models::{Capability, GgufSource, ModelFormat, UseCase};
+
+    #[test]
+    fn tps_cell_shows_dash_for_a_refused_cluster_layout() {
+        let mut fit = mock_fit(RunMode::TensorParallel, UseCase::Chat, "chat");
+        fit.estimated_tps = 12.34;
+        assert_eq!(tps_cell(&fit), "12.3");
+        fit.estimated_tps = 0.0;
+        fit.tp_layout_invalid = true;
+        assert_eq!(tps_cell(&fit), "-");
+        // JSON keeps the number.
+        assert_eq!(fit_to_json(&fit)["estimated_tps"], 0.0);
+
+        // `diff`: no speed and no delta against or from a refused layout.
+        let mut ok = mock_fit(RunMode::TensorParallel, UseCase::Chat, "chat");
+        ok.estimated_tps = 20.0;
+        let mut other = ok.clone();
+        other.estimated_tps = 25.0;
+        assert_eq!(diff_tps_cell(&other, &ok), "25.0 (+5.0)");
+        assert_eq!(diff_tps_cell(&fit, &ok), "-");
+        assert_eq!(diff_tps_cell(&ok, &fit), "20.0");
+    }
 
     fn mock_fit(run_mode: RunMode, use_case: UseCase, model_use_case: &str) -> ModelFit {
         ModelFit {
@@ -955,6 +1288,7 @@ mod tests {
                     provider: "test".to_string(),
                 }],
                 capabilities: vec![],
+                languages: vec![],
                 format: ModelFormat::Gguf,
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -989,7 +1323,42 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8_192,
+            usable_context: 8_192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
+            tp_size: None,
+            layout_refusal: None,
+            tp_layout_invalid: false,
+            estimate_confidence: llmfit_core::EstimateConfidence::Estimated,
+            prefill_tps: None,
+            ttft_ms: None,
         }
+    }
+
+    #[test]
+    fn cli_json_keeps_legacy_vocab_while_shared_uses_codes() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.model.capabilities = vec![Capability::ToolUse];
+
+        let cli = fit_to_json(&fit);
+        let shared = crate::serve_shared::fit_to_json(&fit);
+
+        // The CLI overlay preserves the human-readable values existing
+        // `fit --json` scripts depend on — unchanged from before the unification.
+        assert_eq!(cli["fit_level"], "Good");
+        assert_eq!(cli["run_mode"], "GPU");
+        assert_eq!(cli["runtime"], "llama.cpp");
+        assert_eq!(cli["capabilities"], serde_json::json!(["Tool Use"]));
+
+        // The shared (REST/MCP) envelope emits stable machine codes under the
+        // same keys, with the human string relocated to a `*_label` key.
+        assert_eq!(shared["fit_level"], "good");
+        assert_eq!(shared["fit_label"], "Good");
+        assert_eq!(shared["run_mode"], "gpu");
+        assert_eq!(shared["run_mode_label"], "GPU");
+        assert_eq!(shared["runtime"], "llamacpp");
+        assert_eq!(shared["runtime_label"], "llama.cpp");
+        assert_eq!(shared["capability_ids"], serde_json::json!(["tool_use"]));
     }
 
     #[test]
@@ -1078,5 +1447,87 @@ mod tests {
 
         assert_eq!(json["context_length"], 131_072);
         assert_eq!(json["effective_context_length"], 8_192);
+    }
+
+    #[test]
+    fn cli_json_carries_confidence_and_prefill_fields_through_unchanged() {
+        // The CLI overlay only rewrites fit_level/run_mode/runtime/capabilities;
+        // issue #969's additive fields must pass through from the shared
+        // envelope untouched.
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.estimate_basis.local_calibration = Some(1.2);
+        fit.prefill_tps = Some(500.0);
+        fit.ttft_ms = Some(16.0);
+
+        let json = fit_to_json(&fit);
+
+        assert_eq!(json["estimate_confidence"], "calibrated");
+        assert_eq!(json["estimate_confidence_label"], "calibrated");
+        assert_eq!(json["prefill_tps"], 500.0);
+        assert_eq!(json["ttft_ms"], 16.0);
+    }
+
+    #[test]
+    fn display_best_quant_clears_gguf_label_for_native_low_precision_named_model() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.model.name = "nvidia/Qwen3-8B-NVFP4".to_string();
+        fit.best_quant = "Q8_0".to_string();
+
+        assert_eq!(display_best_quant(&fit), "\u{2014}");
+    }
+
+    #[test]
+    fn display_best_quant_keeps_label_for_plain_gguf_model() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        assert_eq!(display_best_quant(&fit), "Q4_K_M");
+    }
+
+    #[test]
+    fn table_confidence_cell_uses_the_short_code_not_the_full_label() {
+        use llmfit_core::benchmarks::{MeasuredSource, MeasuredTps};
+
+        // Estimated: nothing measured, nothing calibrated.
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        assert_eq!(confidence_cell(&fit), "est");
+
+        // Calibrated: a local calibration factor, still no measurement.
+        fit.estimate_basis.local_calibration = Some(1.2);
+        assert_eq!(confidence_cell(&fit), "calib");
+
+        // Measured beats calibrated, and is the case that used to render the
+        // 23-column "measured (this machine)" that wrapped the row (#974).
+        fit.measured_tps = Some(MeasuredTps {
+            tok_s: 42.0,
+            sample_count: 3,
+            hardware_label: "this machine".to_string(),
+            source: MeasuredSource::LocalBench,
+            match_grade: None,
+        });
+        assert_eq!(confidence_cell(&fit), "local");
+    }
+
+    #[test]
+    fn table_confidence_cell_reads_through_the_stale_stored_field() {
+        use llmfit_core::benchmarks::{MeasuredSource, MeasuredTps};
+
+        // `estimate_confidence` is only correct if every writer remembered to
+        // call refresh_estimate_confidence(); the table must derive it instead,
+        // or it prints "est" beside a measured tok/s figure (issue #969).
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.measured_tps = Some(MeasuredTps {
+            tok_s: 42.0,
+            sample_count: 3,
+            hardware_label: "this machine".to_string(),
+            source: MeasuredSource::LocalBench,
+            match_grade: None,
+        });
+        // Deliberately left stale — no refresh_estimate_confidence() call.
+        assert_eq!(
+            fit.estimate_confidence,
+            llmfit_core::EstimateConfidence::Estimated
+        );
+
+        assert_eq!(confidence_cell(&fit), "local");
     }
 }

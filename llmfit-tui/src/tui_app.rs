@@ -1,15 +1,15 @@
-use llmfit_core::fit::{CalcConfig, FitLevel, ModelFit, SortColumn, backend_compatible};
+use llmfit_core::fit::{CalcConfig, FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
-use llmfit_core::models::{Capability, ModelDatabase, UseCase};
-use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
+use llmfit_core::models::{Capability, LlmModel, ModelDatabase, UseCase, matches_provider_filter};
+use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan_with_config};
 use llmfit_core::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-    ModelProvider, OllamaProvider, PullEvent, PullHandle, VllmProvider,
+    ModelProvider, OllamaProvider, PullEvent, PullHandle, RamaLamaProvider, VllmProvider,
+    command_exists,
 };
 use llmfit_core::quality;
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Add;
 use std::sync::mpsc;
 use std::{cmp, thread};
 
@@ -46,6 +46,32 @@ fn next_grapheme_boundary(value: &str, index: usize) -> usize {
         .unwrap_or_else(|| value.len())
 }
 
+fn insert_ascii_graphic_input(value: &mut String, cursor: &mut usize, c: char) {
+    if !c.is_ascii_graphic() {
+        return;
+    }
+
+    *cursor = floor_char_boundary(value, *cursor);
+    value.insert(*cursor, c);
+    *cursor += c.len_utf8();
+}
+
+fn backspace_grapheme_input(value: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        let prev = previous_grapheme_boundary(value, *cursor);
+        value.drain(prev..*cursor);
+        *cursor = prev;
+    }
+}
+
+fn delete_grapheme_input(value: &mut String, cursor: usize) {
+    if cursor < value.len() {
+        let cursor = floor_char_boundary(value, cursor);
+        let next = next_grapheme_boundary(value, cursor);
+        value.drain(cursor..next);
+    }
+}
+
 /// Messages sent from background provider-detection threads back to the main TUI.
 pub enum ProviderDetectionMsg {
     Ollama {
@@ -61,15 +87,22 @@ pub enum ProviderDetectionMsg {
     },
     DockerMr {
         available: bool,
+        app_installed: bool,
         installed: HashSet<String>,
         installed_count: usize,
     },
     LmStudio {
         available: bool,
+        app_installed: bool,
         installed: HashSet<String>,
         installed_count: usize,
     },
     Vllm {
+        available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+    },
+    RamaLama {
         available: bool,
         installed: HashSet<String>,
         installed_count: usize,
@@ -98,6 +131,7 @@ pub enum InputMode {
     DownloadManager,
     FilterPopup,
     Benchmarks,
+    BenchOffer,
 }
 
 /// Fields in the Filter Popup modal.
@@ -109,6 +143,7 @@ pub enum FilterPopupField {
     MemPctMax,
     SortDirection,
     FitFilter,
+    Availability,
 }
 
 impl FilterPopupField {
@@ -119,18 +154,20 @@ impl FilterPopupField {
             Self::MemPctMin => Self::MemPctMax,
             Self::MemPctMax => Self::SortDirection,
             Self::SortDirection => Self::FitFilter,
-            Self::FitFilter => Self::ParamsMin,
+            Self::FitFilter => Self::Availability,
+            Self::Availability => Self::ParamsMin,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::ParamsMin => Self::FitFilter,
+            Self::ParamsMin => Self::Availability,
             Self::ParamsMax => Self::ParamsMin,
             Self::MemPctMin => Self::ParamsMax,
             Self::MemPctMax => Self::MemPctMin,
             Self::SortDirection => Self::MemPctMax,
             Self::FitFilter => Self::SortDirection,
+            Self::Availability => Self::FitFilter,
         }
     }
 }
@@ -144,6 +181,7 @@ struct FilterSnapshot {
     mem_pct_max: String,
     sort_ascending: bool,
     fit_filter: FitFilter,
+    availability_filter: AvailabilityFilter,
 }
 
 /// Fields in the Advanced Configuration modal.
@@ -156,6 +194,7 @@ pub enum AdvConfigField {
     FactorTp,         // Run mode factor: Tensor parallel
     FactorCpuOnly,    // Run mode factor: CPU only
     ContextCap,       // Context window cap
+    DdrBandwidth,     // System RAM bandwidth (GB/s) for MoE offload
 }
 
 impl AdvConfigField {
@@ -167,13 +206,15 @@ impl AdvConfigField {
             AdvConfigField::FactorMoe => AdvConfigField::FactorTp,
             AdvConfigField::FactorTp => AdvConfigField::FactorCpuOnly,
             AdvConfigField::FactorCpuOnly => AdvConfigField::ContextCap,
-            AdvConfigField::ContextCap => AdvConfigField::Efficiency,
+            AdvConfigField::ContextCap => AdvConfigField::DdrBandwidth,
+            AdvConfigField::DdrBandwidth => AdvConfigField::Efficiency,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            AdvConfigField::Efficiency => AdvConfigField::ContextCap,
+            AdvConfigField::Efficiency => AdvConfigField::DdrBandwidth,
+            AdvConfigField::DdrBandwidth => AdvConfigField::ContextCap,
             AdvConfigField::FactorGpu => AdvConfigField::Efficiency,
             AdvConfigField::FactorCpuOffload => AdvConfigField::FactorGpu,
             AdvConfigField::FactorMoe => AdvConfigField::FactorCpuOffload,
@@ -288,6 +329,278 @@ pub enum BenchMsg {
     },
     ModelDone(quality::ModelQualityResult),
     AllDone,
+}
+
+/// Messages sent from the bench-offer worker thread (benchmark of the
+/// selected model, plus the optional share-as-PR flow) to the UI.
+pub enum BenchOfferMsg {
+    Progress(String),
+    /// GitHub device-flow authorization needed: show code + URL in the modal.
+    AuthCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    Done {
+        summary: String,
+        pr_url: Option<String>,
+        /// Set when the bench succeeded but the share step failed/was skipped.
+        share_note: Option<String>,
+    },
+    Error(String),
+}
+
+/// UI state of the bench-offer modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchOfferState {
+    /// Waiting for the user to confirm, toggle share, or dismiss.
+    Offer,
+    /// Worker thread is benchmarking (and possibly sharing).
+    Running,
+    /// Finished — summary (and PR URL, if shared) is displayed.
+    Done,
+    /// Failed — error message is displayed.
+    Error,
+}
+
+/// Match a running provider's model tag against an HF-style model name,
+/// reusing the same heuristics as the installed-column detection.
+///
+/// Two deliberately separate passes: Ollama-style candidate matching runs
+/// only against the verbatim id, while file paths reported by llama-server
+/// (".../gemma-3.Q8_0.gguf") get exact stem matching only — feeding a bare
+/// stem into the Ollama candidate heuristics would match whole families.
+fn bench_target_matches(target_model: &str, hf_name: &str) -> bool {
+    llmfit_core::providers::tag_matches_model(target_model, hf_name)
+}
+
+/// Body of the bench-offer worker thread: find the selected model on a running
+/// provider, benchmark it, and optionally share the result as a PR. All
+/// user-visible output goes through `tx` — never stdout/stderr (the TUI owns
+/// the terminal).
+fn bench_offer_worker(
+    tx: &mpsc::Sender<BenchOfferMsg>,
+    model_name: &str,
+    share: bool,
+    specs: &SystemSpecs,
+) {
+    use llmfit_core::bench::{self, BenchTarget};
+    use llmfit_core::share;
+
+    let targets = bench::discover_all_targets();
+    let target = targets.into_iter().find(|t| {
+        let model = match t {
+            BenchTarget::Ollama { model, .. }
+            | BenchTarget::VLlm { model, .. }
+            | BenchTarget::Ferrum { model, .. }
+            | BenchTarget::Mlx { model, .. }
+            | BenchTarget::LlamaCpp { model, .. }
+            | BenchTarget::LmStudio { model, .. } => model,
+        };
+        bench_target_matches(model, model_name)
+    });
+    let Some(target) = target else {
+        let _ = tx.send(BenchOfferMsg::Error(format!(
+            "{} is installed but not served by any running provider",
+            model_name
+        )));
+        return;
+    };
+
+    const RUNS: usize = 3;
+    let (provider, url, tag) = match &target {
+        BenchTarget::Ollama { url, model } => ("ollama", url, model),
+        BenchTarget::VLlm { url, model } => ("vllm", url, model),
+        BenchTarget::Ferrum { url, model } => ("ferrum", url, model),
+        BenchTarget::Mlx { url, model } => ("mlx", url, model),
+        BenchTarget::LlamaCpp { url, model } => ("llamacpp", url, model),
+        BenchTarget::LmStudio { url, model } => ("lmstudio", url, model),
+    };
+
+    // llama-server reports file paths as model ids — display just the stem.
+    let display_tag = tag
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(tag)
+        .trim_end_matches(".gguf")
+        .to_string();
+
+    // Resolve and verify GitHub credentials BEFORE the benchmark runs, so a
+    // missing or expired token (or the device-flow prompt) surfaces while the
+    // user is still watching — not after minutes of benching. A credential
+    // problem never aborts the bench: it downgrades to save-locally.
+    let mut share_note: Option<String> = None;
+    let share_token: Option<String> = if share {
+        let _ = tx.send(BenchOfferMsg::Progress(
+            "Checking GitHub credentials...".into(),
+        ));
+        match tui_share_auth(tx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                share_note = Some(format!("Share skipped: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let progress_tx = tx.clone();
+    let tag_for_progress = display_tag.clone();
+    let on_progress = move |i: usize, total: usize| {
+        let msg = if i == 0 {
+            format!("Warming up {}...", tag_for_progress)
+        } else {
+            format!("Benchmarking {} — run {}/{}", tag_for_progress, i, total)
+        };
+        let _ = progress_tx.send(BenchOfferMsg::Progress(msg));
+    };
+
+    let result = bench::benchmark_target(&target, RUNS, &on_progress);
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(BenchOfferMsg::Error(format!(
+                "benchmark via {} at {} failed: {}",
+                provider, url, e
+            )));
+            return;
+        }
+    };
+
+    let ttft = result
+        .summary
+        .avg_ttft_ms
+        .map(|v| format!("{:.0} ms TTFT, ", v))
+        .unwrap_or_default();
+    let summary = format!(
+        "{}: {:.1} tok/s avg ({:.1}–{:.1}), {}{} runs via {}",
+        display_tag,
+        result.summary.avg_tps,
+        result.summary.min_tps,
+        result.summary.max_tps,
+        ttft,
+        result.summary.num_runs,
+        provider,
+    );
+
+    // Always record the run locally; sharing (now or later) uploads from the
+    // pending store, so declining to share never discards the result.
+    let store_err = share::store_local(std::slice::from_ref(&result), specs).err();
+
+    let Some(token) = share_token else {
+        let mut note = share_note.unwrap_or_default();
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        match store_err {
+            None => {
+                let pending = share::pending_benchmarks().len();
+                note.push_str(&format!(
+                    "Saved locally ({pending} pending) — share any time with \
+                     `llmfit bench --share`."
+                ));
+            }
+            Some(e) => note.push_str(&format!("Warning: could not save result locally: {e}")),
+        }
+        let _ = tx.send(BenchOfferMsg::Done {
+            summary,
+            pr_url: None,
+            share_note: Some(note),
+        });
+        return;
+    };
+
+    // Upload the entire pending store: this run plus anything stored earlier.
+    let stored = share::pending_benchmarks();
+    let _ = tx.send(BenchOfferMsg::Progress(format!(
+        "Opening pull request on GitHub ({} submission(s))...",
+        stored.len()
+    )));
+    match share::submit_stored(&stored, &token) {
+        Ok(outcome) => {
+            share::mark_shared(&stored);
+            let mut notes: Vec<String> = Vec::new();
+            if outcome.reused_existing_pr {
+                notes.push(format!(
+                    "Added {} result(s) to your open benchmark PR.",
+                    outcome.uploaded
+                ));
+            }
+            if outcome.skipped > 0 {
+                notes.push(format!(
+                    "{} previously submitted result(s) skipped.",
+                    outcome.skipped
+                ));
+            }
+            if outcome.pr_url.is_none() {
+                notes.push("All results were already contributed upstream.".to_string());
+            }
+            let _ = tx.send(BenchOfferMsg::Done {
+                summary,
+                pr_url: outcome.pr_url,
+                share_note: (!notes.is_empty()).then(|| notes.join(" ")),
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(BenchOfferMsg::Done {
+                summary,
+                pr_url: None,
+                share_note: Some(format!(
+                    "Share failed: {e}. Results remain stored locally — retry with \
+                     `llmfit bench --share`."
+                )),
+            });
+        }
+    }
+}
+
+/// Resolve a *validated* GitHub token for the TUI share flow: env or cached
+/// token (verified against the API), falling back to the device flow with the
+/// code rendered inside the modal. Runs before the benchmark so credential
+/// problems surface immediately.
+fn tui_share_auth(tx: &mpsc::Sender<BenchOfferMsg>) -> Result<String, String> {
+    use llmfit_core::share;
+
+    if let Some((token, source)) = share::resolve_token_noninteractive_with_source() {
+        match share::validate_token(&token) {
+            Ok(Some(_login)) => return Ok(token),
+            Ok(None) => match source {
+                share::TokenSource::Env => {
+                    return Err("GITHUB_TOKEN/GH_TOKEN is invalid or expired.".into());
+                }
+                // Stale cached login — drop it and fall through to a fresh
+                // device-flow authorization.
+                share::TokenSource::Cache => share::clear_cached_token(),
+            },
+            Err(e) => return Err(format!("could not reach GitHub: {e}.")),
+        }
+    }
+
+    let Some(client_id) = share::oauth_client_id() else {
+        return Err("no GitHub token. Set GITHUB_TOKEN or GH_TOKEN.".into());
+    };
+    let auth = share::device_flow_start(&client_id)?;
+    let _ = tx.send(BenchOfferMsg::AuthCode {
+        user_code: auth.user_code.clone(),
+        verification_uri: auth.verification_uri.clone(),
+    });
+    let mut interval = auth.interval;
+    loop {
+        thread::sleep(std::time::Duration::from_secs(interval + 1));
+        match share::device_flow_poll(&client_id, &auth.device_code) {
+            Ok(share::DevicePoll::Token(t)) => {
+                let _ = share::cache_token(&t);
+                return Ok(t);
+            }
+            Ok(share::DevicePoll::Pending) => continue,
+            Ok(share::DevicePoll::SlowDown) => {
+                interval += 5;
+                continue;
+            }
+            Ok(share::DevicePoll::Failed(e)) | Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Per-model bench status for the live dashboard rows.
@@ -495,6 +808,7 @@ fn sort_column_from_label(s: &str) -> SortColumn {
         "Ctx" => SortColumn::Ctx,
         "Date" => SortColumn::ReleaseDate,
         "Use" => SortColumn::UseCase,
+        "Provider" => SortColumn::Provider,
         _ => SortColumn::Score,
     }
 }
@@ -517,6 +831,38 @@ fn fuzzy_match(query: &str, candidate: &str) -> bool {
         }
     }
     q.peek().is_none()
+}
+
+/// Whether `name` is one of the currently selected entries of the provider filter.
+pub(crate) fn provider_selected(name: &str, providers: &[String], selected: &[bool]) -> bool {
+    providers
+        .iter()
+        .position(|p| p == name)
+        .and_then(|idx| selected.get(idx).copied())
+        .unwrap_or(false)
+}
+
+/// The GGUF-source provider that got this model through the provider filter,
+/// when the model's own provider is not selected.
+///
+/// The catalog lists base models (e.g. `Qwen/Qwen3-4B` from Alibaba) while the
+/// GGUF quants are published by others (unsloth, bartowski, ...), so filtering
+/// by a GGUF publisher surfaces rows whose own provider was never selected.
+/// Returns `None` when the primary provider is selected (nothing to attribute)
+/// or when nothing matched at all.
+pub(crate) fn matched_gguf_provider<'a>(
+    model: &'a LlmModel,
+    providers: &[String],
+    selected: &[bool],
+) -> Option<&'a str> {
+    if provider_selected(&model.provider, providers, selected) {
+        return None;
+    }
+    model
+        .gguf_sources
+        .iter()
+        .find(|gs| provider_selected(&gs.provider, providers, selected))
+        .map(|gs| gs.provider.as_str())
 }
 
 pub struct App {
@@ -547,6 +893,10 @@ pub struct App {
     // Table state
     pub selected_row: usize,
     pub table_state: TableState,
+    pub table_follow_selection: bool,
+    pub last_model_click: Option<(std::time::Instant, usize, u16)>,
+    // TUI-only sort columns
+    pub header_sort_column: Option<usize>,
 
     // Detail view
     pub show_detail: bool,
@@ -569,6 +919,7 @@ pub struct App {
     // Provider popup
     pub provider_cursor: usize,
     pub provider_search: String,
+    pub provider_search_cursor_position: usize,
     pub use_case_cursor: usize,
     pub capability_cursor: usize,
     pub download_provider_cursor: usize,
@@ -578,29 +929,23 @@ pub struct App {
     // Provider state
     pub ollama_available: bool,
     pub ollama_binary_available: bool,
-    pub ollama_installed: HashSet<String>,
-    pub ollama_installed_count: usize,
+    pub installed: llmfit_core::analysis::InstalledIndex,
     ollama: OllamaProvider,
     pub mlx_available: bool,
-    pub mlx_installed: HashSet<String>,
     mlx: MlxProvider,
     pub llamacpp_available: bool,
-    pub llamacpp_installed: HashSet<String>,
-    pub llamacpp_installed_count: usize,
     pub llamacpp_detection_hint: String,
     llamacpp: LlamaCppProvider,
     pub docker_mr_available: bool,
-    pub docker_mr_installed: HashSet<String>,
-    pub docker_mr_installed_count: usize,
+    pub docker_desktop_installed: bool,
     docker_mr: DockerModelRunnerProvider,
     pub lmstudio_available: bool,
-    pub lmstudio_installed: HashSet<String>,
-    pub lmstudio_installed_count: usize,
+    pub lmstudio_app_installed: bool,
     lmstudio: LmStudioProvider,
     pub vllm_available: bool,
-    pub vllm_installed: HashSet<String>,
-    pub vllm_installed_count: usize,
     vllm: VllmProvider,
+    pub ramalama_available: bool,
+    ramalama: RamaLamaProvider,
 
     // Download state
     pub pull_active: Option<PullHandle>,
@@ -677,6 +1022,10 @@ pub struct App {
 
     // Advanced Configuration
     pub calc_config: CalcConfig,
+    /// What "reset" in the advanced-config editor goes back to: the config the
+    /// app was started with, so a `--profile` run resets to the profile rather
+    /// than to this host's defaults (issue #969).
+    calc_config_baseline: CalcConfig,
     pub adv_config_field: AdvConfigField,
     pub adv_config_cursor_position: usize,
     pub adv_config_dirty: bool,
@@ -687,6 +1036,7 @@ pub struct App {
     pub adv_config_eff_factor_tp: String,
     pub adv_config_eff_factor_cpu_only: String,
     pub adv_config_context_cap_input: String,
+    pub adv_config_ddr_bandwidth_input: String,
 
     // Filter Popup
     pub filter_field: FilterPopupField,
@@ -719,6 +1069,10 @@ pub struct App {
     /// Index into HardwarePreset::all() when the picker is open.
     pub bench_hw_picker_cursor: usize,
     pub bench_hw_picker_open: bool,
+    /// `/` filter over the leaderboard rows (model, engine, quant, user).
+    pub bench_search_query: String,
+    /// True while the `/` search box is capturing keystrokes.
+    pub bench_search_active: bool,
 
     // Live inference-bench view (llmfit bench — distinct from community benchmarks above)
     pub show_bench: bool,
@@ -730,12 +1084,39 @@ pub struct App {
     pub bench_progress: String,
     pub live_bench_scroll: usize,
     pub bench_selected_row: usize,
+    pub bench_table_offset: usize,
     pub bench_show_detail: bool,
     pub bench_view_mode: BenchViewMode,
     pub bench_confirm_quit: bool,
     pub bench_tests_done: usize,
     pub bench_tests_total: usize,
     bench_rx: Option<mpsc::Receiver<BenchMsg>>,
+    /// In-flight leaderboard fetch; the HTTP call runs on a worker thread so
+    /// a slow or unreachable API can't freeze the UI.
+    bench_fetch_rx:
+        Option<mpsc::Receiver<Result<llmfit_core::benchmarks::LeaderboardResponse, String>>>,
+
+    // Bench-offer modal (benchmark the selected model, optionally share as PR)
+    pub bench_offer_state: BenchOfferState,
+    pub bench_offer_share: bool,
+    /// Locally stored submissions that a share would also upload.
+    pub bench_offer_pending: usize,
+    /// Why sharing cannot work right now (no token and no OAuth client id);
+    /// `None` when sharing is possible. Checked when the modal opens so the
+    /// user learns about missing credentials before benchmarking.
+    pub bench_offer_share_unavailable: Option<String>,
+    /// HF-style name of the model being offered for benchmark.
+    pub bench_offer_model: String,
+    /// Providers that have the model installed (display names).
+    pub bench_offer_providers: Vec<&'static str>,
+    pub bench_offer_progress: String,
+    /// Device-flow authorization prompt: (user_code, verification_uri).
+    pub bench_offer_auth: Option<(String, String)>,
+    pub bench_offer_summary: Option<String>,
+    pub bench_offer_pr_url: Option<String>,
+    pub bench_offer_share_note: Option<String>,
+    pub bench_offer_error: Option<String>,
+    bench_offer_rx: Option<mpsc::Receiver<BenchOfferMsg>>,
 
     // Background provider detection
     provider_detection_rx: mpsc::Receiver<ProviderDetectionMsg>,
@@ -744,7 +1125,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn with_specs_and_context(specs: SystemSpecs, context_limit: Option<u32>) -> Self {
+    /// Start the TUI with the calculation parameters a `--profile` implies.
+    ///
+    /// `profile_config` seeds [`App::calc_config`], so the opening sweep, every
+    /// rebuild, and the plan view all estimate against the profile's bandwidth
+    /// and efficiency instead of this host's (issue #969). `None` keeps the
+    /// estimator defaults, which is what the advanced-config editor starts from.
+    pub fn with_specs_context_and_config(
+        specs: SystemSpecs,
+        context_limit: Option<u32>,
+        profile_config: Option<CalcConfig>,
+    ) -> Self {
         let real_specs = specs.clone();
         let db = ModelDatabase::new();
 
@@ -764,23 +1155,21 @@ impl App {
         let ollama = OllamaProvider::new();
         let ollama_available = false;
         let ollama_binary_available = false;
-        let ollama_installed = HashSet::new();
-        let ollama_installed_count = 0;
         let mlx = MlxProvider::new();
         let mlx_available = false;
-        let mlx_installed = HashSet::new();
         let docker_mr = DockerModelRunnerProvider::new();
         let docker_mr_available = false;
-        let docker_mr_installed = HashSet::new();
-        let docker_mr_installed_count = 0;
+        let docker_desktop_installed = false;
         let lmstudio = LmStudioProvider::new();
         let lmstudio_available = false;
-        let lmstudio_installed = HashSet::new();
-        let lmstudio_installed_count = 0;
+        let lmstudio_app_installed = false;
         let vllm = VllmProvider::new();
         let vllm_available = false;
-        let vllm_installed = HashSet::new();
-        let vllm_installed_count = 0;
+        let ramalama = RamaLamaProvider::new();
+        let ramalama_available = false;
+        let mut installed = llmfit_core::analysis::InstalledIndex::empty();
+        installed.llamacpp = llamacpp_installed;
+        installed.llamacpp_count = llamacpp_installed_count;
 
         // Spawn background provider detection for network-based providers
         let (provider_tx, provider_detection_rx) = mpsc::channel();
@@ -815,8 +1204,12 @@ impl App {
             thread::spawn(move || {
                 let docker_mr = DockerModelRunnerProvider::new();
                 let (available, installed, installed_count) = docker_mr.detect_with_installed();
+                // Distinguish "not installed" from "installed but Docker
+                // Desktop isn't running" (#731).
+                let app_installed = available || llmfit_core::providers::docker_desktop_installed();
                 let _ = tx.send(ProviderDetectionMsg::DockerMr {
                     available,
+                    app_installed,
                     installed,
                     installed_count,
                 });
@@ -827,15 +1220,19 @@ impl App {
             thread::spawn(move || {
                 let lmstudio = LmStudioProvider::new();
                 let (available, installed, installed_count) = lmstudio.detect_with_installed();
+                // Distinguish "not installed" from "installed but the local
+                // server isn't running" (#731).
+                let app_installed = available || llmfit_core::providers::lmstudio_app_installed();
                 let _ = tx.send(ProviderDetectionMsg::LmStudio {
                     available,
+                    app_installed,
                     installed,
                     installed_count,
                 });
             });
         }
         {
-            let tx = provider_tx;
+            let tx = provider_tx.clone();
             thread::spawn(move || {
                 let vllm = VllmProvider::new();
                 let (available, installed, installed_count) = vllm.detect_with_installed();
@@ -846,30 +1243,57 @@ impl App {
                 });
             });
         }
+        {
+            let tx = provider_tx;
+            thread::spawn(move || {
+                let ramalama = RamaLamaProvider::new();
+                let (available, installed, installed_count) = ramalama.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::RamaLama {
+                    available,
+                    installed,
+                    installed_count,
+                });
+            });
+        }
 
         // Track how many we're skipping so the UI can surface it.
-        let backend_hidden_count = db
-            .get_all_models()
-            .iter()
-            .filter(|m| !backend_compatible(m, &specs))
-            .count();
+        let backend_hidden_count =
+            llmfit_core::analysis::backend_hidden_count(db.get_all_models(), &specs);
+
+        let calc_config = profile_config.unwrap_or_default();
 
         // Only analyze models that can actually run on this hardware.
-        let mut all_fits: Vec<ModelFit> = db
-            .get_all_models()
-            .iter()
-            .filter(|m| backend_compatible(m, &specs))
-            .map(|m| {
-                let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
-                fit.installed = providers::is_model_installed(&m.name, &ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &lmstudio_installed)
-                    || providers::is_model_installed_vllm(&m.name, &vllm_installed);
-                fit
-            })
-            .collect();
+        // Measured sources, most trustworthy first: your own runs, llmfit
+        // community submissions with matching CPU and GPU, localmaxxing presets.
+        let local_index = llmfit_core::share::LocalBenchIndex::load(&specs);
+        let community_index = llmfit_core::benchmarks::CommunityBenchIndex::for_specs(&specs);
+        let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&specs);
+        let mut all_fits: Vec<ModelFit> =
+            llmfit_core::analysis::rankable_models(db.get_all_models(), &specs)
+                .map(|m| {
+                    let mut fit = llmfit_core::analysis::analyze_with_optional_config(
+                        m,
+                        &specs,
+                        context_limit,
+                        Some(&calc_config),
+                    );
+                    fit.installed = installed.is_installed(m);
+                    let measured = local_index
+                        .as_ref()
+                        .and_then(|idx| idx.lookup(&m.name))
+                        .or_else(|| community_index.as_ref().and_then(|idx| idx.lookup(&m.name)))
+                        .or_else(|| {
+                            measured_index
+                                .as_ref()
+                                .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                        });
+                    fit.set_measured_tps(measured);
+                    fit
+                })
+                .collect();
+
+        // Calibrate formula estimates from the user's own benchmark runs.
+        llmfit_core::analysis::apply_local_calibration(&mut all_fits);
 
         // Sort by fit level then RAM usage
         all_fits = llmfit_core::fit::rank_models_by_fit(all_fits);
@@ -1050,6 +1474,17 @@ impl App {
             sort_ascending,
             selected_row: 0,
             table_state: TableState::default(),
+            table_follow_selection: true,
+            last_model_click: None,
+            header_sort_column: match saved.sort_column.as_deref() {
+                Some("Inst") => Some(1),
+                Some("Model") => Some(2),
+                Some("Quant") => Some(7),
+                Some("Disk") => Some(8),
+                Some("Mode") => Some(9),
+                Some("Fit") => Some(13),
+                _ => None,
+            },
             show_detail: false,
             show_compare: false,
             compare_mark_model: None,
@@ -1068,6 +1503,7 @@ impl App {
             plan_error: None,
             provider_cursor: 0,
             provider_search: String::new(),
+            provider_search_cursor_position: 0,
             use_case_cursor: 0,
             capability_cursor: 0,
             download_provider_cursor: 0,
@@ -1075,29 +1511,23 @@ impl App {
             download_provider_model: None,
             ollama_available,
             ollama_binary_available,
-            ollama_installed,
-            ollama_installed_count,
+            installed,
             ollama,
             mlx_available,
-            mlx_installed,
             mlx,
             llamacpp_available,
-            llamacpp_installed,
-            llamacpp_installed_count,
             llamacpp_detection_hint,
             llamacpp,
             docker_mr_available,
-            docker_mr_installed,
-            docker_mr_installed_count,
+            docker_desktop_installed,
             docker_mr,
             lmstudio_available,
-            lmstudio_installed,
-            lmstudio_installed_count,
+            lmstudio_app_installed,
             lmstudio,
             vllm_available,
-            vllm_installed,
-            vllm_installed_count,
             vllm,
+            ramalama_available,
+            ramalama,
             pull_active: None,
             pull_status: None,
             pull_percent: None,
@@ -1146,18 +1576,34 @@ impl App {
             context_limit,
             theme: Theme::load(),
             backend_hidden_count,
-            // Advanced configuration defaults
-            calc_config: CalcConfig::default(),
+            // Advanced configuration: seeded from `--profile` when given,
+            // otherwise the estimator defaults. The popup re-reads every input
+            // from `calc_config` when it opens.
+            adv_config_efficiency_input: format!("{:.2}", calc_config.efficiency),
+            adv_config_eff_factor_gpu: format!("{:.2}", calc_config.run_mode_factors.gpu),
+            adv_config_eff_factor_cpu_offload: format!(
+                "{:.2}",
+                calc_config.run_mode_factors.cpu_offload
+            ),
+            adv_config_eff_factor_moe: format!("{:.2}", calc_config.run_mode_factors.moe_offload),
+            adv_config_eff_factor_tp: format!(
+                "{:.2}",
+                calc_config.run_mode_factors.tensor_parallel
+            ),
+            adv_config_eff_factor_cpu_only: format!("{:.2}", calc_config.run_mode_factors.cpu_only),
+            adv_config_context_cap_input: match calc_config.context_cap {
+                Some(cap) => cap.to_string(),
+                None => String::new(),
+            },
+            adv_config_ddr_bandwidth_input: match calc_config.ddr_bandwidth_gbps {
+                Some(bw) => format!("{bw:.0}"),
+                None => String::new(),
+            },
+            calc_config_baseline: calc_config.clone(),
+            calc_config,
             adv_config_field: AdvConfigField::Efficiency,
             adv_config_cursor_position: 0,
             adv_config_dirty: false,
-            adv_config_efficiency_input: "0.55".to_string(),
-            adv_config_eff_factor_gpu: "1.0".to_string(),
-            adv_config_eff_factor_cpu_offload: "0.5".to_string(),
-            adv_config_eff_factor_moe: "0.8".to_string(),
-            adv_config_eff_factor_tp: "0.9".to_string(),
-            adv_config_eff_factor_cpu_only: "0.3".to_string(),
-            adv_config_context_cap_input: String::new(), // empty = use default
             // Filter popup defaults
             filter_field: FilterPopupField::ParamsMin,
             filter_cursor_position: 0,
@@ -1179,6 +1625,8 @@ impl App {
             bench_hw_label: None,
             bench_hw_picker_cursor: 0,
             bench_hw_picker_open: false,
+            bench_search_query: String::new(),
+            bench_search_active: false,
             // Live inference-bench view
             show_bench: false,
             bench_model_status: Vec::new(),
@@ -1189,12 +1637,28 @@ impl App {
             bench_progress: String::new(),
             live_bench_scroll: 0,
             bench_selected_row: 0,
+            bench_table_offset: 0,
             bench_show_detail: false,
             bench_view_mode: BenchViewMode::Results,
             bench_confirm_quit: false,
             bench_tests_done: 0,
             bench_tests_total: 0,
             bench_rx: None,
+            bench_fetch_rx: None,
+            // Bench-offer modal
+            bench_offer_state: BenchOfferState::Offer,
+            bench_offer_share: false,
+            bench_offer_pending: 0,
+            bench_offer_share_unavailable: None,
+            bench_offer_model: String::new(),
+            bench_offer_providers: Vec::new(),
+            bench_offer_progress: String::new(),
+            bench_offer_auth: None,
+            bench_offer_summary: None,
+            bench_offer_pr_url: None,
+            bench_offer_share_note: None,
+            bench_offer_error: None,
+            bench_offer_rx: None,
             provider_detection_rx,
             providers_loading: true,
         };
@@ -1264,7 +1728,7 @@ impl App {
             fit_filter: Some(self.fit_filter.label().to_string()),
             availability_filter: Some(self.availability_filter.label().to_string()),
             tp_filter: Some(self.tp_filter.label().to_string()),
-            sort_column: Some(self.sort_column.label().to_string()),
+            sort_column: Some(self.table_sort_label().to_string()),
             sort_ascending: Some(self.sort_ascending),
             installed_first: Some(self.installed_first),
             search_query: if self.search_query.is_empty() {
@@ -1333,6 +1797,40 @@ impl App {
         // Split query into space-separated terms for fuzzy matching
         let terms: Vec<&str> = query.split_whitespace().collect();
 
+        let term_matches_model = |term: &str, fit: &ModelFit| -> bool {
+            if fit.model.name.to_lowercase().contains(term) {
+                return true;
+            }
+            if fit.model.provider.to_lowercase().contains(term) {
+                return true;
+            }
+            if fit.model.parameter_count.to_lowercase().contains(term) {
+                return true;
+            }
+            if fit.model.use_case.to_lowercase().contains(term) {
+                return true;
+            }
+            if fit.use_case.label().to_lowercase().contains(term) {
+                return true;
+            }
+            if fit
+                .model
+                .capabilities
+                .iter()
+                .any(|c| c.label().to_lowercase().contains(term))
+            {
+                return true;
+            }
+            if let Some(lic) = &fit.model.license {
+                if lic.to_lowercase().contains(term) {
+                    return true;
+                }
+            }
+            fit.model.gguf_sources.iter().any(|gs| {
+                gs.repo.to_lowercase().contains(term) || gs.provider.to_lowercase().contains(term)
+            })
+        };
+
         self.filtered_fits = self
             .all_fits
             .iter()
@@ -1342,56 +1840,13 @@ impl App {
                 let matches_search = if terms.is_empty() {
                     true
                 } else {
-                    let caps_text = fit
-                        .model
-                        .capabilities
-                        .iter()
-                        .map(|c| c.label().to_lowercase())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    // Combine all searchable fields into one string
-                    let license_text = fit.model.license.as_deref().unwrap_or("").to_lowercase();
-                    let gguf_text = fit
-                        .model
-                        .gguf_sources
-                        .iter()
-                        .map(|gs| {
-                            format!("{} {}", gs.repo.to_lowercase(), gs.provider.to_lowercase())
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let searchable = format!(
-                        "{} {} {} {} {} {} {} {}",
-                        fit.model.name.to_lowercase(),
-                        fit.model.provider.to_lowercase(),
-                        fit.model.parameter_count.to_lowercase(),
-                        fit.model.use_case.to_lowercase(),
-                        fit.use_case.label().to_lowercase(),
-                        caps_text,
-                        license_text,
-                        gguf_text
-                    );
-                    // All terms must be present (AND logic)
-                    terms.iter().all(|term| searchable.contains(term))
+                    terms.iter().all(|term| term_matches_model(term, fit))
                 };
 
                 // Provider filter (check primary provider and GGUF source providers)
-                let matches_provider = {
-                    let primary_match = self
-                        .providers
-                        .iter()
-                        .position(|p| p == &fit.model.provider)
-                        .map(|idx| self.selected_providers[idx])
-                        .unwrap_or(false);
-                    let gguf_match = fit.model.gguf_sources.iter().any(|gs| {
-                        self.providers
-                            .iter()
-                            .position(|p| p == &gs.provider)
-                            .map(|idx| self.selected_providers[idx])
-                            .unwrap_or(false)
-                    });
-                    primary_match || gguf_match
-                };
+                let matches_provider = matches_provider_filter(&fit.model, |provider| {
+                    provider_selected(provider, &self.providers, &self.selected_providers)
+                });
                 let use_case_idx = self.use_cases.iter().position(|uc| *uc == fit.use_case);
                 let matches_use_case = use_case_idx
                     .map(|idx| self.selected_use_cases[idx])
@@ -1585,6 +2040,8 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
+        self.table_follow_selection = true;
+        self.last_model_click = None;
         // Clamp selection
         if self.filtered_fits.is_empty() {
             self.selected_row = 0;
@@ -1601,6 +2058,7 @@ impl App {
     }
 
     pub fn move_up(&mut self) {
+        self.table_follow_selection = true;
         self.confirm_download = false;
         if self.selected_row > 0 {
             self.selected_row -= 1;
@@ -1609,6 +2067,7 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
+        self.table_follow_selection = true;
         self.confirm_download = false;
         if !self.filtered_fits.is_empty() && self.selected_row < self.filtered_fits.len() - 1 {
             self.selected_row += 1;
@@ -1617,12 +2076,14 @@ impl App {
     }
 
     pub fn page_up(&mut self) {
+        self.table_follow_selection = true;
         self.confirm_download = false;
         self.selected_row = self.selected_row.saturating_sub(10);
         self.enqueue_capability_probes_for_visible(24);
     }
 
     pub fn page_down(&mut self) {
+        self.table_follow_selection = true;
         self.confirm_download = false;
         if !self.filtered_fits.is_empty() {
             self.selected_row = (self.selected_row + 10).min(self.filtered_fits.len() - 1);
@@ -1631,11 +2092,13 @@ impl App {
     }
 
     pub fn half_page_up(&mut self) {
+        self.table_follow_selection = true;
         self.selected_row = self.selected_row.saturating_sub(5);
         self.enqueue_capability_probes_for_visible(24);
     }
 
     pub fn half_page_down(&mut self) {
+        self.table_follow_selection = true;
         if !self.filtered_fits.is_empty() {
             self.selected_row = (self.selected_row + 5).min(self.filtered_fits.len() - 1);
         }
@@ -1643,6 +2106,7 @@ impl App {
     }
 
     pub fn cycle_top_bottom(&mut self) {
+        self.table_follow_selection = true;
         if !self.filtered_fits.is_empty() && self.selected_row == self.filtered_fits.len() - 1 {
             self.selected_row = 0;
         } else {
@@ -1694,7 +2158,40 @@ impl App {
             || has_runtime_filter
     }
 
+    /// Human-readable labels for the active advanced range filters from the
+    /// `F` popup, e.g. `["≤2B", "mem≥50%"]`. Empty when no range is set.
+    /// These constrain every fit category, so the UI shows them explicitly
+    /// rather than as a cryptic marker.
+    pub fn advanced_range_labels(&self) -> Vec<String> {
+        fn range(min: &str, max: &str, prefix: &str, unit: &str) -> Option<String> {
+            match (min.is_empty(), max.is_empty()) {
+                (false, false) => Some(format!("{prefix}{min}–{max}{unit}")),
+                (false, true) => Some(format!("{prefix}≥{min}{unit}")),
+                (true, false) => Some(format!("{prefix}≤{max}{unit}")),
+                (true, true) => None,
+            }
+        }
+        [
+            range(
+                &self.filter_params_min_input,
+                &self.filter_params_max_input,
+                "",
+                "B",
+            ),
+            range(
+                &self.filter_mem_pct_min_input,
+                &self.filter_mem_pct_max_input,
+                "mem",
+                "%",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub fn cycle_sort_column(&mut self) {
+        self.header_sort_column = None;
         self.sort_column = self.sort_column.next();
         self.sort_ascending = false;
         self.re_sort();
@@ -1716,6 +2213,9 @@ impl App {
     pub fn search_input(&mut self, c: char) {
         self.search_query.insert(self.cursor_position, c);
         self.cursor_position += c.len_utf8();
+        // Changing the query should snap the list back to the top so all
+        // matches are visible regardless of the prior cursor position.
+        self.selected_row = 0;
         self.apply_filters();
     }
 
@@ -1724,6 +2224,7 @@ impl App {
             let prev = previous_grapheme_boundary(&self.search_query, self.cursor_position);
             self.search_query.drain(prev..self.cursor_position);
             self.cursor_position = prev;
+            self.selected_row = 0;
             self.apply_filters();
         }
     }
@@ -1732,6 +2233,7 @@ impl App {
         if self.cursor_position < self.search_query.len() {
             let next = next_grapheme_boundary(&self.search_query, self.cursor_position);
             self.search_query.drain(self.cursor_position..next);
+            self.selected_row = 0;
             self.apply_filters();
         }
     }
@@ -1752,6 +2254,7 @@ impl App {
     pub fn clear_search(&mut self) {
         self.search_query.clear();
         self.cursor_position = 0;
+        self.selected_row = 0;
         self.apply_filters();
     }
 
@@ -2019,33 +2522,340 @@ impl App {
         self.input_mode = InputMode::Benchmarks;
         self.bench_cursor = 0;
         self.bench_scroll = 0;
+        self.bench_search_query.clear();
+        self.bench_search_active = false;
 
-        // Fetch if we don't have data yet
-        if self.bench_entries.is_empty() && !self.bench_loading {
+        // If the selected model is installed and a provider has it, offer to
+        // benchmark it (with optional share-as-PR) before showing the board.
+        if self.bench_offer_rx.is_none()
+            && let Some(fit) = self.selected_fit()
+            && fit.installed
+        {
+            let name = fit.model.name.clone();
+            let providers = self.installed.installed_providers(&fit.model);
+            if !providers.is_empty() {
+                self.bench_offer_state = BenchOfferState::Offer;
+                self.bench_offer_model = name;
+                self.bench_offer_providers = providers;
+                self.bench_offer_pending = llmfit_core::share::pending_benchmarks().len();
+                // Cheap offline check (env var + cached-token file) so the
+                // modal can flag missing credentials before a bench starts.
+                self.bench_offer_share_unavailable =
+                    if llmfit_core::share::resolve_token_noninteractive().is_some()
+                        || llmfit_core::share::oauth_client_id().is_some()
+                    {
+                        None
+                    } else {
+                        Some("no GitHub credentials (set GITHUB_TOKEN)".to_string())
+                    };
+                self.bench_offer_progress = String::new();
+                self.bench_offer_auth = None;
+                self.bench_offer_summary = None;
+                self.bench_offer_pr_url = None;
+                self.bench_offer_share_note = None;
+                self.bench_offer_error = None;
+                self.input_mode = InputMode::BenchOffer;
+            }
+        }
+
+        // Fetch if we have no server data yet (pinned local rows don't count)
+        let has_server_rows = self
+            .bench_entries
+            .iter()
+            .any(|e| !e.id.starts_with("local:"));
+        if !has_server_rows && !self.bench_loading {
             self.fetch_benchmarks();
+        } else {
+            // Cached board — still refresh the pinned local rows.
+            self.merge_local_bench_rows();
         }
     }
 
     pub fn close_benchmarks(&mut self) {
         self.show_benchmarks = false;
         self.input_mode = InputMode::Normal;
+        // Leaving the leaderboard drops any simulated card: the top bar goes
+        // back to the detected GPU, and the cached preset rows are discarded
+        // so the next open refetches for the real hardware.
+        if self.bench_hw_label.take().is_some() {
+            self.bench_entries.clear();
+            self.bench_total = 0;
+            self.bench_cursor = 0;
+            self.bench_scroll = 0;
+            self.bench_error = None;
+            // Discard any in-flight preset fetch so its rows can't land after
+            // the view has reset to the detected hardware.
+            self.bench_fetch_rx = None;
+            self.bench_loading = false;
+        }
+    }
+
+    /// Toggle the "share with llmfit" checkbox in the bench-offer modal.
+    /// A no-op when sharing is unavailable (the modal shows why).
+    pub fn bench_offer_toggle_share(&mut self) {
+        if self.bench_offer_share_unavailable.is_some() {
+            self.bench_offer_share = false;
+            return;
+        }
+        self.bench_offer_share = !self.bench_offer_share;
+    }
+
+    /// Dismiss the bench-offer modal and drop into the leaderboard view. A
+    /// still-running worker is detached: its receiver is dropped and its sends
+    /// fail silently.
+    pub fn bench_offer_dismiss(&mut self) {
+        self.bench_offer_rx = None;
+        self.bench_offer_state = BenchOfferState::Offer;
+        self.input_mode = InputMode::Benchmarks;
+    }
+
+    /// Start the bench(+share) worker for the offered model.
+    pub fn bench_offer_confirm(&mut self) {
+        if self.bench_offer_state != BenchOfferState::Offer {
+            return;
+        }
+        let model_name = self.bench_offer_model.clone();
+        let share = self.bench_offer_share;
+        // Share real hardware, never simulated specs.
+        let specs = self.real_specs.clone();
+
+        let (tx, rx) = mpsc::channel::<BenchOfferMsg>();
+        self.bench_offer_rx = Some(rx);
+        self.bench_offer_state = BenchOfferState::Running;
+        self.bench_offer_progress = "Detecting providers...".to_string();
+
+        thread::spawn(move || {
+            bench_offer_worker(&tx, &model_name, share, &specs);
+        });
+    }
+
+    /// Drain bench-offer worker messages (called every frame, non-blocking).
+    pub fn tick_bench_offer(&mut self) {
+        let mut finished = false;
+        if let Some(rx) = &self.bench_offer_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    BenchOfferMsg::Progress(s) => {
+                        // Any progress after the auth prompt means the device
+                        // flow completed — stop showing the code.
+                        self.bench_offer_auth = None;
+                        self.bench_offer_progress = s;
+                    }
+                    BenchOfferMsg::AuthCode {
+                        user_code,
+                        verification_uri,
+                    } => {
+                        self.bench_offer_auth = Some((user_code, verification_uri));
+                    }
+                    BenchOfferMsg::Done {
+                        summary,
+                        pr_url,
+                        share_note,
+                    } => {
+                        self.bench_offer_state = BenchOfferState::Done;
+                        self.bench_offer_summary = Some(summary);
+                        self.bench_offer_pr_url = pr_url;
+                        self.bench_offer_share_note = share_note;
+                        self.bench_offer_auth = None;
+                        finished = true;
+                    }
+                    BenchOfferMsg::Error(e) => {
+                        self.bench_offer_state = BenchOfferState::Error;
+                        self.bench_offer_error = Some(e);
+                        self.bench_offer_auth = None;
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if finished {
+            self.bench_offer_rx = None;
+            // The worker stored (and possibly shared) a new local result —
+            // refresh the local rows pinned to the leaderboard behind the
+            // modal and the measured tok/s shown in the main table.
+            self.merge_local_bench_rows();
+            self.refresh_local_measured_tps();
+        }
+    }
+
+    /// Re-annotate fit rows with the latest local benchmark measurements so
+    /// the main table's tok/s column reflects a just-finished bench without a
+    /// restart. Only upgrades rows a local run matches; community-measured
+    /// values elsewhere are left alone. Estimate calibration is then
+    /// recomputed (idempotently) from the updated anchors.
+    pub fn refresh_local_measured_tps(&mut self) {
+        // Same specs the fits were built with: under simulated hardware the
+        // stored runs won't match, so simulated estimates stay untouched.
+        if let Some(idx) = llmfit_core::share::LocalBenchIndex::load(&self.specs) {
+            for fit in &mut self.all_fits {
+                if let Some(m) = idx.lookup(&fit.model.name) {
+                    fit.set_measured_tps(Some(m));
+                }
+            }
+        }
+        llmfit_core::analysis::apply_local_calibration(&mut self.all_fits);
+    }
+
+    /// Rebuild the rows pinned at the top of the leaderboard: your stored
+    /// runs (`local:` ids, "you (local)/(shared)") and llmfit community
+    /// submissions with matching CPU and GPU (`community:` ids,
+    /// "llmfit community"). Skipped while browsing a hardware preset other
+    /// than this machine.
+    pub fn merge_local_bench_rows(&mut self) {
+        use llmfit_core::benchmarks::{
+            LeaderboardEngine, LeaderboardEntry, LeaderboardModel, LeaderboardUser,
+        };
+
+        self.bench_entries
+            .retain(|e| !e.id.starts_with("local:") && !e.id.starts_with("community:"));
+        if self.bench_hw_label.is_some() {
+            return;
+        }
+
+        fn pinned_row(
+            id: String,
+            who: &str,
+            model: &str,
+            provider: &str,
+            tps: Option<f64>,
+            ttft: Option<f64>,
+        ) -> LeaderboardEntry {
+            LeaderboardEntry {
+                id,
+                tok_s_out: tps,
+                tok_s_total: None,
+                ttft_ms: ttft,
+                context_length: None,
+                batch_size: None,
+                peak_vram_gb: None,
+                notes: None,
+                model: Some(LeaderboardModel {
+                    hf_id: model.to_string(),
+                    display_name: None,
+                    family: None,
+                    params: None,
+                    is_mo_e: None,
+                }),
+                hardware: None,
+                engine: Some(LeaderboardEngine {
+                    engine_name: provider.to_string(),
+                    engine_version: None,
+                    quantization: String::new(),
+                    backend: None,
+                }),
+                engine_flags: None,
+                user: Some(LeaderboardUser {
+                    username: Some(who.to_string()),
+                    verified: None,
+                }),
+            }
+        }
+
+        let mut local: Vec<LeaderboardEntry> = Vec::new();
+        let stores = [
+            ("you (local)", llmfit_core::share::pending_benchmarks()),
+            ("you (shared)", llmfit_core::share::shared_benchmarks()),
+        ];
+        for (who, stored) in &stores {
+            for s in stored {
+                let Some(results) = s.payload["results"].as_array() else {
+                    continue;
+                };
+                for (i, r) in results.iter().enumerate() {
+                    local.push(pinned_row(
+                        format!("local:{}:{i}", s.path.display()),
+                        who,
+                        r["model"].as_str().unwrap_or("?"),
+                        r["provider"].as_str().unwrap_or(""),
+                        r["avgTps"].as_f64(),
+                        r["avgTtftMs"].as_f64(),
+                    ));
+                }
+            }
+        }
+        // Newest first, pinned above the fetched leaderboard.
+        local.reverse();
+
+        // Embedded community submissions with matching CPU and GPU. Place them below your
+        // own rows. Your shared runs also live in the embedded data, so skip
+        // community entries that duplicate a local row (same model + tok/s).
+        let is_dup = |model: &str, tps: f64, rows: &[LeaderboardEntry]| {
+            rows.iter()
+                .any(|e| e.hf_id() == model && e.tok_s_out.is_some_and(|t| (t - tps).abs() < 0.005))
+        };
+        let community = llmfit_core::benchmarks::community_results_for_specs(&self.specs);
+        for (i, r) in community.iter().enumerate() {
+            if is_dup(&r.model, r.avg_tps, &local) {
+                continue;
+            }
+            local.push(pinned_row(
+                format!("community:{i}"),
+                "llmfit community",
+                &r.model,
+                &r.provider,
+                Some(r.avg_tps),
+                r.ttft_ms,
+            ));
+        }
+
+        if local.is_empty() {
+            return;
+        }
+        local.append(&mut self.bench_entries);
+        self.bench_entries = local;
+        let visible = self.bench_visible_indices().len();
+        if self.bench_cursor >= visible {
+            self.bench_cursor = visible.saturating_sub(1);
+        }
     }
 
     pub fn fetch_benchmarks(&mut self) {
         self.bench_loading = true;
         self.bench_error = None;
 
-        let key = self.bench_api_key.as_deref();
-        match llmfit_core::benchmarks::fetch_leaderboard(&self.specs, key, 100) {
+        let specs = self.specs.clone();
+        let key = self.bench_api_key.clone();
+        let (tx, rx) = mpsc::channel();
+        self.bench_fetch_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(llmfit_core::benchmarks::fetch_leaderboard(
+                &specs,
+                key.as_deref(),
+                100,
+            ));
+        });
+    }
+
+    /// Drain the in-flight leaderboard fetch. Called every event tick; a no-op
+    /// while the worker is still running or when no fetch is active.
+    pub fn tick_bench_fetch(&mut self) {
+        let Some(rx) = &self.bench_fetch_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.bench_fetch_rx = None;
+                self.bench_loading = false;
+                return;
+            }
+        };
+        self.bench_fetch_rx = None;
+        self.bench_loading = false;
+        match result {
             Ok(resp) => {
                 self.bench_total = resp.total;
                 self.bench_entries = resp.rows;
-                self.bench_loading = false;
             }
             Err(_) => {
-                // API failed — try embedded cache fallback
-                self.bench_loading = false;
-                if let Some(cached) = self.find_cached_for_specs() {
+                // API failed — try embedded cache fallback for whichever view
+                // is current (simulated preset or detected hardware).
+                let cached = match &self.bench_hw_label {
+                    Some(label) => llmfit_core::benchmarks::cached_leaderboard_for_preset(label),
+                    None => self.find_cached_for_specs(),
+                };
+                if let Some(cached) = cached {
                     self.bench_total = cached.total;
                     self.bench_entries = cached.rows;
                     self.bench_error = Some("Using cached data (API unreachable)".to_string());
@@ -2055,6 +2865,8 @@ impl App {
                 }
             }
         }
+        // Local results render even when the API is unreachable.
+        self.merge_local_bench_rows();
     }
 
     pub fn bench_move_up(&mut self) {
@@ -2064,9 +2876,67 @@ impl App {
     }
 
     pub fn bench_move_down(&mut self) {
-        if !self.bench_entries.is_empty() && self.bench_cursor < self.bench_entries.len() - 1 {
+        let visible = self.bench_visible_indices().len();
+        if visible > 0 && self.bench_cursor < visible - 1 {
             self.bench_cursor += 1;
         }
+    }
+
+    /// Indices into `bench_entries` that match the `/` search. Same semantics
+    /// as the main table search: space-separated terms, all must appear
+    /// (case-insensitive) somewhere in the row's searchable text.
+    pub fn bench_visible_indices(&self) -> Vec<usize> {
+        let query = self.bench_search_query.to_lowercase();
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        self.bench_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if terms.is_empty() {
+                    return true;
+                }
+                let haystack = format!(
+                    "{} {} {} {}",
+                    e.hf_id().to_lowercase(),
+                    e.engine_name().to_lowercase(),
+                    e.quantization().to_lowercase(),
+                    e.username().to_lowercase(),
+                );
+                terms.iter().all(|t| haystack.contains(t))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn bench_search_start(&mut self) {
+        self.bench_search_active = true;
+    }
+
+    /// Accept the current query and return to list navigation; the filter
+    /// stays applied until cleared with Esc or the view is reopened.
+    pub fn bench_search_accept(&mut self) {
+        self.bench_search_active = false;
+    }
+
+    pub fn bench_search_clear(&mut self) {
+        self.bench_search_active = false;
+        self.bench_search_query.clear();
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
+    }
+
+    pub fn bench_search_input(&mut self, c: char) {
+        if c.is_ascii_graphic() || c == ' ' {
+            self.bench_search_query.push(c);
+            self.bench_cursor = 0;
+            self.bench_scroll = 0;
+        }
+    }
+
+    pub fn bench_search_backspace(&mut self) {
+        self.bench_search_query.pop();
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
     }
 
     pub fn bench_refresh(&mut self) {
@@ -2082,16 +2952,13 @@ impl App {
 
         // Try each preset and see if the GPU name matches
         for preset in llmfit_core::benchmarks::HardwarePreset::all() {
-            if let Some(hw_name) = preset.hardware_name {
-                if lower.contains(&hw_name.to_lowercase()) {
-                    if let Some(cached) =
-                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
-                    {
-                        if !cached.rows.is_empty() {
-                            return Some(cached);
-                        }
-                    }
-                }
+            if let Some(hw_name) = preset.hardware_name
+                && lower.contains(&hw_name.to_lowercase())
+                && let Some(cached) =
+                    llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
+                && !cached.rows.is_empty()
+            {
+                return Some(cached);
             }
         }
         None
@@ -2137,29 +3004,16 @@ impl App {
             self.bench_loading = true;
             self.bench_error = None;
 
-            let key = self.bench_api_key.as_deref();
-            match llmfit_core::benchmarks::fetch_leaderboard_for_preset(preset, key, 100) {
-                Ok(resp) => {
-                    self.bench_total = resp.total;
-                    self.bench_entries = resp.rows;
-                    self.bench_loading = false;
-                }
-                Err(_) => {
-                    // API failed — try embedded cache
-                    self.bench_loading = false;
-                    if let Some(cached) =
-                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
-                    {
-                        self.bench_total = cached.total;
-                        self.bench_entries = cached.rows;
-                        self.bench_error = Some("Using cached data (API unreachable)".to_string());
-                    } else {
-                        self.bench_error = Some(
-                            "API unreachable and no cached data for this hardware".to_string(),
-                        );
-                    }
-                }
-            }
+            let key = self.bench_api_key.clone();
+            let (tx, rx) = mpsc::channel();
+            self.bench_fetch_rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(llmfit_core::benchmarks::fetch_leaderboard_for_preset(
+                    preset,
+                    key.as_deref(),
+                    100,
+                ));
+            });
         }
 
         self.bench_cursor = 0;
@@ -2314,7 +3168,10 @@ impl App {
             kv_quant,
         };
 
-        match estimate_model_plan(&fit.model, &request, &self.specs) {
+        // Pass the Advanced Config values so the plan panel and the fit table
+        // agree on speed; `estimate_model_plan` would silently use defaults.
+        match estimate_model_plan_with_config(&fit.model, &request, &self.specs, &self.calc_config)
+        {
             Ok(plan) => {
                 self.plan_estimate = Some(plan);
                 self.plan_error = None;
@@ -2335,12 +3192,14 @@ impl App {
     pub fn open_provider_popup(&mut self) {
         self.input_mode = InputMode::ProviderPopup;
         self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
         self.provider_cursor = 0;
     }
 
     pub fn close_provider_popup(&mut self) {
         self.input_mode = InputMode::Normal;
         self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
     }
 
     /// Indices into `self.providers` that match the current fuzzy search query,
@@ -2355,17 +3214,57 @@ impl App {
     }
 
     pub fn provider_search_input(&mut self, c: char) {
-        self.provider_search.push(c);
+        insert_ascii_graphic_input(
+            &mut self.provider_search,
+            &mut self.provider_search_cursor_position,
+            c,
+        );
         self.clamp_provider_cursor();
     }
 
     pub fn provider_search_backspace(&mut self) {
-        self.provider_search.pop();
+        backspace_grapheme_input(
+            &mut self.provider_search,
+            &mut self.provider_search_cursor_position,
+        );
         self.clamp_provider_cursor();
+    }
+
+    pub fn provider_search_delete(&mut self) {
+        delete_grapheme_input(
+            &mut self.provider_search,
+            self.provider_search_cursor_position,
+        );
+        self.clamp_provider_cursor();
+    }
+
+    pub fn provider_search_cursor_left(&mut self) {
+        if self.provider_search_cursor_position > 0 {
+            self.provider_search_cursor_position = previous_grapheme_boundary(
+                &self.provider_search,
+                self.provider_search_cursor_position,
+            );
+        }
+    }
+
+    pub fn provider_search_cursor_right(&mut self) {
+        if self.provider_search_cursor_position < self.provider_search.len() {
+            self.provider_search_cursor_position =
+                next_grapheme_boundary(&self.provider_search, self.provider_search_cursor_position);
+        }
+    }
+
+    pub fn provider_search_cursor_home(&mut self) {
+        self.provider_search_cursor_position = 0;
+    }
+
+    pub fn provider_search_cursor_end(&mut self) {
+        self.provider_search_cursor_position = self.provider_search.len();
     }
 
     pub fn provider_search_clear(&mut self) {
         self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
         self.clamp_provider_cursor();
     }
 
@@ -2620,14 +3519,89 @@ impl App {
         }
     }
 
+    pub fn sorted_table_column(&self) -> usize {
+        self.header_sort_column.unwrap_or(match self.sort_column {
+            SortColumn::Provider => 3,
+            SortColumn::Params => 4,
+            SortColumn::Score => 5,
+            SortColumn::Tps => 6,
+            SortColumn::MemPct => 10,
+            SortColumn::Ctx => 11,
+            SortColumn::ReleaseDate => 12,
+            SortColumn::UseCase => 14,
+        })
+    }
+
+    pub fn table_sort_label(&self) -> &str {
+        match self.header_sort_column {
+            Some(1) => "Inst",
+            Some(2) => "Model",
+            Some(7) => "Quant",
+            Some(8) => "Disk",
+            Some(9) => "Mode",
+            Some(13) => "Fit",
+            _ => self.sort_column.label(),
+        }
+    }
+
+    pub fn table_sort_is_ascending(&self) -> bool {
+        self.table_sort_direction_is_ascending(self.sort_ascending)
+    }
+
+    pub fn table_sort_direction_is_ascending(&self, reversed: bool) -> bool {
+        if matches!(self.sorted_table_column(), 2 | 3 | 7 | 9 | 13 | 14) {
+            !reversed // These columns default to A-Z / best fit first
+        } else {
+            reversed
+        }
+    }
+
+    /// Mouse headers only sort; keyboard Select mode retains its filter actions
+    pub fn sort_model_table_column(&mut self, column: usize) -> bool {
+        let selected = self.selected_fit().map(|fit| fit.model.name.clone());
+        let core_column = match column {
+            3 => Some(SortColumn::Provider),
+            4 => Some(SortColumn::Params),
+            5 => Some(SortColumn::Score),
+            6 => Some(SortColumn::Tps),
+            10 => Some(SortColumn::MemPct),
+            11 => Some(SortColumn::Ctx),
+            12 => Some(SortColumn::ReleaseDate),
+            14 => Some(SortColumn::UseCase),
+            1 | 2 | 7 | 8 | 9 | 13 => None,
+            _ => return false,
+        };
+        if let Some(column) = core_column {
+            self.set_or_toggle_sort(column);
+        } else {
+            self.sort_ascending = self.header_sort_column == Some(column) && !self.sort_ascending;
+            self.header_sort_column = Some(column);
+            self.re_sort();
+        }
+        if let Some(name) = selected
+            && let Some(row) = self
+                .filtered_fits
+                .iter()
+                .position(|&i| self.all_fits[i].model.name == name)
+        {
+            self.selected_row = row;
+        }
+        // Show the start of the new order without changing the selected model
+        *self.table_state.offset_mut() = 0;
+        self.table_follow_selection = false;
+        self.enqueue_capability_probes_for_visible(24);
+        true
+    }
+
     /// Set sort column, or toggle ascending/descending if already on that column.
     fn set_or_toggle_sort(&mut self, col: SortColumn) {
-        if self.sort_column == col {
+        if self.header_sort_column.is_none() && self.sort_column == col {
             self.sort_ascending = !self.sort_ascending;
         } else {
             self.sort_column = col;
             self.sort_ascending = false;
         }
+        self.header_sort_column = None;
         self.re_sort();
     }
 
@@ -2832,7 +3806,15 @@ impl App {
     }
 
     pub fn close_simulation_popup(&mut self) {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = if self.show_benchmarks {
+            InputMode::Benchmarks
+        } else if self.show_downloads {
+            InputMode::DownloadManager
+        } else if self.show_plan {
+            InputMode::Plan
+        } else {
+            InputMode::Normal
+        };
     }
 
     pub fn apply_simulation(&mut self) {
@@ -2858,7 +3840,7 @@ impl App {
         self.specs = specs;
         self.sim_active = true;
         self.rebuild_fits();
-        self.input_mode = InputMode::Normal;
+        self.close_simulation_popup();
     }
 
     pub fn reset_simulation(&mut self) {
@@ -2867,29 +3849,32 @@ impl App {
         self.rebuild_fits();
     }
 
-    /// Re-evaluate all model fits against current `self.specs`, preserving
-    /// installed status and filter selections.
+    /// Re-evaluate all model fits against current `self.specs` and
+    /// `self.calc_config`, preserving installed status and filter selections.
+    ///
+    /// Always goes through `calc_config`, so a rebuild triggered by hardware
+    /// simulation can't quietly drop the `--profile` or advanced-config
+    /// parameters the visible numbers were built from (issue #969).
     fn rebuild_fits(&mut self) {
         let db = ModelDatabase::new();
 
-        self.backend_hidden_count = db
-            .get_all_models()
-            .iter()
-            .filter(|m| !backend_compatible(m, &self.specs))
-            .count();
+        self.backend_hidden_count =
+            llmfit_core::analysis::backend_hidden_count(db.get_all_models(), &self.specs);
 
-        self.all_fits = db
-            .get_all_models()
-            .iter()
-            .filter(|m| backend_compatible(m, &self.specs))
+        let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&self.specs);
+        self.all_fits = llmfit_core::analysis::rankable_models(db.get_all_models(), &self.specs)
             .map(|m| {
-                let mut fit =
-                    ModelFit::analyze_with_context_limit(m, &self.specs, self.context_limit);
-                fit.installed = providers::is_model_installed(&m.name, &self.ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &self.mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &self.llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &self.docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &self.lmstudio_installed);
+                let mut fit = llmfit_core::analysis::analyze_with_optional_config(
+                    m,
+                    &self.specs,
+                    self.context_limit,
+                    Some(&self.calc_config),
+                );
+                fit.installed = self.installed.is_installed(m);
+                let measured = measured_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
+                fit.set_measured_tps(measured);
                 fit
             })
             .collect();
@@ -2991,6 +3976,10 @@ impl App {
             Some(cap) => cap.to_string(),
             None => String::new(),
         };
+        self.adv_config_ddr_bandwidth_input = match self.calc_config.ddr_bandwidth_gbps {
+            Some(bw) => format!("{bw:.0}"),
+            None => String::new(),
+        };
         self.adv_config_field = AdvConfigField::Efficiency;
         self.adv_config_cursor_position = self.adv_config_efficiency_input.len();
         self.adv_config_dirty = false;
@@ -3011,6 +4000,7 @@ impl App {
             mem_pct_max: self.filter_mem_pct_max_input.clone(),
             sort_ascending: self.sort_ascending,
             fit_filter: self.fit_filter,
+            availability_filter: self.availability_filter,
         });
         self.filter_field = FilterPopupField::ParamsMin;
         self.filter_cursor_position = self.filter_params_min_input.len();
@@ -3026,6 +4016,7 @@ impl App {
             self.filter_mem_pct_max_input = snap.mem_pct_max;
             self.sort_ascending = snap.sort_ascending;
             self.fit_filter = snap.fit_filter;
+            self.availability_filter = snap.availability_filter;
         }
         self.input_mode = InputMode::Normal;
     }
@@ -3093,7 +4084,9 @@ impl App {
             FilterPopupField::ParamsMax => self.filter_params_max_input.len(),
             FilterPopupField::MemPctMin => self.filter_mem_pct_min_input.len(),
             FilterPopupField::MemPctMax => self.filter_mem_pct_max_input.len(),
-            FilterPopupField::SortDirection | FilterPopupField::FitFilter => 0,
+            FilterPopupField::SortDirection
+            | FilterPopupField::FitFilter
+            | FilterPopupField::Availability => 0,
         }
     }
 
@@ -3103,7 +4096,9 @@ impl App {
             FilterPopupField::ParamsMax => &mut self.filter_params_max_input,
             FilterPopupField::MemPctMin => &mut self.filter_mem_pct_min_input,
             FilterPopupField::MemPctMax => &mut self.filter_mem_pct_max_input,
-            FilterPopupField::SortDirection | FilterPopupField::FitFilter => {
+            FilterPopupField::SortDirection
+            | FilterPopupField::FitFilter
+            | FilterPopupField::Availability => {
                 unreachable!("no text input for toggle fields")
             }
         }
@@ -3135,6 +4130,10 @@ impl App {
         self.fit_filter = self.fit_filter.next();
     }
 
+    pub fn cycle_filter_availability(&mut self) {
+        self.availability_filter = self.availability_filter.next();
+    }
+
     pub fn apply_filter_popup(&mut self) {
         self.filter_snapshot = None;
         self.sort_ascending = self.filter_sort_ascending;
@@ -3153,6 +4152,7 @@ impl App {
             AdvConfigField::FactorTp => &self.adv_config_eff_factor_tp,
             AdvConfigField::FactorCpuOnly => &self.adv_config_eff_factor_cpu_only,
             AdvConfigField::ContextCap => &self.adv_config_context_cap_input,
+            AdvConfigField::DdrBandwidth => &self.adv_config_ddr_bandwidth_input,
         }
     }
 
@@ -3165,6 +4165,7 @@ impl App {
             AdvConfigField::FactorTp => &mut self.adv_config_eff_factor_tp,
             AdvConfigField::FactorCpuOnly => &mut self.adv_config_eff_factor_cpu_only,
             AdvConfigField::ContextCap => &mut self.adv_config_context_cap_input,
+            AdvConfigField::DdrBandwidth => &mut self.adv_config_ddr_bandwidth_input,
         }
     }
 
@@ -3179,7 +4180,7 @@ impl App {
     }
 
     pub fn reset_advanced_config(&mut self) {
-        self.calc_config = CalcConfig::default();
+        self.calc_config = self.calc_config_baseline.clone();
         self.rebuild_fits_with_config();
         // Refresh input fields to show defaults
         self.open_advanced_config_popup();
@@ -3272,6 +4273,15 @@ impl App {
         } else {
             self.adv_config_context_cap_input.parse().ok()
         };
+        // Empty = auto (env var, then measured, then 50 GB/s fallback).
+        let ddr_bandwidth_gbps: Option<f64> = if self.adv_config_ddr_bandwidth_input.is_empty() {
+            None
+        } else {
+            self.adv_config_ddr_bandwidth_input
+                .parse()
+                .ok()
+                .filter(|bw: &f64| *bw > 0.0)
+        };
 
         // Update the config
         self.calc_config = CalcConfig {
@@ -3284,6 +4294,7 @@ impl App {
                 cpu_only,
             },
             context_cap,
+            ddr_bandwidth_gbps,
             ..self.calc_config
         };
 
@@ -3292,37 +4303,9 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    /// Rebuild fits using the custom calc_config
+    /// Rebuild fits after the advanced-config editor changed `calc_config`.
     fn rebuild_fits_with_config(&mut self) {
-        let db = ModelDatabase::new();
-
-        self.backend_hidden_count = db
-            .get_all_models()
-            .iter()
-            .filter(|m| !backend_compatible(m, &self.specs))
-            .count();
-
-        self.all_fits = db
-            .get_all_models()
-            .iter()
-            .filter(|m| backend_compatible(m, &self.specs))
-            .map(|m| {
-                let mut fit =
-                    ModelFit::analyze_with_config(m, &self.specs, self.calc_config.clone());
-                fit.installed = providers::is_model_installed(&m.name, &self.ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &self.mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &self.llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &self.docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &self.lmstudio_installed);
-                fit
-            })
-            .collect();
-
-        self.all_fits = llmfit_core::fit::rank_models_by_fit(self.all_fits.drain(..).collect());
-        self.selected_row = 0;
-        self.compare_models.clear();
-        self.compare_mark_model = None;
-        self.apply_filters();
+        self.rebuild_fits();
     }
 
     pub fn toggle_installed_first(&mut self) {
@@ -3332,16 +4315,61 @@ impl App {
 
     /// Re-sort all_fits using current sort column and installed_first preference, then refilter.
     fn re_sort(&mut self) {
-        let fits = std::mem::take(&mut self.all_fits);
-        let mut sorted = llmfit_core::fit::rank_models_by_fit_opts_col(
-            fits,
-            self.installed_first,
-            self.sort_column,
-        );
-        if self.sort_ascending {
-            sorted.reverse();
+        if let Some(column) = self.header_sort_column {
+            let direction = self.sort_ascending;
+            let installed_first = self.installed_first;
+            self.all_fits.sort_by(|a, b| {
+                // Keep the existing installed-first / unrunnable-last policy
+                let group = if column == 1 {
+                    let key = b.installed.cmp(&a.installed);
+                    if direction { key.reverse() } else { key }
+                } else if installed_first {
+                    b.installed.cmp(&a.installed)
+                } else {
+                    cmp::Ordering::Equal
+                };
+                let group = group.then_with(|| {
+                    (a.fit_level == FitLevel::TooTight).cmp(&(b.fit_level == FitLevel::TooTight))
+                });
+                if group != cmp::Ordering::Equal {
+                    return group;
+                }
+                let fit_rank = |fit| match fit {
+                    FitLevel::Perfect => 0,
+                    FitLevel::Good => 1,
+                    FitLevel::Marginal => 2,
+                    FitLevel::TooTight => 3,
+                };
+                let key = match column {
+                    2 => a
+                        .model
+                        .name
+                        .to_lowercase()
+                        .cmp(&b.model.name.to_lowercase()),
+                    7 => a.best_quant.cmp(&b.best_quant),
+                    8 => b
+                        .model
+                        .estimate_disk_gb(&b.best_quant)
+                        .total_cmp(&a.model.estimate_disk_gb(&a.best_quant)),
+                    9 => a.run_mode_text().cmp(b.run_mode_text()),
+                    13 => fit_rank(a.fit_level).cmp(&fit_rank(b.fit_level)),
+                    _ => cmp::Ordering::Equal,
+                };
+                let key = if direction { key.reverse() } else { key };
+                key.then_with(|| b.score.total_cmp(&a.score))
+                    .then_with(|| a.model.name.cmp(&b.model.name))
+            });
+        } else {
+            let fits = std::mem::take(&mut self.all_fits);
+            // Apply direction inside the core comparator to keep installed-first
+            // and TooTight-last ordering in both directions
+            self.all_fits = llmfit_core::fit::rank_models_by_fit_opts_col_dir(
+                fits,
+                self.installed_first,
+                self.sort_column,
+                self.sort_ascending,
+            );
         }
-        self.all_fits = sorted;
         self.apply_filters();
     }
 
@@ -3375,7 +4403,12 @@ impl App {
         let is_mlx_model = fit.model.is_mlx_model();
         let has_catalog_gguf = !fit.model.gguf_sources.is_empty();
 
-        let download_options = self.available_download_providers(&model_name, has_catalog_gguf);
+        let download_options = self.available_download_providers(
+            &model_name,
+            model_format,
+            is_mlx_model,
+            has_catalog_gguf,
+        );
         if !download_options.is_empty() {
             self.open_download_provider_popup(model_name, download_options);
         } else {
@@ -3640,6 +4673,8 @@ impl App {
     fn available_download_providers(
         &self,
         model_name: &str,
+        model_format: llmfit_core::models::ModelFormat,
+        is_mlx_model: bool,
         has_catalog_gguf: bool,
     ) -> Vec<DownloadProvider> {
         let mut providers_for_model = Vec::new();
@@ -3648,7 +4683,13 @@ impl App {
         {
             providers_for_model.push(DownloadProvider::Ollama);
         }
-        if self.mlx_available {
+        // AWQ/GPTQ/AutoRound are vLLM/CUDA formats with no MLX equivalent to
+        // guess — offering MLX for them fabricates a nonexistent
+        // mlx-community repo (issue #294). Scanned HF models default to
+        // ModelFormat::Gguf, so the name is checked as well as the format.
+        let prequantized = model_format.is_prequantized()
+            || providers::is_likely_prequantized_repo(&model_name.to_lowercase());
+        if self.mlx_available && (is_mlx_model || !prequantized) {
             providers_for_model.push(DownloadProvider::Mlx);
         }
         // Check catalog gguf_sources first (no HTTP probe needed), then
@@ -3722,38 +4763,34 @@ impl App {
 
     /// Re-query all providers for installed models and update all_fits.
     pub fn refresh_installed(&mut self) {
-        let (ollama_set, ollama_count) = self.ollama.installed_models_counted();
-        self.ollama_installed = ollama_set;
-        self.ollama_installed_count = ollama_count;
-        self.mlx_installed = self.mlx.installed_models();
-        let (llamacpp_set, llamacpp_count) = self.llamacpp.installed_models_counted();
-        self.llamacpp_installed = llamacpp_set;
-        self.llamacpp_installed_count = llamacpp_count;
-        let (docker_mr_set, docker_mr_count) = self.docker_mr.installed_models_counted();
-        self.docker_mr_installed = docker_mr_set;
-        self.docker_mr_installed_count = docker_mr_count;
-        let (lmstudio_set, lmstudio_count) = self.lmstudio.installed_models_counted();
-        self.lmstudio_installed = lmstudio_set;
-        self.lmstudio_installed_count = lmstudio_count;
-        let (vllm_set, vllm_count) = self.vllm.installed_models_counted();
-        self.vllm_installed = vllm_set;
-        self.vllm_installed_count = vllm_count;
+        let (ollama, ollama_count) = self.ollama.installed_models_counted();
+        let mlx = self.mlx.installed_models();
+        let (llamacpp, llamacpp_count) = self.llamacpp.installed_models_counted();
+        let (docker_mr, docker_mr_count) = self.docker_mr.installed_models_counted();
+        let (lmstudio, lmstudio_count) = self.lmstudio.installed_models_counted();
+        let (lmstudio_disk, lmstudio_disk_count) =
+            llmfit_core::providers::scan_lmstudio_models_dir();
+        let (vllm, vllm_count) = self.vllm.installed_models_counted();
+        let (ramalama, ramalama_count) = self.ramalama.installed_models_counted();
+        self.installed = llmfit_core::analysis::InstalledIndex {
+            ollama,
+            ollama_count,
+            mlx,
+            llamacpp,
+            llamacpp_count,
+            docker_mr,
+            docker_mr_count,
+            lmstudio,
+            lmstudio_count,
+            lmstudio_disk,
+            lmstudio_disk_count,
+            vllm,
+            vllm_count,
+            ramalama,
+            ramalama_count,
+        };
         for fit in &mut self.all_fits {
-            fit.installed = providers::is_model_installed(&fit.model.name, &self.ollama_installed)
-                || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
-                || providers::is_model_installed_llamacpp(
-                    &fit.model.name,
-                    &self.llamacpp_installed,
-                )
-                || providers::is_model_installed_docker_mr(
-                    &fit.model.name,
-                    &self.docker_mr_installed,
-                )
-                || providers::is_model_installed_lmstudio(
-                    &fit.model.name,
-                    &self.lmstudio_installed,
-                )
-                || providers::is_model_installed_vllm(&fit.model.name, &self.vllm_installed);
+            fit.installed = self.installed.is_installed(&fit.model);
         }
         self.re_sort();
         self.enqueue_capability_probes_for_visible(24);
@@ -3770,7 +4807,11 @@ impl App {
         if self.filtered_fits.is_empty() {
             return;
         }
-        let start = self.selected_row.saturating_sub(window / 2);
+        let start = if self.table_follow_selection {
+            self.selected_row.saturating_sub(window / 2)
+        } else {
+            self.table_state.offset()
+        };
         let end = (start + window).min(self.filtered_fits.len());
         for idx in start..end {
             if let Some(&fit_idx) = self.filtered_fits.get(idx) {
@@ -3858,8 +4899,8 @@ impl App {
                         } => {
                             self.ollama_available = available;
                             self.ollama_binary_available = binary_available;
-                            self.ollama_installed = installed;
-                            self.ollama_installed_count = installed_count;
+                            self.installed.ollama = installed;
+                            self.installed.ollama_count = installed_count;
                             self.ollama = provider;
                         }
                         ProviderDetectionMsg::Mlx {
@@ -3867,25 +4908,29 @@ impl App {
                             installed,
                         } => {
                             self.mlx_available = available;
-                            self.mlx_installed = installed;
+                            self.installed.mlx = installed;
                         }
                         ProviderDetectionMsg::DockerMr {
                             available,
+                            app_installed,
                             installed,
                             installed_count,
                         } => {
                             self.docker_mr_available = available;
-                            self.docker_mr_installed = installed;
-                            self.docker_mr_installed_count = installed_count;
+                            self.docker_desktop_installed = app_installed;
+                            self.installed.docker_mr = installed;
+                            self.installed.docker_mr_count = installed_count;
                         }
                         ProviderDetectionMsg::LmStudio {
                             available,
+                            app_installed,
                             installed,
                             installed_count,
                         } => {
                             self.lmstudio_available = available;
-                            self.lmstudio_installed = installed;
-                            self.lmstudio_installed_count = installed_count;
+                            self.lmstudio_app_installed = app_installed;
+                            self.installed.lmstudio = installed;
+                            self.installed.lmstudio_count = installed_count;
                         }
                         ProviderDetectionMsg::Vllm {
                             available,
@@ -3893,8 +4938,17 @@ impl App {
                             installed_count,
                         } => {
                             self.vllm_available = available;
-                            self.vllm_installed = installed;
-                            self.vllm_installed_count = installed_count;
+                            self.installed.vllm = installed;
+                            self.installed.vllm_count = installed_count;
+                        }
+                        ProviderDetectionMsg::RamaLama {
+                            available,
+                            installed,
+                            installed_count,
+                        } => {
+                            self.ramalama_available = available;
+                            self.installed.ramalama = installed;
+                            self.installed.ramalama_count = installed_count;
                         }
                     }
                 }
@@ -3908,25 +4962,7 @@ impl App {
         if got_any {
             // Re-mark installed status for all models
             for fit in &mut self.all_fits {
-                fit.installed =
-                    providers::is_model_installed(&fit.model.name, &self.ollama_installed)
-                        || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
-                        || providers::is_model_installed_llamacpp(
-                            &fit.model.name,
-                            &self.llamacpp_installed,
-                        )
-                        || providers::is_model_installed_docker_mr(
-                            &fit.model.name,
-                            &self.docker_mr_installed,
-                        )
-                        || providers::is_model_installed_lmstudio(
-                            &fit.model.name,
-                            &self.lmstudio_installed,
-                        )
-                        || providers::is_model_installed_vllm(
-                            &fit.model.name,
-                            &self.vllm_installed,
-                        );
+                fit.installed = self.installed.is_installed(&fit.model);
             }
             self.re_sort();
         }
@@ -3957,12 +4993,11 @@ impl App {
     pub fn open_bench(&mut self) {
         self.show_bench = true;
         self.live_bench_scroll = 0;
+        self.bench_table_offset = 0;
         self.bench_view_mode = BenchViewMode::Results;
 
-        if !self.bench_running && self.ollama_available {
-            if !self.load_bench_cache() {
-                self.start_bench();
-            }
+        if !self.bench_running && self.ollama_available && !self.load_bench_cache() {
+            self.start_bench();
         }
     }
 
@@ -3989,7 +5024,8 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut installed: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .collect();
@@ -4020,7 +5056,8 @@ impl App {
 
         // Check if installed models match
         let mut installed: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .collect();
@@ -4036,25 +5073,22 @@ impl App {
             return false;
         }
 
-        if let Some(results) = cache.get("results") {
-            if let Ok(r) =
+        if let Some(results) = cache.get("results")
+            && let Ok(r) =
                 serde_json::from_value::<Vec<quality::ModelQualityResult>>(results.clone())
-            {
-                self.bench_results = r;
-            }
+        {
+            self.bench_results = r;
         }
-        if let Some(routing) = cache.get("routing") {
-            if let Ok(r) =
+        if let Some(routing) = cache.get("routing")
+            && let Ok(r) =
                 serde_json::from_value::<Vec<quality::RoutingRecommendation>>(routing.clone())
-            {
-                self.bench_routing = r;
-            }
+        {
+            self.bench_routing = r;
         }
-        if let Some(ru) = cache.get("runner_ups") {
-            if let Ok(r) = serde_json::from_value::<Vec<quality::RoutingRecommendation>>(ru.clone())
-            {
-                self.bench_runner_ups = r;
-            }
+        if let Some(ru) = cache.get("runner_ups")
+            && let Ok(r) = serde_json::from_value::<Vec<quality::RoutingRecommendation>>(ru.clone())
+        {
+            self.bench_runner_ups = r;
         }
 
         // Rebuild model status from cached results
@@ -4108,12 +5142,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.bench_rx = Some(rx);
 
-        let ollama_url =
-            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let ollama_url = llmfit_core::providers::ollama_bench_url();
         // Deduplicate: strip ":latest" suffix and remove dupes
         let mut seen = std::collections::HashSet::new();
         let mut models: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .filter(|m| seen.insert(m.clone()))
@@ -4314,25 +5348,15 @@ impl App {
     }
 }
 
-fn command_exists(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use llmfit_core::fit::{InferenceRuntime, RunMode, ScoreComponents};
     use llmfit_core::hardware::GpuBackend;
-    use llmfit_core::models::{LlmModel, ModelFormat, UseCase};
+    use llmfit_core::models::{GgufSource, LlmModel, ModelFormat, UseCase};
 
     fn test_app() -> App {
-        App::with_specs_and_context(
+        App::with_specs_context_and_config(
             SystemSpecs {
                 total_ram_gb: 16.0,
                 available_ram_gb: 12.0,
@@ -4341,6 +5365,7 @@ mod tests {
                 has_gpu: false,
                 gpu_vram_gb: None,
                 total_gpu_vram_gb: None,
+                gpu_available_gb: None,
                 gpu_name: None,
                 gpu_count: 0,
                 unified_memory: false,
@@ -4350,7 +5375,92 @@ mod tests {
                 cluster_node_count: 0,
             },
             None,
+            None,
         )
+    }
+
+    /// A 128 GB unified box, so estimator assertions don't depend on whatever
+    /// hardware the test happens to run on.
+    fn unified_specs() -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: 128.0,
+            available_ram_gb: 120.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(128.0),
+            total_gpu_vram_gb: Some(128.0),
+            gpu_available_gb: None,
+            gpu_name: Some("Test Unified GPU".to_string()),
+            gpu_count: 1,
+            unified_memory: true,
+            backend: GpuBackend::Rocm,
+            gpus: Vec::new(),
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    /// The TUI builds its own sweep, so the sanitization gate has to hold here
+    /// too rather than only in the CLI's `build_fits` (issue #969, problem 3).
+    #[test]
+    fn tui_sweep_excludes_sanitization_demoted_entries() {
+        let db = ModelDatabase::new();
+        let demoted: std::collections::HashSet<&str> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| m.is_sanitization_demoted())
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(
+            !demoted.is_empty(),
+            "catalog has no demoted entries to hide"
+        );
+
+        let app = App::with_specs_context_and_config(unified_specs(), None, None);
+
+        assert!(!app.all_fits.is_empty(), "expected some ranked fits");
+        let leaked: Vec<&str> = app
+            .all_fits
+            .iter()
+            .map(|f| f.model.name.as_str())
+            .filter(|name| demoted.contains(name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "demoted models reached the TUI: {leaked:?}"
+        );
+    }
+
+    /// Startup under `--profile` has to seed the estimator config, not just the
+    /// reported capacity, and the advanced-config reset has to return to that
+    /// profile rather than to the generic defaults (issue #969).
+    #[test]
+    fn profile_config_seeds_the_sweep_and_the_advanced_config_reset() {
+        let config = CalcConfig {
+            gpu_bandwidth_gbps_override: Some(777.0),
+            ..CalcConfig::default()
+        };
+        let mut app =
+            App::with_specs_context_and_config(unified_specs(), None, Some(config.clone()));
+
+        let bandwidths: Vec<f64> = app
+            .all_fits
+            .iter()
+            .filter_map(|f| f.estimate_basis.gpu_bandwidth_gbps)
+            .collect();
+        assert!(
+            !bandwidths.is_empty() && bandwidths.iter().all(|bw| *bw == 777.0),
+            "every GPU-path estimate should use the profile bandwidth, got {bandwidths:?}"
+        );
+
+        app.calc_config.gpu_bandwidth_gbps_override = Some(100.0);
+        app.reset_advanced_config();
+
+        assert_eq!(
+            app.calc_config.gpu_bandwidth_gbps_override, config.gpu_bandwidth_gbps_override,
+            "reset should return to the profile, not to CalcConfig::default()"
+        );
     }
 
     fn test_model(name: &str) -> LlmModel {
@@ -4372,6 +5482,7 @@ mod tests {
             release_date: None,
             gguf_sources: Vec::new(),
             capabilities: Vec::new(),
+            languages: Vec::new(),
             format: ModelFormat::Gguf,
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -4411,7 +5522,225 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8192,
+            usable_context: 8192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
+            tp_size: None,
+            layout_refusal: None,
+            tp_layout_invalid: false,
+            estimate_confidence: llmfit_core::EstimateConfidence::Estimated,
+            prefill_tps: None,
+            ttft_ms: None,
         }
+    }
+
+    // ── sort direction regression ────────────────────────────────────
+
+    #[test]
+    fn score_sort_ascending_keeps_too_tight_last() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![
+            test_fit("a-high", FitLevel::Good, 90.0),
+            test_fit("b-tootight", FitLevel::TooTight, 10.0),
+            test_fit("c-mid", FitLevel::Good, 60.0),
+        ];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.sort_column = SortColumn::Score;
+        app.sort_ascending = false;
+        app.re_sort();
+        let names: Vec<&str> = app
+            .filtered_fits
+            .iter()
+            .map(|&i| app.all_fits[i].model.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a-high", "c-mid", "b-tootight"]);
+
+        // Toggle to ascending: runnable models flip, TooTight must stay last.
+        app.sort_ascending = true;
+        app.re_sort();
+        let names: Vec<&str> = app
+            .filtered_fits
+            .iter()
+            .map(|&i| app.all_fits[i].model.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["c-mid", "a-high", "b-tootight"]);
+    }
+
+    #[test]
+    fn score_sort_keeps_installed_first_in_both_directions() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        let mut installed_high = test_fit("a-installed", FitLevel::Good, 95.0);
+        installed_high.installed = true;
+        let not_installed_low = test_fit("b-remote", FitLevel::Good, 40.0);
+        app.all_fits = vec![not_installed_low, installed_high];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.sort_column = SortColumn::Score;
+        app.installed_first = true;
+
+        // Descending: installed stays on top even though the remote model
+        // would never out-score it — but prove the pinning with the direction
+        // where the raw key order would bury it.
+        app.sort_ascending = true;
+        app.re_sort();
+        let names: Vec<&str> = app
+            .filtered_fits
+            .iter()
+            .map(|&i| app.all_fits[i].model.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a-installed", "b-remote"]);
+    }
+
+    // ── matched GGUF source attribution (issue #569) ─────────────────
+
+    /// `Qwen/Qwen3-4B`-shaped entry: base model from one provider, GGUF quants
+    /// published by others.
+    fn model_with_gguf_sources() -> LlmModel {
+        let mut model = test_model("Qwen/Qwen3-4B");
+        model.provider = "Alibaba".to_string();
+        model.gguf_sources = vec![
+            GgufSource {
+                repo: "unsloth/Qwen3-4B-GGUF".to_string(),
+                provider: "unsloth".to_string(),
+            },
+            GgufSource {
+                repo: "bartowski/Qwen3-4B-GGUF".to_string(),
+                provider: "bartowski".to_string(),
+            },
+        ];
+        model
+    }
+
+    fn providers() -> Vec<String> {
+        ["Alibaba", "unsloth", "bartowski"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn matched_gguf_provider_reports_the_selected_source() {
+        let model = model_with_gguf_sources();
+        let selected = vec![false, true, false];
+        assert_eq!(
+            matched_gguf_provider(&model, &providers(), &selected),
+            Some("unsloth")
+        );
+    }
+
+    #[test]
+    fn matched_gguf_provider_is_none_when_primary_provider_selected() {
+        let model = model_with_gguf_sources();
+        // Both the base provider and a GGUF source are on: the row is there on
+        // its own merit, so there is nothing to attribute.
+        let selected = vec![true, true, false];
+        assert_eq!(matched_gguf_provider(&model, &providers(), &selected), None);
+    }
+
+    #[test]
+    fn matched_gguf_provider_is_none_when_nothing_selected() {
+        let model = model_with_gguf_sources();
+        let selected = vec![false, false, false];
+        assert_eq!(matched_gguf_provider(&model, &providers(), &selected), None);
+    }
+
+    #[test]
+    fn matched_gguf_provider_is_none_without_a_provider_filter() {
+        // No filter is `vec![true; n]` (see `App::new`), so every row is there
+        // on its own merit and the list marker must stay off.
+        let model = model_with_gguf_sources();
+        let selected = vec![true, true, true];
+        assert_eq!(matched_gguf_provider(&model, &providers(), &selected), None);
+    }
+
+    #[test]
+    fn matched_gguf_provider_returns_first_selected_source_in_catalog_order() {
+        let model = model_with_gguf_sources();
+        let selected = vec![false, true, true];
+        assert_eq!(
+            matched_gguf_provider(&model, &providers(), &selected),
+            Some("unsloth")
+        );
+    }
+
+    #[test]
+    fn matched_gguf_provider_is_none_without_gguf_sources() {
+        let mut model = test_model("some/model");
+        model.provider = "Alibaba".to_string();
+        let selected = vec![false, true, true];
+        assert_eq!(matched_gguf_provider(&model, &providers(), &selected), None);
+    }
+
+    #[test]
+    fn provider_selected_tolerates_a_short_selection_slice() {
+        // The names and selection vectors are built in parallel, but never
+        // index out of bounds if they ever drift.
+        assert!(!provider_selected("bartowski", &providers(), &[false]));
+    }
+
+    // ── available_download_providers MLX gating (issue #294) ─────────
+
+    fn mlx_only_app() -> App {
+        let mut app = test_app();
+        app.mlx_available = true;
+        // Keep every other provider off so no network probe runs and the
+        // returned options are exactly the MLX decision.
+        app.ollama_available = false;
+        app.ollama_binary_available = false;
+        app.llamacpp_available = false;
+        app.docker_mr_available = false;
+        app.lmstudio_available = false;
+        app.vllm_available = false;
+        app
+    }
+
+    #[test]
+    fn awq_named_model_is_not_offered_mlx_download() {
+        let app = mlx_only_app();
+        // The #294 model: format comes back as the Gguf default for scanned
+        // HF models, so the name heuristic must catch it.
+        let options = app.available_download_providers(
+            "cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit",
+            ModelFormat::Gguf,
+            false,
+            true,
+        );
+        assert!(options.is_empty(), "got: {options:?}");
+    }
+
+    #[test]
+    fn awq_format_model_is_not_offered_mlx_download() {
+        let app = mlx_only_app();
+        let options =
+            app.available_download_providers("some/quantized-model", ModelFormat::Awq, false, true);
+        assert!(options.is_empty(), "got: {options:?}");
+    }
+
+    #[test]
+    fn plain_model_is_offered_mlx_download() {
+        let app = mlx_only_app();
+        let options = app.available_download_providers(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            ModelFormat::Gguf,
+            false,
+            true,
+        );
+        assert_eq!(options, vec![DownloadProvider::Mlx]);
+    }
+
+    #[test]
+    fn mlx_conversion_keeping_awq_in_name_is_still_offered() {
+        let app = mlx_only_app();
+        let options = app.available_download_providers(
+            "mlx-community/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit-MLX",
+            ModelFormat::Gguf,
+            true,
+            true,
+        );
+        assert_eq!(options, vec![DownloadProvider::Mlx]);
     }
 
     #[test]
@@ -4455,6 +5784,35 @@ mod tests {
         // Char not present
         assert!(!fuzzy_match("ollamax", "Ollama"));
         assert!(!fuzzy_match("z", "Anthropic"));
+    }
+
+    #[test]
+    fn ascii_graphic_input_inserts_at_cursor_and_rejects_non_ascii() {
+        let mut value = "Ollma".to_string();
+        let mut cursor = "Oll".len();
+
+        insert_ascii_graphic_input(&mut value, &mut cursor, 'a');
+        assert_eq!(value, "Ollama");
+        assert_eq!(cursor, "Olla".len());
+
+        insert_ascii_graphic_input(&mut value, &mut cursor, '你');
+        insert_ascii_graphic_input(&mut value, &mut cursor, ' ');
+        assert_eq!(value, "Ollama");
+        assert_eq!(cursor, "Olla".len());
+    }
+
+    #[test]
+    fn grapheme_input_backspace_and_delete_edit_at_cursor() {
+        let mut value = "LLaamCpp".to_string();
+        let mut cursor = "LLa".len();
+
+        backspace_grapheme_input(&mut value, &mut cursor);
+        assert_eq!(value, "LLamCpp");
+        assert_eq!(cursor, "LL".len());
+
+        delete_grapheme_input(&mut value, cursor);
+        assert_eq!(value, "LLmCpp");
+        assert_eq!(cursor, "LL".len());
     }
 
     #[test]
@@ -4539,5 +5897,467 @@ mod tests {
         app.dm_dir_backspace();
         assert_eq!(app.dm_dir_input, "一a");
         assert_eq!(app.dm_dir_cursor, 0);
+    }
+
+    // Reset every filter that `with_specs_and_context` may restore from a
+    // persisted filters.json so search tests are deterministic regardless of
+    // the developer's saved llmfit state.
+    fn clear_persisted_filters(app: &mut App) {
+        app.header_sort_column = None;
+        app.search_query.clear();
+        app.cursor_position = 0;
+        app.fit_filter = FitFilter::All;
+        app.availability_filter = AvailabilityFilter::All;
+        app.tp_filter = TpFilter::All;
+        app.filter_params_min_input.clear();
+        app.filter_params_max_input.clear();
+        app.filter_mem_pct_min_input.clear();
+        app.filter_mem_pct_max_input.clear();
+        // Persisted use-case / provider / quant / run-mode / capability
+        // toggles load from the real config dir and can zero out
+        // filtered_fits under a developer machine. Reset them all so unit
+        // tests don't depend on ~/.config/llmfit/filters.json.
+        for selected in &mut app.selected_use_cases {
+            *selected = true;
+        }
+        for selected in &mut app.selected_providers {
+            *selected = true;
+        }
+        for selected in &mut app.selected_quants {
+            *selected = true;
+        }
+        for selected in &mut app.selected_run_modes {
+            *selected = true;
+        }
+        for selected in &mut app.selected_capabilities {
+            *selected = true;
+        }
+    }
+
+    #[test]
+    fn changing_search_query_resets_selection_to_top() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![
+            test_fit("gemma-2b", FitLevel::Good, 90.0),
+            test_fit("gemma-7b", FitLevel::Good, 80.0),
+            test_fit("llama-7b", FitLevel::Good, 70.0),
+        ];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.apply_filters();
+        assert_eq!(app.filtered_fits.len(), 3);
+
+        // Cursor parked deep in the full list, mimicking the user having
+        // navigated far down before searching.
+        app.selected_row = app.filtered_fits.len() - 1;
+
+        // Typing a query must snap the viewport back to the top so every
+        // match is visible (issue #657).
+        app.search_input('g');
+        assert!(!app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+
+        // Clearing the search also resets to the top.
+        app.selected_row = app.filtered_fits.len() - 1;
+        app.clear_search();
+        assert_eq!(app.filtered_fits.len(), 3);
+        assert_eq!(app.selected_row, 0);
+
+        // Backspacing the query resets to the top too.
+        app.search_input('g');
+        app.selected_row = app.filtered_fits.len() - 1;
+        app.search_backspace();
+        assert!(!app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+    }
+
+    #[test]
+    fn search_query_with_no_matches_keeps_selection_at_zero() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![test_fit("gemma-2b", FitLevel::Good, 90.0)];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.apply_filters();
+
+        // A query that matches nothing must not panic on the clamp path and
+        // leaves the selection at the top.
+        app.search_input('z');
+        app.search_input('z');
+        app.search_input('z');
+        assert!(app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+    }
+
+    /// Build an app with one installed model, primed so open_benchmarks
+    /// skips the network fetch (bench_loading = true).
+    fn app_with_installed_model(installed: bool) -> App {
+        let mut app = test_app();
+        let mut fit = test_fit("test/llama-3.1-8b", FitLevel::Perfect, 90.0);
+        fit.installed = installed;
+        app.all_fits = vec![fit];
+        app.filtered_fits = vec![0];
+        app.selected_row = 0;
+        if installed {
+            app.installed.ollama.insert("test/llama-3.1-8b".to_string());
+        }
+        app.bench_loading = true; // skip leaderboard fetch in tests
+        app
+    }
+
+    #[test]
+    fn tick_bench_fetch_applies_result_and_clears_loading() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.bench_fetch_rx = Some(rx);
+        app.bench_loading = true;
+
+        // Worker still running — tick is a no-op.
+        app.tick_bench_fetch();
+        assert!(app.bench_loading);
+
+        tx.send(Ok(llmfit_core::benchmarks::LeaderboardResponse {
+            rows: Vec::new(),
+            total: 42,
+            limit: 100,
+            offset: 0,
+        }))
+        .unwrap();
+        app.tick_bench_fetch();
+        assert!(!app.bench_loading);
+        assert!(app.bench_fetch_rx.is_none());
+        assert_eq!(app.bench_total, 42);
+    }
+
+    #[test]
+    fn tick_bench_fetch_error_surfaces_without_freezing_state() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.bench_fetch_rx = Some(rx);
+        app.bench_loading = true;
+
+        tx.send(Err("HTTP error: timeout".to_string())).unwrap();
+        app.tick_bench_fetch();
+        assert!(!app.bench_loading);
+        assert!(app.bench_fetch_rx.is_none());
+        // Either the embedded cache or an error message — never stuck loading.
+        assert!(app.bench_error.is_some() || !app.bench_entries.is_empty());
+    }
+
+    #[test]
+    fn open_benchmarks_offers_bench_for_installed_model() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        assert_eq!(app.input_mode, InputMode::BenchOffer);
+        assert_eq!(app.bench_offer_state, BenchOfferState::Offer);
+        assert_eq!(app.bench_offer_model, "test/llama-3.1-8b");
+        assert_eq!(app.bench_offer_providers, vec!["Ollama"]);
+        assert!(app.show_benchmarks);
+    }
+
+    #[test]
+    fn open_benchmarks_skips_offer_for_uninstalled_model() {
+        let mut app = app_with_installed_model(false);
+        app.open_benchmarks();
+        assert_eq!(app.input_mode, InputMode::Benchmarks);
+    }
+
+    #[test]
+    fn bench_offer_share_toggle_and_dismiss() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        // open_benchmarks probes for real GitHub credentials (env token or
+        // cached login), which differ between dev machines and CI runners —
+        // pin the outcome so the toggle path is deterministic.
+        app.bench_offer_share_unavailable = None;
+        assert!(!app.bench_offer_share);
+        app.bench_offer_toggle_share();
+        assert!(app.bench_offer_share);
+        app.bench_offer_toggle_share();
+        assert!(!app.bench_offer_share);
+
+        // Dismiss drops into the leaderboard view, not back to Normal.
+        app.bench_offer_dismiss();
+        assert_eq!(app.input_mode, InputMode::Benchmarks);
+        assert!(app.show_benchmarks);
+    }
+
+    #[test]
+    fn bench_offer_share_toggle_noop_without_credentials() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        app.bench_offer_share_unavailable = Some("no GitHub credentials".to_string());
+        app.bench_offer_toggle_share();
+        assert!(!app.bench_offer_share);
+    }
+
+    #[test]
+    fn bench_target_matching_reuses_installed_heuristics() {
+        // Exact HF name (as MLX/vLLM report it)
+        assert!(bench_target_matches(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Llama-3.1-8B-Instruct"
+        ));
+        // Real Ollama tag resolved through the mapping table
+        assert!(bench_target_matches("llama3.1:8b", "test/llama-3.1-8b"));
+        // Variant tag reported by `ollama list` (quant suffix)
+        assert!(bench_target_matches(
+            "llama3.1:8b-instruct-q4_K_M",
+            "test/llama-3.1-8b"
+        ));
+        // llama-server style: model id is a file path with quant suffix
+        assert!(bench_target_matches(
+            "/home/user/.cache/llmfit/models/gemma-3.Q8_0.gguf",
+            "tiny-random/gemma-3"
+        ));
+        // Unrelated models must not match
+        assert!(!bench_target_matches("qwen2.5:7b", "test/llama-3.1-8b"));
+        assert!(!bench_target_matches(
+            "/home/user/.cache/llmfit/models/gemma-3.Q8_0.gguf",
+            "google/gemma-3-27b-it"
+        ));
+    }
+
+    fn bench_entry(
+        id: &str,
+        model: &str,
+        engine: &str,
+        user: &str,
+    ) -> llmfit_core::benchmarks::LeaderboardEntry {
+        use llmfit_core::benchmarks::{
+            LeaderboardEngine, LeaderboardEntry, LeaderboardModel, LeaderboardUser,
+        };
+        LeaderboardEntry {
+            id: id.to_string(),
+            tok_s_out: Some(10.0),
+            tok_s_total: None,
+            ttft_ms: None,
+            context_length: None,
+            batch_size: None,
+            peak_vram_gb: None,
+            notes: None,
+            model: Some(LeaderboardModel {
+                hf_id: model.to_string(),
+                display_name: None,
+                family: None,
+                params: None,
+                is_mo_e: None,
+            }),
+            hardware: None,
+            engine: Some(LeaderboardEngine {
+                engine_name: engine.to_string(),
+                engine_version: None,
+                quantization: "Q4_K_M".to_string(),
+                backend: None,
+            }),
+            engine_flags: None,
+            user: Some(LeaderboardUser {
+                username: Some(user.to_string()),
+                verified: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn bench_search_filters_by_model_engine_and_user() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+            bench_entry("3", "meta-llama/Llama-3.1-70B", "vllm", "carol"),
+        ];
+
+        // Empty query shows everything
+        assert_eq!(app.bench_visible_indices(), vec![0, 1, 2]);
+
+        // Case-insensitive substring on the model id
+        app.bench_search_query = "LLAMA-3.1".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![0, 2]);
+
+        // AND across space-separated terms (model + engine)
+        app.bench_search_query = "llama-3.1 vllm".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![2]);
+
+        // Username matches too
+        app.bench_search_query = "bob".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![1]);
+
+        app.bench_search_query = "nomatch".to_string();
+        assert!(app.bench_visible_indices().is_empty());
+    }
+
+    #[test]
+    fn advanced_range_labels_spell_out_active_ranges() {
+        let mut app = test_app();
+        assert!(app.advanced_range_labels().is_empty());
+
+        app.filter_params_max_input = "2".to_string();
+        assert_eq!(app.advanced_range_labels(), vec!["≤2B"]);
+
+        app.filter_params_min_input = "7".to_string();
+        app.filter_params_max_input = "30".to_string();
+        app.filter_mem_pct_min_input = "50".to_string();
+        assert_eq!(app.advanced_range_labels(), vec!["7–30B", "mem≥50%"]);
+    }
+
+    #[test]
+    fn closing_benchmarks_resets_simulated_card_and_cached_rows() {
+        let mut app = test_app();
+        app.bench_hw_label = Some("RTX 5080 (16 GB)".to_string());
+        app.bench_entries = vec![bench_entry("1", "Qwen/Qwen3.6-35B-A3B", "llama.cpp", "bob")];
+        app.bench_total = 12;
+        app.bench_cursor = 1;
+
+        app.close_benchmarks();
+        assert!(app.bench_hw_label.is_none());
+        assert!(app.bench_entries.is_empty());
+        assert_eq!(app.bench_total, 0);
+        assert_eq!(app.bench_cursor, 0);
+
+        // Without a simulated card the cached board is kept.
+        app.bench_entries = vec![bench_entry("1", "Qwen/Qwen3.6-35B-A3B", "llama.cpp", "bob")];
+        app.close_benchmarks();
+        assert_eq!(app.bench_entries.len(), 1);
+    }
+
+    #[test]
+    fn bench_search_edits_reset_cursor_and_clear_restores() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+        ];
+        app.bench_cursor = 1;
+        app.bench_search_start();
+        assert!(app.bench_search_active);
+
+        app.bench_search_input('q');
+        app.bench_search_input('w');
+        assert_eq!(app.bench_cursor, 0);
+        assert_eq!(app.bench_visible_indices(), vec![1]);
+
+        // Cursor moves are bounded by the filtered list, not all entries
+        app.bench_move_down();
+        assert_eq!(app.bench_cursor, 0);
+
+        app.bench_search_accept();
+        assert!(!app.bench_search_active);
+        assert_eq!(app.bench_search_query, "qw");
+
+        app.bench_search_clear();
+        assert!(app.bench_search_query.is_empty());
+        assert_eq!(app.bench_visible_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn multi_term_search_matches_capabilities_and_gguf_sources() {
+        use llmfit_core::models::{Capability, GgufSource};
+
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+
+        let mut fit_a = test_fit("generic-model-a", FitLevel::Good, 80.0);
+        fit_a.model.provider = "Meta".to_string();
+        fit_a.model.capabilities = vec![Capability::Vision];
+        fit_a.model.gguf_sources = vec![GgufSource {
+            repo: "bartowski/model-a-GGUF".to_string(),
+            provider: "HuggingFace".to_string(),
+        }];
+
+        let mut fit_b = test_fit("generic-model-b", FitLevel::Good, 80.0);
+        fit_b.model.provider = "Meta".to_string();
+        fit_b.model.capabilities = vec![Capability::Audio];
+        fit_b.model.gguf_sources = vec![];
+
+        app.all_fits = vec![fit_a, fit_b];
+        app.providers = vec!["Meta".to_string()];
+        app.selected_providers = vec![true];
+
+        // Multi-term query matching across provider, capabilities, and gguf_sources
+        app.search_query = "meta vision bartowski".to_string();
+        app.apply_filters();
+
+        assert_eq!(app.filtered_fits.len(), 1);
+        assert_eq!(app.filtered_fits[0], 0);
+
+        // Multi-term query matching provider and audio capability
+        app.search_query = "meta audio".to_string();
+        app.apply_filters();
+
+        assert_eq!(app.filtered_fits.len(), 1);
+        assert_eq!(app.filtered_fits[0], 1);
+    }
+
+    #[test]
+    #[ignore = "benchmark test for manual invocation via cargo test -- --ignored"]
+    fn test_benchmark_apply_filters_performance() {
+        use std::time::{Duration, Instant};
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+
+        // Build 100 model fits with realistic capabilities and gguf sources
+        let mut fits = Vec::with_capacity(100);
+        for i in 0..100 {
+            let mut fit = test_fit(
+                &format!(
+                    "provider_{}/model-family-{}-{}",
+                    i % 5,
+                    i,
+                    if i % 2 == 0 { "instruct" } else { "coder" }
+                ),
+                FitLevel::Good,
+                80.0,
+            );
+            fit.model.provider = format!("Provider_{}", i % 4);
+            fit.model.parameter_count = format!("{}B", (i % 70) + 1);
+            fit.model.license = Some(format!("License-Type-{}", i % 3));
+            fit.model.gguf_sources = vec![
+                llmfit_core::models::GgufSource {
+                    repo: format!("TheBloke/Model-{}-GGUF", i),
+                    provider: "HuggingFace".to_string(),
+                },
+                llmfit_core::models::GgufSource {
+                    repo: format!("bartowski/Model-{}-GGUF", i),
+                    provider: "HuggingFace".to_string(),
+                },
+            ];
+            fits.push(fit);
+        }
+        app.all_fits = fits;
+        app.providers = (0..5).map(|p| format!("Provider_{}", p)).collect();
+        app.selected_providers = vec![true; 5];
+
+        let queries = vec![
+            "llama",
+            "7b",
+            "coder",
+            "instruct",
+            "license",
+            "thebloke",
+            "gguf",
+            "provider_1",
+            "model-family",
+            "80b",
+        ];
+
+        let iterations = 1000;
+        let start = Instant::now();
+        for i in 0..iterations {
+            app.search_query = queries[i % queries.len()].to_string();
+            app.apply_filters();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "--- BENCHMARK RESULTS --- Iterations: {}, Total Time: {:?}, Avg per pass: {:?}",
+            iterations,
+            elapsed,
+            elapsed / iterations as u32
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Filter performance regressed: 1,000 passes took {:?}",
+            elapsed
+        );
     }
 }
